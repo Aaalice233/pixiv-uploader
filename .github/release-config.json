@@ -1,0 +1,7 @@
+{
+  "product_name": "Pixiv Uploader",
+  "artifact_slug": "pixiv-uploader",
+  "initial_base": "1afa76dd0f15ffde1a1c2bda98ce271cdb0e0ce4",
+  "max_items_per_section": 6,
+  "repository": "Aaalice233/pixiv-uploader"
+}

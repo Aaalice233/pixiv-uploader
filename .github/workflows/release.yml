@@ -1,0 +1,185 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，例如 1.0 或 1.1.0-beta.1（不要带 v）"
+        required: true
+        type: string
+      from_ref:
+        description: "可选：覆盖更新日志起点；通常留空自动取上一版本"
+        required: false
+        default: ""
+        type: string
+      draft:
+        description: "创建为草稿 Release"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "标记为预发布版本"
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          DISPATCH_FROM_REF: ${{ inputs.from_ref }}
+          DISPATCH_DRAFT: ${{ inputs.draft }}
+          DISPATCH_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+            from_ref=""
+            draft="false"
+            prerelease="false"
+            [[ "$version" == *-* ]] && prerelease="true"
+          else
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "手动正式发布只能从 main 分支执行，当前为 $GITHUB_REF" >&2
+              exit 1
+            fi
+            version="${DISPATCH_VERSION#v}"
+            tag="v${version}"
+            from_ref="$DISPATCH_FROM_REF"
+            draft="${DISPATCH_DRAFT:-false}"
+            prerelease="${DISPATCH_PRERELEASE:-false}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "版本号格式无效: $version" >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "from_ref=$from_ref"
+            echo "draft=$draft"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate version metadata
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: python scripts/release_tools.py validate --version "$VERSION" --to-ref "$GITHUB_SHA"
+
+      - name: Generate user-facing release notes
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          FROM_REF: ${{ steps.metadata.outputs.from_ref }}
+        run: |
+          set -euo pipefail
+          args=(notes --version "$VERSION" --to-ref "$GITHUB_SHA" --output release-notes.md)
+          if [[ -n "$FROM_REF" ]]; then
+            args+=(--from-ref "$FROM_REF")
+          fi
+          python scripts/release_tools.py "${args[@]}"
+
+      - name: Build source package and checksum
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-dist
+          archive="release-dist/pixiv-uploader-v${VERSION}.zip"
+          git archive --format=zip --prefix="pixiv-uploader-v${VERSION}/" --output "$archive" "$GITHUB_SHA"
+          (cd release-dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+
+      - name: Ensure release does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在；为避免覆盖，流程终止。" >&2
+            exit 1
+          fi
+
+      - name: Create or verify release tag
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+            tag_sha="$(git rev-list -n 1 "$TAG")"
+            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+              echo "标签 $TAG 已指向 $tag_sha，而当前提交是 $GITHUB_SHA。" >&2
+              exit 1
+            fi
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" "$GITHUB_SHA" -m "Pixiv Uploader $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          DRAFT: ${{ steps.metadata.outputs.draft }}
+          PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          args=(release create "$TAG"
+            --repo "$GITHUB_REPOSITORY"
+            --verify-tag
+            --title "Pixiv Uploader v${VERSION}"
+            --notes-file release-notes.md
+            "release-dist/pixiv-uploader-v${VERSION}.zip"
+            "release-dist/pixiv-uploader-v${VERSION}.zip.sha256")
+          [[ "$DRAFT" == "true" ]] && args+=(--draft)
+          [[ "$PRERELEASE" == "true" ]] && args+=(--prerelease)
+          gh "${args[@]}"
+
+      - name: Write workflow summary
+        if: always()
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          {
+            echo "## 🚀 Release $TAG"
+            echo
+            if [[ -f release-notes.md ]]; then
+              cat release-notes.md
+            else
+              echo "发布流程在生成更新日志前失败，请查看上方步骤。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

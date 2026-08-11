@@ -63,6 +63,10 @@ node_modules/
 .idea/
 *.swp
 
+# Release tooling outputs
+release-notes.md
+release-dist/
+
 # Update check timestamp and agent artifacts (per-machine)
 .last_update_check
 .gstack/
