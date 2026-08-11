@@ -57,7 +57,7 @@ def _fail(message: str) -> None:
     raise SystemExit(message)
 
 
-def _run_git(*args: str, check: bool = True) -> str:
+def _run_git(*args: str, check: bool = True, strip: bool = True) -> str:
     result = subprocess.run(
         ["git", *args],
         cwd=ROOT,
@@ -68,7 +68,7 @@ def _run_git(*args: str, check: bool = True) -> str:
     )
     if check and result.returncode != 0:
         _fail(result.stderr.strip() or f"git {' '.join(args)} failed")
-    return result.stdout.strip()
+    return result.stdout.strip() if strip else result.stdout
 
 
 def _load_config() -> dict[str, Any]:
@@ -181,10 +181,13 @@ def _read_release_commits(from_ref: str, to_ref: str) -> list[ReleaseCommit]:
         "--no-merges",
         "--format=%H%x1f%s%x1f%b%x1e",
         f"{from_ref}..{to_ref}",
+        strip=False,
     )
     commits: list[ReleaseCommit] = []
     for record in raw.split("\x1e"):
-        record = record.strip()
+        # \x1f is the field delimiter and Python treats it as whitespace. Only
+        # trim Git's record newlines so commits with an empty body keep all fields.
+        record = record.strip("\r\n")
         if not record:
             continue
         parts = record.split("\x1f", 2)
