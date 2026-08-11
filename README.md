@@ -6,7 +6,7 @@
 
 > 本项目 fork 自 [1756141021/civitai-post-splitter](https://github.com/1756141021/civitai-post-splitter)，现由 [Aaalice233](https://github.com/Aaalice233) 独立维护。
 
-## 功能概览
+## ✨ 功能概览
 
 - **发布工作台**：集中管理待发布图片、平台状态、任务进度和运行日志
 - **Pixiv 发布**：自动填写标题、说明、标签、年龄分级和原创/二创选项
@@ -20,7 +20,7 @@
 - **双语界面**：内置简体中文和 English，支持系统语言检测与即时切换
 - **深浅主题**：支持 Dark / Light 主题以及桌面端、移动端布局
 
-## 当前支持的平台
+## 🌐 当前支持的平台
 
 | 平台 | 发布方式 | 自动标签 | LLM 文案 | R-18 打码 | 图文水印 |
 |---|---|---:|---:|---:|---:|
@@ -29,7 +29,7 @@
 
 当前发布目标仅允许 `pixiv` 和 `civitai`。平台能力已按独立边界组织，后续可以继续扩展新的发布目标。
 
-## 环境要求
+## 🧰 环境要求
 
 - Windows 10 / 11
 - Python 3.10+
@@ -37,7 +37,7 @@
 - Git
 - Node.js 18+（仅修改前端时需要）
 
-## 安装
+## 📦 安装
 
 ```powershell
 git clone https://github.com/Aaalice233/pixiv-uploader.git
@@ -57,7 +57,7 @@ R-18 自动打码为可选功能：
 
 随后运行 `run.bat`，选择 **[4] 安装 / 检查 R-18 自动打码**，程序会检查并引导安装模型。
 
-## 快速开始
+## 🚀 快速开始
 
 ### Web UI
 
@@ -124,7 +124,7 @@ run_web.bat
 
 `--sort` 支持：`random`、`name_asc`、`name_desc`、`time_asc`、`time_desc`。
 
-## 图片生命周期
+## 🖼️ 图片生命周期
 
 ```text
 upload/  →  发布准备与平台处理  →  done/
@@ -139,7 +139,7 @@ upload/  →  发布准备与平台处理  →  done/
 - 某个平台失败时，图片会保留在待处理状态，重试时跳过已经成功的平台
 - `manifest` 会记录每个平台的准备结果与发布状态，便于定位问题
 
-## Tagger
+## 🏷️ Tagger
 
 优先级为：
 
@@ -155,13 +155,13 @@ PixAI tagger → CL / WD14 tagger → metadata / 文件名候选
 
 PixAI v0.9 模型约 1.27 GB，请预留磁盘空间。
 
-## LLM 文案
+## ✍️ LLM 文案
 
 Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Gemini 配置。每个人设可独立配置提示词、内容模式和默认行为。
 
 敏感配置保存在本机 `config.json`。该文件已被 Git 忽略，请不要主动提交 API key、Cookie 或其他凭据。
 
-## 水印
+## 💧 水印
 
 在 **设置 → Pixiv → 水印** 中可以选择文字或图片水印。水印只写入 Pixiv 清洗后的发布副本，不修改 `upload/` 中的原图：
 
@@ -170,7 +170,7 @@ Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Ge
 - 导入的字体与图片分别保存在本机 `watermark_fonts/` 和 `watermark_images/`
 - 删除当前正在使用的水印资源时，应用会同步回退到安全的禁用状态
 
-## 主要配置与数据
+## ⚙️ 主要配置与数据
 
 | 路径 | 作用 |
 |---|---|
@@ -185,7 +185,7 @@ Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Ge
 | `pixiv/jp_aliases.json` | Danbooru → 日文标签缓存 |
 | `pixiv/general_jp.json` | Pixiv 标签规则与同义词 |
 
-## 前端开发
+## 🛠️ 前端开发
 
 ```powershell
 npm ci
@@ -207,13 +207,13 @@ Python 测试：
 
 更多模块约定与维护说明见 [DEV_NOTES.md](DEV_NOTES.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
-## 注意事项
+## ⚠️ 注意事项
 
 - 本项目使用浏览器自动化完成 Pixiv / Civitai 操作，站点页面更新后可能需要同步适配
 - 发布前请自行确认作品版权、平台规则、AI 生成内容标记和年龄分级
 - 请合理控制发布频率，不要使用本项目进行垃圾信息、批量骚扰或规避平台限制
 - 本项目与 Pixiv、Civitai 及其运营方没有隶属或官方合作关系
 
-## 许可证
+## 📄 许可证
 
 本项目基于 [MIT License](LICENSE) 发布，并保留上游项目的版权与许可声明。

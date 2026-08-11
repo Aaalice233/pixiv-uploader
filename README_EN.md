@@ -6,7 +6,7 @@ A local, **Pixiv-first** publishing workspace for artwork. It currently supports
 
 > Forked from [1756141021/civitai-post-splitter](https://github.com/1756141021/civitai-post-splitter) and now independently maintained by [Aaalice233](https://github.com/Aaalice233).
 
-## Features
+## ✨ Features
 
 - **Publishing workspace** — manage pending images, platform status, task progress, and activity logs
 - **Pixiv publishing** — fills titles, captions, tags, age ratings, and original/fan-art settings
@@ -20,7 +20,7 @@ A local, **Pixiv-first** publishing workspace for artwork. It currently supports
 - **Bilingual interface** — Simplified Chinese and English with system detection and live switching
 - **Light and dark themes** — responsive layouts for desktop and mobile viewports
 
-## Supported platforms
+## 🌐 Supported platforms
 
 | Platform | Publishing method | Auto-tagging | LLM copy | R-18 censoring | Watermarks |
 |---|---|---:|---:|---:|---:|
@@ -29,7 +29,7 @@ A local, **Pixiv-first** publishing workspace for artwork. It currently supports
 
 The current build accepts only `pixiv` and `civitai` as publishing targets. Platform capabilities are kept behind explicit boundaries so more destinations can be added later.
 
-## Requirements
+## 🧰 Requirements
 
 - Windows 10 / 11
 - Python 3.10+
@@ -37,7 +37,7 @@ The current build accepts only `pixiv` and `civitai` as publishing targets. Plat
 - Git
 - Node.js 18+ (only required for frontend development)
 
-## Installation
+## 📦 Installation
 
 ```powershell
 git clone https://github.com/Aaalice233/pixiv-uploader.git
@@ -57,7 +57,7 @@ R-18 auto-censoring is optional:
 
 Then launch `run.bat` and choose **[4] Install / verify R-18 auto-censor** to check or install the model.
 
-## Quick start
+## 🚀 Quick start
 
 ### Web UI
 
@@ -124,7 +124,7 @@ The menu provides:
 
 `--sort` accepts `random`, `name_asc`, `name_desc`, `time_asc`, and `time_desc`.
 
-## Image lifecycle
+## 🖼️ Image lifecycle
 
 ```text
 upload/  →  preparation and platform processing  →  done/
@@ -139,7 +139,7 @@ upload/  →  preparation and platform processing  →  done/
 - If one platform fails, the image remains available for retry and completed targets are skipped
 - The manifest records preparation and publishing results for each platform to aid diagnosis
 
-## Taggers
+## 🏷️ Taggers
 
 Tagger priority:
 
@@ -155,13 +155,13 @@ Configure models from CLI menu **[6]** or the Web UI settings. Automatic PixAI d
 
 The PixAI v0.9 model is approximately 1.27 GB; reserve enough disk space before downloading it.
 
-## LLM copy generation
+## ✍️ LLM copy generation
 
 Pixiv copy generation supports OpenAI-compatible endpoints, Anthropic, and Google Gemini configurations. Each persona can keep its own prompt, content mode, and defaults.
 
 Sensitive settings are stored in the local `config.json`. It is ignored by Git; never commit API keys, cookies, or other credentials.
 
-## Watermarks
+## 💧 Watermarks
 
 Choose a text or image watermark under **Settings → Pixiv → Watermark**. Watermarks are applied only to cleaned Pixiv publishing copies; files in `upload/` stay unchanged.
 
@@ -170,7 +170,7 @@ Choose a text or image watermark under **Settings → Pixiv → Watermark**. Wat
 - Imported fonts and images stay locally in `watermark_fonts/` and `watermark_images/`
 - Removing an active watermark asset safely disables that configuration
 
-## Configuration and data
+## ⚙️ Configuration and data
 
 | Path | Purpose |
 |---|---|
@@ -185,7 +185,7 @@ Choose a text or image watermark under **Settings → Pixiv → Watermark**. Wat
 | `pixiv/jp_aliases.json` | Danbooru-to-Japanese tag cache |
 | `pixiv/general_jp.json` | Pixiv tag rules and synonyms |
 
-## Frontend development
+## 🛠️ Frontend development
 
 ```powershell
 npm ci
@@ -207,13 +207,13 @@ Run the Python test suite with:
 
 See [DEV_NOTES.md](DEV_NOTES.md) for architecture and maintenance notes, and [CHANGELOG.md](CHANGELOG.md) for version history.
 
-## Important notes
+## ⚠️ Important notes
 
 - Pixiv and Civitai operations rely on browser automation and may need updates when either site changes
 - Verify copyright, platform rules, AI-generated content labels, and age ratings before publishing
 - Use reasonable publishing intervals; do not use this project for spam, harassment, or bypassing platform restrictions
 - This project is not affiliated with or endorsed by Pixiv, Civitai, or their operators
 
-## License
+## 📄 License
 
 Released under the [MIT License](LICENSE), with the original upstream copyright and license notice retained.
