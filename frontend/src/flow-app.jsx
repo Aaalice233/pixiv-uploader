@@ -765,7 +765,34 @@ function PixivSettings({ status, notify, reloadStatus }) {
   </div>;
 }
 
-function LlmSettings({ initialConfig, onSaved, notify }) {
+function llmSampleFieldSpecs(persona, platformSpecs) {
+  const platformIds = Array.isArray(persona?.platform) ? persona.platform : [persona?.platform || 'pixiv'];
+  const seen = new Set();
+  const fields = [];
+  platformIds.forEach(platformId => {
+    const spec = platformSpecs?.[platformId];
+    [...(spec?.fields || []), ...(spec?.extra_fields || [])].forEach(field => {
+      if (field?.key && !seen.has(field.key)) { seen.add(field.key); fields.push(field); }
+    });
+  });
+  return fields;
+}
+
+function llmSampleIsComplete(sample, fieldSpecs) {
+  return fieldSpecs.filter(field => field.required).every(field => {
+    const value = sample?.fields?.[field.key];
+    if (field.kind !== 'tags') return Boolean(String(value || '').trim());
+    const forbidden = new Set((field.forbidden_values || []).map(item => String(item).toLocaleLowerCase()));
+    const forbiddenPrefixes = (field.forbidden_prefixes || []).map(item => String(item).toLocaleLowerCase());
+    const tags = Array.isArray(value) ? value.map(item => String(item).trim()).filter(Boolean) : [];
+    const usable = tags.map(item => item.toLocaleLowerCase()).filter(item => (
+      !forbidden.has(item) && !forbiddenPrefixes.some(prefix => item.startsWith(prefix))
+    ));
+    return new Set(usable).size >= Number(field.min_count || 1);
+  });
+}
+
+function LlmSettings({ initialConfig, platformSpecs, onSaved, notify }) {
   const { t } = useI18n();
   const [config, setConfig] = useState(() => structuredClone(initialConfig));
   const [selectedId, setSelectedId] = useState(initialConfig.default_persona_id || initialConfig.personas?.[0]?.id || '');
@@ -773,6 +800,7 @@ function LlmSettings({ initialConfig, onSaved, notify }) {
   const [models, setModels] = useState([]);
   const [modelBusy, setModelBusy] = useState(false);
   const persona = (config.personas || []).find(item => item.id === selectedId) || config.personas?.[0];
+  const sampleFieldSpecs = llmSampleFieldSpecs(persona, platformSpecs);
   const retryPolicy = {
     request_attempts: 3,
     repair_attempts: 1,
@@ -784,7 +812,12 @@ function LlmSettings({ initialConfig, onSaved, notify }) {
     ...(config.retry_policy || {}),
   };
 
-  useEffect(() => { setConfig(structuredClone(initialConfig)); }, [initialConfig]);
+  useEffect(() => {
+    setConfig(structuredClone(initialConfig));
+    setSelectedId(current => (initialConfig.personas || []).some(item => item.id === current)
+      ? current
+      : (initialConfig.default_persona_id || initialConfig.personas?.[0]?.id || ''));
+  }, [initialConfig]);
   function patchConfig(key, value) { setConfig(previous => ({ ...previous, [key]: value })); }
   function patchRetryPolicy(key, value) { setConfig(previous => ({ ...previous, retry_policy: { ...retryPolicy, ...(previous.retry_policy || {}), [key]: value } })); }
   function patchPersona(key, value) { setConfig(previous => ({ ...previous, personas: previous.personas.map(item => item.id === selectedId ? { ...item, [key]: value } : item) })); }
@@ -798,9 +831,17 @@ function LlmSettings({ initialConfig, onSaved, notify }) {
     const remaining = config.personas.filter(item => item.id !== selectedId);
     setConfig(previous => ({ ...previous, personas: remaining, default_persona_id: previous.default_persona_id === selectedId ? remaining[0].id : previous.default_persona_id })); setSelectedId(remaining[0].id);
   }
-  function addSample() { patchPersona('samples', [...(persona.samples || []), { mode: 'sfw', note: '', fields: { title_ja: '', title_zh: '', caption_ja: '', caption_zh: '' } }]); }
+  function addSample() {
+    const fields = Object.fromEntries(sampleFieldSpecs.map(field => [field.key, field.kind === 'tags' ? [] : '']));
+    patchPersona('samples', [...(persona.samples || []), { mode: 'sfw', note: '', fields }]);
+  }
   function patchSample(index, key, value) { const samples = structuredClone(persona.samples || []); if (key.startsWith('fields.')) samples[index].fields[key.slice(7)] = value; else samples[index][key] = value; patchPersona('samples', samples); }
   function removeSample(index) { patchPersona('samples', (persona.samples || []).filter((_, sampleIndex) => sampleIndex !== index)); }
+  function sampleFieldLabel(field) {
+    if (!field.label_key) return field.label || field.key;
+    const localized = t(field.label_key);
+    return localized === field.label_key ? (field.label || field.key) : localized;
+  }
   async function fetchModels() {
     setModelBusy(true);
     try { const query = new URLSearchParams({ provider: config.provider || '', base_url: config.base_url || '', api_key: config.api_key || '' }); const result = await api(`/api/llm-reverse-models?${query}`); setModels(result.models || []); notify(t('llm.modelsLoaded', { count: (result.models || []).length })); }
@@ -841,7 +882,7 @@ function LlmSettings({ initialConfig, onSaved, notify }) {
       <Toggle checked={Boolean(retryPolicy.adaptive_image)} onChange={value => patchRetryPolicy('adaptive_image', value)} label={t('llm.adaptiveImage')} description={t('llm.adaptiveImageHint')}/>
       <label className="flow-field llm-fallback-models"><span>{t('llm.fallbackModels')}</span><textarea rows="3" value={(retryPolicy.fallback_models || []).join('\n')} onChange={event => patchRetryPolicy('fallback_models', event.target.value.split(/[\r\n,]+/).map(value => value.trim()).filter(Boolean).slice(0, 3))} placeholder={t('llm.fallbackModelsPlaceholder')}/><small>{t('llm.fallbackModelsHint')}</small></label>
     </section>
-    <section className="settings-section"><div className="settings-heading-row"><h3>{t('llm.personas')}</h3><Button icon="plus" onClick={addPersona}>{t('common.new')}</Button></div><div className="persona-layout"><nav>{config.personas.map(item => <button aria-pressed={item.id === selectedId} className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => setSelectedId(item.id)}><strong>{item.label}</strong><small>{item.default_content_mode?.toUpperCase()}</small></button>)}</nav><div className="persona-editor"><div className="settings-grid-two"><label className="flow-field"><span>{t('llm.name')}</span><input value={persona.label} onChange={event => patchPersona('label', event.target.value)}/></label><label className="flow-field"><span>{t('llm.defaultRating')}</span><select value={persona.default_content_mode || 'sfw'} onChange={event => patchPersona('default_content_mode', event.target.value)}><option value="sfw">SFW</option><option value="nsfw">NSFW</option></select></label></div><label className="flow-field"><span>{t('llm.voice')}</span><textarea rows="3" value={persona.voice || ''} onChange={event => patchPersona('voice', event.target.value)}/></label><label className="flow-field"><span>{t('llm.sfwPrompt')}</span><textarea rows="3" value={persona.sfw_prompt || ''} onChange={event => patchPersona('sfw_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.nsfwPrompt')}</span><textarea rows="3" value={persona.nsfw_prompt || ''} onChange={event => patchPersona('nsfw_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.extraConstraints')}</span><textarea rows="2" value={persona.extra_prompt || ''} onChange={event => patchPersona('extra_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.avoidWords')}</span><input value={(persona.avoid || []).join(', ')} onChange={event => patchPersona('avoid', event.target.value.split(',').map(value => value.trim()).filter(Boolean))}/></label><div className="sample-heading"><strong>{t('llm.samples')}</strong><button onClick={addSample}><Icon name="plus" size={14}/>{t('common.add')}</button></div>{(persona.samples || []).map((sample, index) => <div className="persona-sample" key={index}><div><select value={sample.mode} onChange={event => patchSample(index, 'mode', event.target.value)}><option value="sfw">SFW</option><option value="nsfw">NSFW</option></select><input value={sample.note || ''} onChange={event => patchSample(index, 'note', event.target.value)} placeholder={t('llm.sampleNote')}/><IconButton icon="trash" label={t('llm.deleteSample')} onClick={() => removeSample(index)}/></div><input value={sample.fields?.title_ja || ''} onChange={event => patchSample(index, 'fields.title_ja', event.target.value)} placeholder={t('llm.japaneseTitle')}/><textarea rows="2" value={sample.fields?.caption_ja || ''} onChange={event => patchSample(index, 'fields.caption_ja', event.target.value)} placeholder={t('llm.japaneseCaption')}/></div>)}<div className="settings-actions spread"><Button variant="danger-ghost" icon="trash" onClick={deletePersona}>{t('llm.deletePersona')}</Button><label className="flow-radio"><input type="radio" checked={config.default_persona_id === selectedId} onChange={() => patchConfig('default_persona_id', selectedId)}/>{t('llm.setDefault')}</label></div></div></div></section>
+    <section className="settings-section"><div className="settings-heading-row"><h3>{t('llm.personas')}</h3><Button icon="plus" onClick={addPersona}>{t('common.new')}</Button></div><div className="persona-layout"><nav>{config.personas.map(item => <button aria-pressed={item.id === selectedId} className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => setSelectedId(item.id)}><strong>{item.label}</strong><small>{item.default_content_mode?.toUpperCase()}</small></button>)}</nav><div className="persona-editor"><div className="settings-grid-two"><label className="flow-field"><span>{t('llm.name')}</span><input value={persona.label} onChange={event => patchPersona('label', event.target.value)}/></label><label className="flow-field"><span>{t('llm.defaultRating')}</span><select value={persona.default_content_mode || 'sfw'} onChange={event => patchPersona('default_content_mode', event.target.value)}><option value="sfw">SFW</option><option value="nsfw">NSFW</option></select></label></div><label className="flow-field"><span>{t('llm.voice')}</span><textarea rows="3" value={persona.voice || ''} onChange={event => patchPersona('voice', event.target.value)}/></label><label className="flow-field"><span>{t('llm.sfwPrompt')}</span><textarea rows="3" value={persona.sfw_prompt || ''} onChange={event => patchPersona('sfw_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.nsfwPrompt')}</span><textarea rows="3" value={persona.nsfw_prompt || ''} onChange={event => patchPersona('nsfw_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.extraConstraints')}</span><textarea rows="2" value={persona.extra_prompt || ''} onChange={event => patchPersona('extra_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.avoidWords')}</span><input value={(persona.avoid || []).join(', ')} onChange={event => patchPersona('avoid', event.target.value.split(',').map(value => value.trim()).filter(Boolean))}/></label><div className="sample-heading"><strong>{t('llm.samples')}</strong><button onClick={addSample}><Icon name="plus" size={14}/>{t('common.add')}</button></div>{(persona.samples || []).map((sample, index) => <div className={`persona-sample${llmSampleIsComplete(sample, sampleFieldSpecs) ? '' : ' incomplete'}`} key={index}><div><select value={sample.mode} onChange={event => patchSample(index, 'mode', event.target.value)}><option value="sfw">SFW</option><option value="nsfw">NSFW</option></select><input value={sample.note || ''} onChange={event => patchSample(index, 'note', event.target.value)} placeholder={t('llm.sampleNote')}/><IconButton icon="trash" label={t('llm.deleteSample')} onClick={() => removeSample(index)}/></div><div className="persona-sample-fields">{sampleFieldSpecs.map(field => <label className={`sample-field-${field.kind || 'multiline'}`} key={field.key}><span>{sampleFieldLabel(field)}{field.required && <b>*</b>}</span>{field.kind === 'text' ? <input maxLength={field.max} value={sample.fields?.[field.key] || ''} onChange={event => patchSample(index, `fields.${field.key}`, event.target.value)}/> : <textarea rows={field.kind === 'tags' ? 4 : 2} maxLength={field.kind === 'tags' ? undefined : field.max} value={field.kind === 'tags' ? (Array.isArray(sample.fields?.[field.key]) ? sample.fields[field.key].join('\n') : (sample.fields?.[field.key] || '')) : (sample.fields?.[field.key] || '')} onChange={event => patchSample(index, `fields.${field.key}`, field.kind === 'tags' ? event.target.value.split(/\r?\n/) : event.target.value)} placeholder={field.kind === 'tags' ? t('llm.tagsOnePerLine') : ''}/>}</label>)}{!llmSampleIsComplete(sample, sampleFieldSpecs) && <small className="persona-sample-hint">{t('llm.sampleRequiredHint')}</small>}</div></div>)}<div className="settings-actions spread"><Button variant="danger-ghost" icon="trash" onClick={deletePersona}>{t('llm.deletePersona')}</Button><label className="flow-radio"><input type="radio" checked={config.default_persona_id === selectedId} onChange={() => patchConfig('default_persona_id', selectedId)}/>{t('llm.setDefault')}</label></div></div></div></section>
     <div className="settings-sticky-save"><Button variant="primary" onClick={save} disabled={saving}>{saving ? t('common.saving') : t('llm.save')}</Button></div>
   </div>;
 }
@@ -887,9 +928,9 @@ function SystemSettings({ status, tasks, connected, onStart, onCancel, onNavigat
   </div>;
 }
 
-function SettingsPage({ tab, onTabChange, status, scheduler, llmConfig, theme, setTheme, reloadStatus, setScheduler, setLlmConfig, notify, tasks, connected, onMaintenance, onCancel, onNavigate }) {
+function SettingsPage({ tab, onTabChange, status, scheduler, llmConfig, llmPlatformSpecs, theme, setTheme, reloadStatus, setScheduler, setLlmConfig, notify, tasks, connected, onMaintenance, onCancel, onNavigate }) {
   const { t } = useI18n();
-  return <section className="settings-shell"><div className="settings-layout"><nav aria-label={t('settings.sections')}><div>{SETTINGS_NAV.map(([id,icon]) => <button aria-current={tab === id ? 'page' : undefined} aria-pressed={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => onTabChange(id)}><Icon name={icon}/><span>{t(`settings.tab.${id}`)}</span></button>)}</div></nav><div className="settings-main"><div key={tab} className="settings-page-transition">{tab === 'general' && <GeneralSettings status={status} theme={theme} setTheme={setTheme} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'pixiv' && <PixivSettings status={status} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'llm' && <LlmSettings initialConfig={llmConfig} onSaved={setLlmConfig} notify={notify}/>} {tab === 'scheduler' && <SchedulerSettings scheduler={scheduler} onChanged={setScheduler} llmConfig={llmConfig} notify={notify}/>} {tab === 'system' && <SystemSettings status={status} tasks={tasks} connected={connected} onStart={onMaintenance} onCancel={onCancel} onNavigate={onNavigate} reloadStatus={reloadStatus}/>}</div></div></div></section>;
+  return <section className="settings-shell"><div className="settings-layout"><nav aria-label={t('settings.sections')}><div>{SETTINGS_NAV.map(([id,icon]) => <button aria-current={tab === id ? 'page' : undefined} aria-pressed={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => onTabChange(id)}><Icon name={icon}/><span>{t(`settings.tab.${id}`)}</span></button>)}</div></nav><div className="settings-main"><div key={tab} className="settings-page-transition">{tab === 'general' && <GeneralSettings status={status} theme={theme} setTheme={setTheme} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'pixiv' && <PixivSettings status={status} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'llm' && <LlmSettings initialConfig={llmConfig} platformSpecs={llmPlatformSpecs} onSaved={setLlmConfig} notify={notify}/>} {tab === 'scheduler' && <SchedulerSettings scheduler={scheduler} onChanged={setScheduler} llmConfig={llmConfig} notify={notify}/>} {tab === 'system' && <SystemSettings status={status} tasks={tasks} connected={connected} onStart={onMaintenance} onCancel={onCancel} onNavigate={onNavigate} reloadStatus={reloadStatus}/>}</div></div></div></section>;
 }
 
 function Sidebar({ status, page, activeTaskCount, onNavigate, mobileOpen, setMobileOpen }) {
@@ -940,6 +981,7 @@ function FlowConsoleApp() {
   const [logs, setLogs] = useState([]);
   const [scheduler, setScheduler] = useState({ enabled: false, targets: 'civitai,pixiv', ai_tags_by_platform: { pixiv: true } });
   const [llmConfig, setLlmConfig] = useState({ enabled: false, personas: [] });
+  const [llmPlatformSpecs, setLlmPlatformSpecs] = useState({});
   const [uploadDefaults, setUploadDefaults] = useState({});
   const [connected, setConnected] = useState(false);
   const [dialog, setDialog] = useState('');
@@ -988,7 +1030,7 @@ function FlowConsoleApp() {
   async function reloadImages() { const next = await api('/api/images'); setImages(next); return next; }
   async function reloadTasks() { const next = await api('/api/tasks'); setTasks(next); return next; }
   useEffect(() => {
-    Promise.all([reloadStatus(), reloadImages(), reloadTasks(), api('/api/llm-reverse-config'), api('/api/upload-defaults')]).then(([, , , llm, defaults]) => { setLlmConfig(llm); setUploadDefaults(defaults); }).catch(error => notify(localizedError(error, t), 'error'));
+    Promise.all([reloadStatus(), reloadImages(), reloadTasks(), api('/api/llm-reverse-config'), api('/api/llm-reverse-platforms'), api('/api/upload-defaults')]).then(([, , , llm, platforms, defaults]) => { setLlmConfig(llm); setLlmPlatformSpecs(platforms); setUploadDefaults(defaults); }).catch(error => notify(localizedError(error, t), 'error'));
     const source = new EventSource('/api/stream');
     const listen = (name, handler) => source.addEventListener(name, event => { try { handler(JSON.parse(event.data)); } catch (_) {} });
     source.onopen = () => setConnected(true);
@@ -1041,7 +1083,7 @@ function FlowConsoleApp() {
         {route.page === 'split' && <SplitPage onStart={startSplit}/>}
         {route.page === 'tasks' && <TaskCenter tasks={tasks} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask}/>}
         {route.page === 'logs' && <ActivityLog logs={logs} clearLogs={() => setLogs([])} notify={notify}/>}
-        {route.page === 'settings' && <SettingsPage tab={route.settingsTab} onTabChange={tab => navigate('settings', tab)} status={status} scheduler={scheduler} llmConfig={llmConfig} theme={theme} setTheme={setTheme} reloadStatus={reloadStatus} setScheduler={setScheduler} setLlmConfig={setLlmConfig} notify={notify} tasks={tasks} connected={connected} onMaintenance={startMaintenance} onCancel={cancelTask} onNavigate={navigate}/>}
+        {route.page === 'settings' && <SettingsPage tab={route.settingsTab} onTabChange={tab => navigate('settings', tab)} status={status} scheduler={scheduler} llmConfig={llmConfig} llmPlatformSpecs={llmPlatformSpecs} theme={theme} setTheme={setTheme} reloadStatus={reloadStatus} setScheduler={setScheduler} setLlmConfig={setLlmConfig} notify={notify} tasks={tasks} connected={connected} onMaintenance={startMaintenance} onCancel={cancelTask} onNavigate={navigate}/>}
       </div></div>
     </main>
     {dialog === 'publish' && <PublishDialog images={images} status={status} defaults={uploadDefaults} llmConfig={llmConfig} onReloadImages={reloadImages} onClose={() => setDialog('')} onRun={startPublish} notify={notify}/>}

@@ -11,8 +11,8 @@ A local, **Pixiv-first** publishing workspace for artwork. It currently supports
 - **Page-based workspace** — switch between publishing, Civitai splitting, tasks, activity logs, and settings from one sidebar
 - **Pixiv publishing** — fills titles, captions, tags, age ratings, and original/fan-art settings
 - **Civitai publishing** — publishes images and can split existing multi-image posts into individual posts
-- **Smart tagging** — PixAI tagger with a CL / WD14 fallback chain
-- **LLM copy generation** — generates Japanese Pixiv titles and captions with request retries, response repair, and fallback-model failover
+- **Smart tagging** — PixAI and CL / WD14 local taggers, plus LLM-generated visual tags routed through the same Pixiv normalization and popularity-ranking pipeline
+- **LLM copy and tags** — generates Japanese Pixiv titles, captions, and visual tags with request retries, response repair, and fallback-model failover
 - **R-18 processing** — mosaic, Gaussian blur, and black-bar censor modes
 - **Text and image watermarks** — configurable position, size, opacity, margin, fonts, and transparent image marks
 - **Scheduled publishing** — automatically processes the queue at randomized intervals
@@ -81,7 +81,7 @@ Recommended first-time setup:
 
 1. Open **Settings → General** and configure the Pixiv / Civitai login or API key
 2. Choose censoring and watermark behavior under **Settings → Pixiv processing**
-3. If copy generation is needed, configure the provider, Base URL, API key, model, and optional retry policy under **Settings → LLM copy**
+3. For automatic copy and visual tags, configure the provider, Base URL, API key, model, and optional retry policy under **Settings → LLM copy & tags**
 4. Place images in `upload/`, or drag them into the publish dialog
 5. Select the target platforms in the **Publishing workspace** and create a task
 6. Follow live stages, progress, and errors in **Task center**, then inspect or copy full logs from **Activity log**
@@ -148,6 +148,9 @@ Tagger priority:
 
 ```text
 PixAI tagger → CL / WD14 tagger → metadata / filename candidates
+                                      + LLM visual tags (when enabled)
+                                      ↓
+                       Pixiv normalization / dedup / ranking (max 10)
 ```
 
 Configure models from CLI menu **[6]** or the Web UI settings. Automatic PixAI download requires:
@@ -158,11 +161,13 @@ Configure models from CLI menu **[6]** or the Web UI settings. Automatic PixAI d
 
 The PixAI v0.9 model is approximately 1.27 GB; reserve enough disk space before downloading it. The app validates configured directories and discovers valid models under the current project's `models/` or HainTag data directory; stale absolute paths are never executed.
 
-## ✍️ LLM copy generation
+## ✍️ LLM copy and visual tags
 
-Pixiv copy generation supports OpenAI-compatible endpoints, Anthropic, and Google Gemini configurations. Each persona can keep its own prompt, content mode, and defaults. Vision requests use a JPEG preview with a 1536 px maximum edge to reduce latency and memory usage for large images; the publishing source remains unchanged.
+Pixiv generation supports OpenAI-compatible endpoints, Anthropic, and Google Gemini configurations. Each persona can keep its own prompt, content mode, and defaults. The model must return complete bilingual copy and at least six distinct, usable visual keywords; missing fields, duplicate padding, or reserved-only tags trigger a structure-repair round. Returned visual keywords are sanitized to remove hashtags, URLs, duplicates, and the program-managed `オリジナル` / `オリジナルイラスト` / `AIイラスト` markers. They are then merged with local tagger, metadata, and filename candidates before Pixiv normalization, Japanese alias mapping, deduplication, and popularity ranking; no more than ten final tags are kept. Automatic content tags therefore still work with LLM enabled when no local tagger model is installed.
 
-Generation uses three recovery levels: transient network, rate-limit, and server failures are retried with exponential backoff; empty or malformed JSON responses enter a repair round; and only then does the app move through configured fallback models. Authentication and permission failures stop immediately. **Settings → LLM copy → Multi-level retry and failover** exposes the per-request timeout, retry and repair counts, total time budget, and up to three fallback models. The Task center reports request, wait, repair, and failover activity in real time.
+Persona reference examples expose every output field from the active platform schema: Japanese and Chinese titles, both captions, and visual tags. An example is sent to the model only after every required field and at least six distinct tags are complete; unfinished drafts are marked in the UI and safely ignored.
+
+Vision requests use a JPEG preview with a 1536 px maximum edge to reduce latency and memory usage for large images; the publishing source remains unchanged. Generation uses three recovery levels: transient network, rate-limit, and server failures are retried with exponential backoff; empty or malformed JSON responses enter a repair round; and only then does the app move through configured fallback models. Authentication and permission failures stop immediately. **Settings → LLM copy & tags → Multi-level retry and failover** exposes the per-request timeout, retry and repair counts, total time budget, and up to three fallback models. The Task center reports request, wait, repair, and failover activity in real time.
 
 Sensitive settings are stored in the local `config.json`. It is ignored by Git; never commit API keys, cookies, or other credentials.
 

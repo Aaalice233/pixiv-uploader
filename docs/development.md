@@ -79,12 +79,13 @@ config.json                     本机设置、凭据和 Scheduler 状态
 
 1. 从 `upload/` 按排序或前端指定顺序选图；
 2. 读取 ComfyUI / A1111 metadata、prompt 和 LoRA token；
-3. 运行 PixAI 或 WD14 tagger，并构建 Pixiv payload；
-4. 按 `PLATFORM_RULES` 执行平台特有的 sanitize、censor、水印与 LLM 文案；
-5. 使用独立浏览器 profile 发布到 Civitai / Pixiv；
-6. 持续写入 `runtime/manifests/`；所有目标成功后把原图移入 `done/`。
+3. 按 `PLATFORM_RULES` 生成 sanitize 副本并执行 censor；
+4. 运行 PixAI 或 WD14 tagger，以本地候选构建初始 Pixiv payload；
+5. 启用 LLM 时生成文案与视觉标签，把视觉标签合并回候选后重新经过完整标签管线，再执行水印；
+6. 使用独立浏览器 profile 发布到 Civitai / Pixiv；
+7. 持续写入 `runtime/manifests/`；所有目标成功后把原图移入 `done/`。
 
-取消只在可逆阶段立即生效。进入实际 publish 点击后，流程优先完成收尾并记录远端成功结果，避免远端已发布而本地误报取消。
+取消只在可逆阶段立即生效。进入实际 publish 点击后，流程优先完成收尾并记录远端成功结果，避免远端已发布而本地误报取消。Pixiv 点击投稿后只能由作品 URL、已知投稿落地页或成功提示确认提交，任意离开上传页和表单消失都不能单独作为成功依据；跳转到用户页时应按标题解析最新作品 URL。由于点击后的不确定失败禁止自动重试，避免重复投稿。
 
 LLM 视觉请求只发送最长边 1536 px 的 JPEG 预览，不得直接 base64 编码发布原图。Pixiv 浏览器通过 CDP 复用登录窗口时，任务结束只断开自动化连接，不关闭用户浏览器；仅关闭由任务自身创建的 persistent context。浏览器会话中途关闭必须记录 `browser_closed` 并立即停止后续 DOM 操作。
 
@@ -99,7 +100,7 @@ LLM 视觉请求只发送最长边 1536 px 的 JPEG 预览，不得直接 base64
 
 - `needs_sanitize`：重新编码，移除 EXIF 和 PNG text chunk；
 - `needs_censor`：运行自动打码；
-- `needs_copy`：允许 LLM 生成 Pixiv 标题与简介。
+- `needs_copy`：允许 LLM 生成 Pixiv 标题、简介与视觉标签。
 
 CLI、Web API、Scheduler 和配置归一化共用同一平台集合。未知平台必须在任务启动前显式失败，不做静默兼容。
 
@@ -111,6 +112,8 @@ CLI、Web API、Scheduler 和配置归一化共用同一平台集合。未知平
 2. `runtime/pixiv/jp_aliases.json` 的人工覆盖；
 3. `pixiv_uploader/resources/pixiv/danbooru_jp.json.gz` 主词典；
 4. Pixiv live lookup 与 `runtime/pixiv/tag_popularity.json` 缓存。
+
+候选来源包含本地 tagger、metadata / 文件名和启用时的 LLM `keywords`。LLM 候选必须先移除 hashtag、URL、重复项及程序维护的 `オリジナル` / `オリジナルイラスト` / `AIイラスト` 标记，再作为高置信度 `general` 候选重新调用 `build_pixiv_payload()`；禁止绕过既有映射、过滤、日文 canonical、热度排序与最多 10 个标签的上限直接写入 `final_tags`。`オリジナル` 必须预留一个槽位，不能在选满 10 个标签后再插入造成 11 个标签。
 
 其他规则：
 
@@ -148,11 +151,13 @@ Tagger 设置向导：
 .venv/Scripts/python.exe -m pixiv_uploader.pixiv.setup_tagger
 ```
 
-## LLM 文案
+## LLM 文案与视觉标签
 
-LLM 仅增强 Pixiv 的 `title_*` 和 `caption_*`，不负责 tag、年龄分级、打码、Civitai 过滤或发布动作。仅选择 Civitai 时整段跳过。
+LLM 增强 Pixiv 的 `title_*`、`caption_*` 和视觉 `keywords`。关键词只作为标签候选，必须重新经过 Pixiv 标签管线；它不负责年龄分级、打码、Civitai 过滤或发布动作。仅选择 Civitai 时整段跳过。本地 tagger 不可用不会禁用 LLM 视觉标签，两者是可独立降级、最终合流的候选源。
 
-私有配置位于 `config.json.llm_reverse`。`manifest.pixiv.llm_reverse` 记录状态、人设、内容模式和不含凭据的错误摘要。SFW 模式遇到 R-18/R-18G 时应记录 `skipped_content_mode` 并保留规则文案；生成失败同样回落，不阻断上传。
+私有配置位于 `config.json.llm_reverse`。`manifest.pixiv.llm_reverse` 记录状态、人设、内容模式和不含凭据的错误摘要；其 `tagging` 字段记录候选数、新增标签、最终标签数或显式合并错误。SFW 模式遇到 R-18/R-18G 时应记录 `skipped_content_mode` 并保留规则文案；生成或标签合并失败同样显式记录并回落到本地候选，不阻断上传。
+
+`pixiv_uploader/pixiv/llm_platforms.py::PLATFORM_SPECS` 是 LLM 输出字段的单一契约。每个字段必须声明稳定 `key`、类型、长度、必填状态、双语 `label_key` 和受支持的 `consumer`；启动时 `validate_platform_specs()` 对注册表做 fail-fast 校验，构建检查再核对动态语言键。提示词必填字段、响应归一化、payload/标签消费和前端参考示例编辑器都必须从该注册表派生，禁止在任一端另写一套字段列表。必填标签按清理、去保留项和不区分大小写去重后的数量校验；不完整 few-shot 示例不得进入模型上下文。
 
 `llm_reverse.retry_policy` 定义三层恢复策略：
 
@@ -210,7 +215,7 @@ LLM 仅增强 Pixiv 的 `title_*` 和 `caption_*`，不负责 tag、年龄分级
 
 - `frontend/src/flow-app.jsx` 的 `APP_PAGES` 与 `SETTINGS_TABS` 是页面和设置分类的稳定 ID 集合；URL 使用 `#/page` 或 `#/settings/tab`，刷新与浏览器前进/后退必须恢复当前位置；
 - 侧边栏只放可切换的一级页面，不放“安装模型”“检查更新”等一次性命令，也不与页面内部标签重复；
-- 设置是一级页面，通用、Pixiv 处理、LLM 文案、定时发布和系统维护属于其内部分类；新增配置应优先归入现有分类，只有形成独立工作流时才新增侧边栏页面；
+- 设置是一级页面，通用、Pixiv 处理、LLM 文案与标签、定时发布和系统维护属于其内部分类；新增配置应优先归入现有分类，只有形成独立工作流时才新增侧边栏页面；
 - 发布与拆分任务使用 `category=workflow` 并进入任务中心；模型安装、更新等环境操作使用 `category=maintenance`，只在系统维护页展示其状态和输出；
 - 新增页面时同步路由解析、侧边栏入口、`page.*` / `nav.*` 双语文案及桌面/移动布局；不要再引入互相独立的弹窗导航状态。
 

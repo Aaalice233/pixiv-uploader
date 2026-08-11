@@ -10,9 +10,23 @@ from unittest.mock import patch
 
 class SupportedPlatformTests(unittest.TestCase):
     def test_backend_platform_registry_contains_only_pixiv_copy_schema(self) -> None:
-        from pixiv_uploader.pixiv.llm_platforms import PLATFORM_SPECS
+        from pixiv_uploader.pixiv.llm_platforms import (
+            PLATFORM_SPECS,
+            SUPPORTED_OUTPUT_CONSUMERS,
+            required_field_keys,
+            validate_platform_specs,
+        )
 
         self.assertEqual(set(PLATFORM_SPECS), {"pixiv"})
+        self.assertEqual(validate_platform_specs(), [])
+        fields = PLATFORM_SPECS["pixiv"]["fields"] + PLATFORM_SPECS["pixiv"]["extra_fields"]
+        self.assertEqual(len({field["key"] for field in fields}), len(fields))
+        self.assertTrue(all(field.get("consumer") in SUPPORTED_OUTPUT_CONSUMERS for field in fields))
+        self.assertEqual(
+            required_field_keys("pixiv"),
+            ["title_ja", "title_zh", "caption_ja", "caption_zh", "keywords"],
+        )
+        self.assertNotIn("description", {field["key"] for field in fields})
 
     def test_upload_target_parser_accepts_only_civitai_and_pixiv(self) -> None:
         import pixiv_uploader.publishing as civitai_splitter
@@ -117,6 +131,21 @@ class PlatformApiTests(unittest.TestCase):
                     task = next(item for item in self.client.get("/api/tasks").get_json() if item["id"] == task_id)
                     self.assertEqual(task["cmd"], command)
                     self.assertEqual(task["category"], "maintenance")
+
+    def test_llm_platform_api_exposes_sample_editor_and_output_consumers(self) -> None:
+        response = self.client.get("/api/llm-reverse-platforms")
+
+        self.assertEqual(response.status_code, 200)
+        pixiv = response.get_json()["pixiv"]
+        fields = pixiv["fields"] + pixiv["extra_fields"]
+        self.assertEqual({field["consumer"] for field in fields}, {"payload", "tag_candidates"})
+        self.assertTrue(all(field.get("label_key") for field in fields))
+        self.assertTrue(all(field.get("required") for field in fields))
+        keywords = next(field for field in fields if field["key"] == "keywords")
+        self.assertTrue(keywords["required"])
+        self.assertEqual(keywords["min_count"], 6)
+        self.assertIn("オリジナル", keywords["forbidden_values"])
+        self.assertIn("#", keywords["forbidden_prefixes"])
 
     def test_llm_retry_policy_is_persisted_as_a_nested_partial_update(self) -> None:
         initial = self.client.post("/api/llm-reverse-config", json={

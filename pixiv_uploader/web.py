@@ -159,7 +159,7 @@ CMD_LABELS = {
     3: ("发布到 Pixiv", "Pixiv"),
     4: ("安装打码模型", "本地处理"),
     5: ("检查更新", "本地处理"),
-    6: ("生成 Pixiv 文案", "本地处理"),
+    6: ("生成 Pixiv 文案与标签", "本地处理"),
 }
 MAINTENANCE_COMMANDS = frozenset({4, 5})
 CMD_LOG_SOURCES = {

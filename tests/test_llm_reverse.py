@@ -41,8 +41,18 @@ def _response(status: int, payload, headers=None) -> httpx.Response:
     return httpx.Response(status, json=payload, headers=headers, request=request)
 
 
+def _success_fields(title: str = "夜の光") -> dict:
+    return {
+        "title_ja": title,
+        "title_zh": "夜之光",
+        "caption_ja": "静かな夜のイラストです。",
+        "caption_zh": "描绘宁静夜晚的插画。",
+        "keywords": ["女の子", "夜", "星空", "白髪", "青い目", "ドレス"],
+    }
+
+
 def _success_response(title: str = "夜の光") -> httpx.Response:
-    content = json.dumps({"title_ja": title}, ensure_ascii=False)
+    content = json.dumps(_success_fields(title), ensure_ascii=False)
     return _response(200, {"choices": [{"message": {"content": content}}]})
 
 
@@ -82,6 +92,37 @@ class LlmImagePreviewTests(unittest.TestCase):
 
 
 class LlmRetryPolicyTests(unittest.TestCase):
+    def test_partial_few_shot_sample_is_not_sent_to_the_model(self) -> None:
+        spec = llm_reverse.get_merged_spec(["pixiv"])
+        persona = {
+            "platform": ["pixiv"],
+            "samples": [
+                {"mode": "sfw", "note": "incomplete", "fields": {"title_ja": "不足例"}},
+                {"mode": "sfw", "note": "complete", "fields": _success_fields("完成例")},
+            ],
+        }
+
+        block = llm_reverse._render_samples_block(persona, "sfw", spec)
+
+        self.assertNotIn("不足例", block)
+        self.assertIn("完成例", block)
+        self.assertIn("keywords", block)
+
+    def test_pixiv_prompt_requires_actionable_visual_keywords(self) -> None:
+        payload = llm_reverse._build_request_payload(
+            _retry_config(),
+            {"voice": "", "sfw_prompt": "", "extra_prompt": "", "avoid": []},
+            "sfw",
+            llm_reverse.PLATFORM_SPECS["pixiv"],
+            "https://example.invalid/image.jpg",
+        )
+        prompt = payload["messages"][0]["content"][0]["text"]
+
+        required_line = next(line for line in prompt.splitlines() if line.startswith("Return only"))
+        self.assertIn("keywords", required_line.split("Optional keys:")[0])
+        self.assertIn("6-16 concise", prompt)
+        self.assertIn("do not include hashtags", prompt)
+
     def test_retry_policy_is_normalized_and_primary_model_is_not_duplicated(self) -> None:
         normalized = llm_reverse.normalize_llm_reverse_config({
             "enabled": "false",
@@ -153,6 +194,35 @@ class LlmRetryPolicyTests(unittest.TestCase):
         self.assertEqual(result["retry"]["attempt_count"], 1)
         self.assertEqual(result["retry"]["models_tried"], ["primary-model"])
         self.assertFalse(result["retry"]["fallback_used"])
+
+    def test_required_visual_keywords_must_be_distinct(self) -> None:
+        fields = _success_fields()
+        fields["keywords"] = ["夜"] * 6
+
+        with self.assertRaisesRegex(ValueError, "keywords"):
+            llm_reverse._normalize_output(fields, llm_reverse.PLATFORM_SPECS["pixiv"])
+
+    def test_missing_required_visual_keywords_runs_strict_repair_round(self) -> None:
+        incomplete = _response(200, {
+            "choices": [{"message": {"content": json.dumps({
+                key: value for key, value in _success_fields().items() if key != "keywords"
+            }, ensure_ascii=False)}}]
+        })
+        client = _client_with(incomplete, _success_response("タグ修復済み"))
+
+        with patch.object(llm_reverse.httpx, "Client", return_value=client):
+            result = llm_reverse.infer_image_copy(
+                image_url="https://example.invalid/image.jpg",
+                config=_retry_config(request_attempts=1, repair_attempts=1),
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["fields"]["title_ja"], "タグ修復済み")
+        self.assertGreaterEqual(len(result["fields"]["keywords"]), 6)
+        self.assertEqual(result["retry"]["repair_count"], 1)
+        second_payload = client.post.call_args_list[1].kwargs["json"]
+        prompt = second_payload["messages"][0]["content"][0]["text"]
+        self.assertIn("Every required field must be non-empty", prompt)
 
     def test_invalid_model_output_runs_strict_repair_round(self) -> None:
         invalid = _response(200, {"choices": [{"message": {"content": "not-json"}}]})
@@ -258,7 +328,7 @@ class LlmRetryPolicyTests(unittest.TestCase):
         self.assertEqual(client.post.call_count, 1)
 
     def test_retry_engine_preserves_native_provider_request_shapes(self) -> None:
-        content = json.dumps({"title_ja": "ネイティブ成功"}, ensure_ascii=False)
+        content = json.dumps(_success_fields("ネイティブ成功"), ensure_ascii=False)
         cases = [
             (
                 "anthropic",

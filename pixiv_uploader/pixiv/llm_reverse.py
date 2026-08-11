@@ -20,12 +20,10 @@ from PIL import Image, ImageOps
 from .llm_platforms import (
     DEFAULT_PLATFORM_ID,
     PLATFORM_SPECS,
-    all_field_keys,
-    empty_sample_fields,
+    field_specs_for_consumer,
     get_merged_spec,
     list_platform_ids,
     normalize_platform_ids,
-    required_field_keys,
 )
 
 POLITICAL_RE = re.compile(
@@ -970,9 +968,10 @@ def apply_llm_result_to_pixiv_payload(payload: dict[str, Any], result: dict[str,
     if result.get("status") != "ok":
         return
     fields = result.get("fields") or {}
-    for key in ("title_ja", "title_zh", "caption_ja", "caption_zh"):
+    for field in field_specs_for_consumer("pixiv", "payload"):
+        key = str(field.get("key") or "")
         value = str(fields.get(key, "") or "").strip()
-        if value:
+        if key and value:
             payload[key] = value
 
 
@@ -1021,7 +1020,16 @@ def _build_request_payload(
     fields = spec.get("fields") or []
     extra_fields = spec.get("extra_fields") or []
     required_keys = [str(f.get("key")) for f in fields if f.get("key")]
-    extra_keys = [str(f.get("key")) for f in extra_fields if f.get("key")]
+    required_keys.extend(
+        str(field.get("key"))
+        for field in extra_fields
+        if field.get("key") and field.get("required")
+    )
+    extra_keys = [
+        str(field.get("key"))
+        for field in extra_fields
+        if field.get("key") and not field.get("required")
+    ]
     field_lines = [_describe_field(f) for f in fields]
     extra_lines = [_describe_field(f) for f in extra_fields]
 
@@ -1066,7 +1074,7 @@ def _build_request_payload(
         parts.append(
             "REPAIR: The previous response was rejected because "
             f"{repair_code}. Return exactly one valid JSON object with the required keys and no markdown, "
-            "commentary, preface, or trailing text. Every required text field must be non-empty."
+            "commentary, preface, or trailing text. Every required field must be non-empty and satisfy its limits."
         )
 
     samples_block = _render_samples_block(persona, mode, spec)
@@ -1096,13 +1104,18 @@ def _build_request_payload(
 def _describe_field(field: dict[str, Any]) -> str:
     key = field.get("key", "")
     kind = field.get("kind", "text")
+    instruction = str(field.get("instruction") or "").strip()
     if kind == "tags":
-        max_count = field.get("max_count", 10)
-        per_max = field.get("max", 50)
-        return f"{key}: list of strings, up to {max_count} items, each within {per_max} chars"
-    limit = field.get("max", 200)
-    shape = "single line" if kind == "text" else "1-3 short lines"
-    return f"{key}: string, {shape}, within {limit} chars"
+        min_count = int(field.get("min_count", 0))
+        max_count = int(field.get("max_count", 10))
+        per_max = int(field.get("max", 50))
+        count_rule = f"{min_count}-{max_count} items" if min_count else f"up to {max_count} items"
+        description = f"{key}: list of strings, {count_rule}, each within {per_max} chars"
+    else:
+        limit = field.get("max", 200)
+        shape = "single line" if kind == "text" else "1-3 short lines"
+        description = f"{key}: string, {shape}, within {limit} chars"
+    return f"{description}; {instruction}" if instruction else description
 
 
 def _render_samples_block(persona: dict[str, Any], mode: str, spec: dict[str, Any]) -> str:
@@ -1110,16 +1123,14 @@ def _render_samples_block(persona: dict[str, Any], mode: str, spec: dict[str, An
     matched = [s for s in samples if s.get("mode") == mode]
     if not matched:
         return ""
-    _plat = persona.get("platform", DEFAULT_PLATFORM_ID)
-    if isinstance(_plat, list):
-        valid_keys = set(k for pid in _plat for k in all_field_keys(pid))
-    else:
-        valid_keys = set(all_field_keys(_plat))
     rendered: list[str] = []
     for idx, sample in enumerate(matched[:MAX_FEW_SHOT_SAMPLES], start=1):
         fields = sample.get("fields") or {}
-        clean = {k: v for k, v in fields.items() if k in valid_keys and v not in (None, "", [])}
-        if not clean:
+        try:
+            clean = _normalize_output(fields, spec)
+        except (TypeError, ValueError):
+            # Partial examples contradict the required output schema and reduce
+            # repair reliability, so keep them editable but omit them from prompts.
             continue
         note = str(sample.get("note", "")).strip()
         header = f"Example {idx}" + (f" ({note})" if note else "")
@@ -1311,22 +1322,32 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 
 def _normalize_output(data: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    has_required = False
-    for field in spec.get("fields") or []:
-        key = str(field.get("key", ""))
-        if not key:
-            continue
-        value = _coerce_field_value(data.get(key), field)
-        out[key] = value
-        if value not in (None, "", []):
-            has_required = True
-    for field in spec.get("extra_fields") or []:
-        key = str(field.get("key", ""))
-        if not key or key not in data:
-            continue
-        out[key] = _coerce_field_value(data.get(key), field)
-    if not has_required:
-        raise ValueError(f"empty required fields for platform {spec.get('label', '')}")
+    missing_required: list[str] = []
+    field_groups = (
+        (spec.get("fields") or [], True),
+        (spec.get("extra_fields") or [], False),
+    )
+    for fields, required_by_default in field_groups:
+        for field in fields:
+            key = str(field.get("key", ""))
+            if not key:
+                continue
+            required = bool(field.get("required", required_by_default))
+            if not required and key not in data:
+                continue
+            value = _coerce_field_value(data.get(key), field)
+            out[key] = value
+            minimum = (
+                int(field.get("min_count", 1 if required else 0))
+                if field.get("kind") == "tags"
+                else 1
+            )
+            if required and (value in (None, "", []) or (isinstance(value, list) and len(value) < minimum)):
+                missing_required.append(key)
+    if missing_required:
+        raise ValueError(
+            f"missing required fields for platform {spec.get('label', '')}: {', '.join(missing_required)}"
+        )
     return out
 
 
@@ -1336,7 +1357,20 @@ def _coerce_field_value(value: Any, field: dict[str, Any]) -> Any:
         max_count = int(field.get("max_count", 10))
         per_max = int(field.get("max", 50))
         items = value if isinstance(value, list) else []
-        return [_clean_text(item, per_max) for item in items[:max_count] if _clean_text(item, per_max)]
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        forbidden = {str(item).casefold() for item in field.get("forbidden_values", [])}
+        forbidden_prefixes = tuple(str(item).casefold() for item in field.get("forbidden_prefixes", []))
+        for item in items:
+            tag = _clean_text(item, per_max)
+            key = tag.casefold()
+            if not tag or key in seen or key in forbidden or key.startswith(forbidden_prefixes):
+                continue
+            seen.add(key)
+            cleaned.append(tag)
+            if len(cleaned) >= max_count:
+                break
+        return cleaned
     limit = int(field.get("max", 200))
     return _clean_text(value, limit)
 

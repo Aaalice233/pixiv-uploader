@@ -113,7 +113,7 @@ STAGE_LABELS = {
     "censoring": "检测并处理敏感区域",
     "tagging": "识别图片标签",
     "organizing_tags": "整理标签与分级",
-    "generating_copy": "生成标题与简介",
+    "generating_copy": "生成文案与视觉标签",
     "watermarking": "应用水印",
     "saving_manifest": "保存发布清单",
     "publishing_civitai": "发布到 Civitai",

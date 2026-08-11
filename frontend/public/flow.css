@@ -370,8 +370,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .sample-heading { padding-top: 4px; display: flex; align-items: center; justify-content: space-between; }
 .sample-heading strong { font-size: 11px; }
 .sample-heading button { display: inline-flex; align-items: center; gap: 4px; border: 0; color: var(--flow-muted); background: transparent; font-size: 10px; cursor: pointer; }
-.persona-sample { padding: 12px; display: grid; gap: 8px; border-radius: 11px; background: var(--flow-surface-raised); }
-.persona-sample > div { display: grid; grid-template-columns: 70px 1fr 32px; gap: 6px; }
+.persona-sample { padding: 12px; display: grid; gap: 11px; border-radius: 11px; background: var(--flow-surface-raised); }
+.persona-sample > div:first-child { display: grid; grid-template-columns: 70px 1fr 32px; gap: 6px; }
+.persona-sample-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.persona-sample-fields label { min-width: 0; display: grid; align-content: start; gap: 5px; }
+.persona-sample-fields label > span { color: var(--flow-muted); font-size: 9px; font-weight: 650; letter-spacing: .03em; }
+.persona-sample-fields label > span b { margin-left: 3px; color: var(--flow-danger); }
+.persona-sample-fields .sample-field-tags { grid-column: 1 / -1; }
+.persona-sample-hint { grid-column: 1 / -1; color: var(--flow-warning); font-size: 9px; line-height: 1.45; }
+.persona-sample.incomplete { box-shadow: inset 2px 0 0 var(--flow-warning); }
 .persona-sample input, .persona-sample textarea, .persona-sample select { min-width: 0; min-height: 35px; padding: 7px 9px; border: 0; border-radius: 8px; color: var(--flow-text); background: var(--flow-surface); font-size: 10px; resize: vertical; }
 .persona-sample .flow-icon-button { width: 32px; height: 32px; }
 
@@ -477,6 +484,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .account-row > span:not(.flow-platform-badge) { grid-column: 1 / -1; grid-row: 2; }
   .persona-layout { grid-template-columns: 1fr; }
   .persona-layout > nav { display: flex; overflow-x: auto; }
+  .persona-sample-fields { grid-template-columns: 1fr; }
+  .persona-sample-fields .sample-field-tags { grid-column: auto; }
   .persona-layout > nav button { min-width: 130px; }
   .settings-sticky-save { bottom: 0; margin-inline: -18px; padding-inline: 18px; }
   .maintenance-action { grid-template-columns: 1fr; }

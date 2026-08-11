@@ -14,14 +14,45 @@ PLATFORM_SPECS: dict[str, dict[str, Any]] = {
     "pixiv": {
         "label": "Pixiv",
         "fields": [
-            {"key": "title_ja",   "label": "标题（日）", "kind": "text",      "max": 60},
-            {"key": "title_zh",   "label": "标题（中）", "kind": "text",      "max": 60},
-            {"key": "caption_ja", "label": "简介（日）", "kind": "multiline", "max": 500},
-            {"key": "caption_zh", "label": "简介（中）", "kind": "multiline", "max": 500},
+            {
+                "key": "title_ja", "label": "标题（日）", "label_key": "llm.field.titleJa",
+                "kind": "text", "max": 60, "required": True, "consumer": "payload",
+            },
+            {
+                "key": "title_zh", "label": "标题（中）", "label_key": "llm.field.titleZh",
+                "kind": "text", "max": 60, "required": True, "consumer": "payload",
+            },
+            {
+                "key": "caption_ja", "label": "简介（日）", "label_key": "llm.field.captionJa",
+                "kind": "multiline", "max": 500, "required": True, "consumer": "payload",
+            },
+            {
+                "key": "caption_zh", "label": "简介（中）", "label_key": "llm.field.captionZh",
+                "kind": "multiline", "max": 500, "required": True, "consumer": "payload",
+            },
         ],
         "extra_fields": [
-            {"key": "description", "label": "扩展描述", "kind": "multiline", "max": 1000},
-            {"key": "keywords",    "label": "关键词",   "kind": "tags",      "max_count": 20, "max": 50},
+            {
+                "key": "keywords",
+                "label": "视觉标签",
+                "label_key": "llm.field.keywords",
+                "kind": "tags",
+                "min_count": 6,
+                "max_count": 16,
+                "max": 50,
+                "required": True,
+                "consumer": "tag_candidates",
+                "forbidden_values": [
+                    "original", "original art", "original illustration", "オリジナル",
+                    "オリジナルイラスト", "ai art", "ai generated", "AIイラスト", "AI生成",
+                ],
+                "forbidden_prefixes": ["#", "http://", "https://", "www."],
+                "instruction": (
+                    "return 6-16 concise, established Pixiv/Danbooru-style visual tags; Japanese is preferred; "
+                    "cover subjects, count, hair/eyes, clothing, pose, animals, setting, lighting, mood and style; "
+                    "do not include hashtags, prose, オリジナル, オリジナルイラスト, AIイラスト or AI生成"
+                ),
+            },
         ],
         "prompt_intro": "Analyze the image and write Pixiv post copy.",
         "policy_notes": "Never identify real people. Avoid copyrighted character names unless visually obvious.",
@@ -29,6 +60,38 @@ PLATFORM_SPECS: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_PLATFORM_ID = "pixiv"
+SUPPORTED_OUTPUT_CONSUMERS = frozenset({"payload", "tag_candidates"})
+
+
+def validate_platform_specs() -> list[str]:
+    errors: list[str] = []
+    for platform_id, spec in PLATFORM_SPECS.items():
+        seen: set[str] = set()
+        for field in (spec.get("fields") or []) + (spec.get("extra_fields") or []):
+            key = str(field.get("key") or "").strip()
+            if not key:
+                errors.append(f"{platform_id}: field key is required")
+                continue
+            if key in seen:
+                errors.append(f"{platform_id}: duplicate field {key}")
+            seen.add(key)
+            if field.get("consumer") not in SUPPORTED_OUTPUT_CONSUMERS:
+                errors.append(f"{platform_id}.{key}: unsupported output consumer")
+            if not str(field.get("label_key") or "").strip():
+                errors.append(f"{platform_id}.{key}: label_key is required")
+            if field.get("kind") not in {"text", "multiline", "tags"}:
+                errors.append(f"{platform_id}.{key}: unsupported field kind")
+            if field.get("kind") == "tags" and field.get("required"):
+                minimum = int(field.get("min_count", 0) or 0)
+                maximum = int(field.get("max_count", 0) or 0)
+                if minimum < 1 or maximum < minimum:
+                    errors.append(f"{platform_id}.{key}: invalid required tag count")
+    return errors
+
+
+_PLATFORM_SPEC_ERRORS = validate_platform_specs()
+if _PLATFORM_SPEC_ERRORS:
+    raise RuntimeError("invalid LLM platform schema: " + "; ".join(_PLATFORM_SPEC_ERRORS))
 
 
 def list_platform_ids() -> list[str]:
@@ -118,13 +181,22 @@ def all_field_keys(platform_id: str) -> list[str]:
 
 def required_field_keys(platform_id: str) -> list[str]:
     spec = PLATFORM_SPECS.get(platform_id) or {}
-    return [str(f.get("key") or "").strip() for f in (spec.get("fields") or []) if f.get("key")]
+    required: list[str] = []
+    for field in spec.get("fields") or []:
+        key = str(field.get("key") or "").strip()
+        if key and field.get("required", True):
+            required.append(key)
+    for field in spec.get("extra_fields") or []:
+        key = str(field.get("key") or "").strip()
+        if key and field.get("required", False):
+            required.append(key)
+    return required
 
 
-def empty_sample_fields(platform_id: str) -> dict[str, Any]:
-    spec = PLATFORM_SPECS.get(platform_id) or {}
-    out: dict[str, Any] = {}
-    for field in (spec.get("fields") or []):
-        kind = field.get("kind")
-        out[str(field.get("key"))] = [] if kind == "tags" else ""
-    return out
+def field_specs_for_consumer(platform_id: str, consumer: str) -> list[dict[str, Any]]:
+    spec = PLATFORM_SPECS.get(platform_id) or PLATFORM_SPECS[DEFAULT_PLATFORM_ID]
+    return [
+        deepcopy(field)
+        for field in (spec.get("fields") or []) + (spec.get("extra_fields") or [])
+        if field.get("consumer") == consumer
+    ]

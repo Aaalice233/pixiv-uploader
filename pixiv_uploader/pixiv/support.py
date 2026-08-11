@@ -1654,15 +1654,15 @@ def build_pixiv_payload(
             entity_tags.append(display)
             entity_tags_zh.append(item.get("zh") or display)
 
+    if general_jp_data.get("force_original", True) and domain == "original":
+        final_tags.append("オリジナル")
+        final_tag_translations.append("オリジナル")
+        seen_display.add("オリジナル")
     for entries in (protected_entity_entries, required_entries, normal_content_entries):
         for item in entries:
             if len(final_tags) >= 10:
                 break
             add_final(item)
-    if general_jp_data.get("force_original", True) and domain == "original" and "オリジナル" not in seen_display:
-        final_tags.insert(0, "オリジナル")
-        final_tag_translations.insert(0, "オリジナル")
-        seen_display.add("オリジナル")
 
     subject = next((item for item in [*protected_entity_entries, *normal_content_entries] if item["class"] in {"character", "identity", "franchise"}), None)
     theme = next((item for item in normal_content_entries if item["class"] in {"theme", "feature"}), None)
@@ -3093,6 +3093,76 @@ def _record_step(steps: list[PixivStep], page, log_dir: Path | None, step: Pixiv
     return step
 
 
+def _is_pixiv_submit_destination(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+    if host not in {"pixiv.net", "www.pixiv.net"}:
+        return False
+    return bool(
+        re.fullmatch(r"/users/\d+(?:/artworks)?", path)
+        or path == "/manage/illusts"
+        or path.startswith("/manage/illusts/")
+    )
+
+
+def _resolve_posted_artwork_url(page, expected_title: str) -> str | None:
+    expected_title = str(expected_title or "").strip()
+    if not expected_title:
+        return None
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+        illust_id = page.evaluate(
+            """async ({ expectedTitle, maxCandidates }) => {
+                const normalize = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                const expected = normalize(expectedTitle);
+                const ids = [];
+                const seen = new Set();
+                const addId = value => {
+                    const id = String(value || '');
+                    if (!id || seen.has(id)) return;
+                    seen.add(id);
+                    ids.push(id);
+                };
+                Array.from(document.querySelectorAll('a[href*="/artworks/"]'))
+                    .map(node => (node.href.match(/\\/artworks\\/(\\d+)/) || [])[1])
+                    .filter(Boolean)
+                    .forEach(addId);
+                const userMatch = location.pathname.match(/^\\/users\\/(\\d+)/);
+                if (userMatch) {
+                    try {
+                        const response = await fetch(`/ajax/user/${userMatch[1]}/profile/all`, {
+                            credentials: 'include',
+                        });
+                        const payload = await response.json();
+                        if (!payload.error) {
+                            const profileIds = [
+                                ...Object.keys(payload.body?.illusts || {}),
+                                ...Object.keys(payload.body?.manga || {}),
+                            ].sort((left, right) => Number(right) - Number(left));
+                            profileIds.forEach(addId);
+                        }
+                    } catch (_) {}
+                }
+                ids.sort((left, right) => Number(right) - Number(left));
+                for (const id of ids.slice(0, maxCandidates)) {
+                    try {
+                        const response = await fetch(`/ajax/illust/${id}`, { credentials: 'include' });
+                        const payload = await response.json();
+                        if (!payload.error && normalize(payload.body?.title) === expected) return id;
+                    } catch (_) {}
+                }
+                return '';
+            }""",
+            {"expectedTitle": expected_title, "maxCandidates": 12},
+        )
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        log.warning("    pixiv: 已跳转到个人页，但无法解析新作品 URL: %s", exc)
+        return None
+    return canonical_artwork_url(str(illust_id)) if str(illust_id or "").isdigit() else None
+
+
 def _create_pixiv_post(
     page,
     payload: dict[str, Any],
@@ -3275,10 +3345,8 @@ def _create_pixiv_post(
         record(PixivStep("publish_click", False, "exception", f"{type(exc).__name__}: {exc}"))
         return None, steps
 
-    # Success signals (any of):
-    #   - URL contains /artworks/<digits>
-    #   - URL no longer contains upload.php / illustration/create
-    #   - file input gone (form unmounted) — page transitioned away from upload form
+    # Success requires an artwork URL, a known post-submit destination, or
+    # Pixiv's explicit success message. DOM disappearance alone is ambiguous.
     artwork_re = re.compile(r"/artworks/\d+")
     # Only match actual hCaptcha iframes — the broad div:has-text("安全检查")
     # was firing false positives on Pixiv's footer/disclaimer text even on the
@@ -3310,29 +3378,25 @@ def _create_pixiv_post(
             stop_alert()
             return url, steps
         upload_in_url = "upload.php" in url or "illustration/create" in url
-        if not upload_in_url:
-            # Left the upload page → success (probably to user mypage / artwork list)
+        if not upload_in_url and _is_pixiv_submit_destination(url):
             _sleep_with_cancel(delay, cancel_event)
-            record(PixivStep("redirect", True, detail=f"left upload page url={url}"))
+            artwork_url = _resolve_posted_artwork_url(page, payload.get("title_ja", ""))
+            if artwork_url:
+                detail = f"resolved artwork url={artwork_url} from {url}"
+            else:
+                detail = f"submit destination reached; artwork url unresolved, fallback={url}"
+            record(PixivStep("redirect", True, detail=detail))
             stop_alert()
-            return url, steps
-        # Form gone? (file input no longer in DOM) — success indicator.
-        # Check BEFORE captcha to avoid false positives during the success modal.
-        try:
-            if _first_visible_locator(page, PIXIV_SELECTORS["file_input"]) is None:
-                _sleep_with_cancel(delay, cancel_event)
-                record(PixivStep("redirect", True, detail=f"form unmounted url={url}"))
-                stop_alert()
-                return url, steps
-        except Exception as exc:
-            _raise_if_browser_closed_exception(exc)
+            return artwork_url or url, steps
         # Success modal text ("作品投稿成功") — appears while URL is still the upload page.
         try:
             if page.locator('text=作品投稿成功').count() > 0:
                 _sleep_with_cancel(delay, cancel_event)
-                record(PixivStep("redirect", True, detail=f"success modal text detected url={url}"))
+                artwork_url = _resolve_posted_artwork_url(page, payload.get("title_ja", ""))
+                detail = f"success modal text detected url={artwork_url or url}"
+                record(PixivStep("redirect", True, detail=detail))
                 stop_alert()
-                return url, steps
+                return artwork_url or url, steps
         except Exception as exc:
             _raise_if_browser_closed_exception(exc)
         # Captcha detection: only after grace period so normal redirects finish first.
@@ -3343,9 +3407,9 @@ def _create_pixiv_post(
                 deadline = time.monotonic() + 300
                 stop_alert = _alert_captcha(page)
     timeout_msg = (
-        "5 分钟内未检测到跳转/表单卸载（人机验证未完成？）"
+        "5 分钟内未检测到投稿成功确认（人机验证未完成？）"
         if captcha_detected
-        else "60 秒内未检测到跳转/表单卸载"
+        else "60 秒内未检测到投稿成功确认"
     )
     record(PixivStep("redirect", False, "verify_failed", timeout_msg))
     return None, steps

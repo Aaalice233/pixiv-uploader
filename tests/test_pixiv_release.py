@@ -37,6 +37,172 @@ class PixivCanonicalLookupTests(unittest.TestCase):
         fetch.assert_called_once_with("touhou")
 
 
+class PixivPublishVerificationTests(unittest.TestCase):
+    def test_only_known_submit_destinations_can_confirm_a_redirect(self) -> None:
+        self.assertTrue(support._is_pixiv_submit_destination("https://www.pixiv.net/users/74968612"))
+        self.assertTrue(support._is_pixiv_submit_destination("https://www.pixiv.net/users/74968612/artworks"))
+        self.assertTrue(support._is_pixiv_submit_destination("https://www.pixiv.net/manage/illusts/"))
+        self.assertFalse(support._is_pixiv_submit_destination("https://www.pixiv.net/"))
+        self.assertFalse(support._is_pixiv_submit_destination("https://accounts.pixiv.net/login"))
+        self.assertFalse(support._is_pixiv_submit_destination("https://example.invalid/users/74968612"))
+
+    def test_profile_redirect_resolves_matching_artwork_url(self) -> None:
+        page = Mock()
+        page.evaluate.return_value = "123456789"
+
+        result = support._resolve_posted_artwork_url(page, "午後の羽音")
+
+        self.assertEqual(result, "https://www.pixiv.net/artworks/123456789")
+        page.wait_for_load_state.assert_called_once_with("domcontentloaded", timeout=10000)
+        self.assertEqual(page.evaluate.call_args.args[1]["expectedTitle"], "午後の羽音")
+
+
+class PixivLlmTagPipelineTests(unittest.TestCase):
+    def test_llm_keywords_are_sanitized_deduplicated_and_drop_reserved_tags(self) -> None:
+        import pixiv_uploader.publishing as publishing
+
+        result = {
+            "status": "ok",
+            "fields": {
+                "keywords": [
+                    "#女の子",
+                    "女の子",
+                    "白髪、小鳥",
+                    "オリジナル",
+                    "オリジナルイラスト",
+                    "AIイラスト",
+                    "https://example.invalid/tag",
+                    "  木漏れ日  ",
+                ]
+            },
+        }
+
+        self.assertEqual(
+            publishing._extract_llm_visual_keywords(result),
+            ["女の子", "白髪", "小鳥", "木漏れ日"],
+        )
+
+    def test_llm_keywords_are_reprocessed_through_pixiv_tag_pipeline(self) -> None:
+        import pixiv_uploader.publishing as publishing
+
+        def payload(tags: list[str]) -> dict:
+            return {
+                "raw_candidates": [],
+                "metadata_entity_hits": [],
+                "popularity_decisions": [],
+                "rejected_tags": [],
+                "final_tags": tags,
+                "final_tag_translations": list(tags),
+                "entity_tags": [],
+                "entity_tags_zh": [],
+                "domain": "original",
+                "title_ja": "無題",
+                "title_zh": "无题",
+                "caption_ja": "",
+                "caption_zh": "",
+                "age_restriction": "all_ages",
+                "ai_generated": True,
+            }
+
+        build_payload = Mock(
+            side_effect=[
+                payload(["オリジナル", "AIイラスト"]),
+                payload(["オリジナル", "AIイラスト", "女の子", "白髪", "小鳥"]),
+            ]
+        )
+        llm_result = {
+            "enabled": True,
+            "status": "ok",
+            "content_mode": "sfw",
+            "fields": {
+                "title_ja": "午後の羽音",
+                "title_zh": "午后的羽音",
+                "caption_ja": "静かな午後。",
+                "caption_zh": "安静的午后。",
+                "keywords": ["オリジナル", "女の子", "白髪", "小鳥"],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.png"
+            clean = root / "source_clean.png"
+            source.write_bytes(b"source")
+            metadata = {"available": False, "status": "unavailable", "detected_types": [], "details": []}
+            with patch.object(
+                publishing, "sanitize_image_for_pixiv", return_value=SimpleNamespace(output_path=clean)
+            ), patch.object(
+                publishing, "build_pixiv_payload", build_payload
+            ), patch.object(
+                publishing, "infer_image_copy", return_value=llm_result
+            ), patch.object(
+                publishing, "resolve_persona", return_value=({}, "sfw")
+            ), patch.object(
+                publishing, "append_validation_case"
+            ):
+                manifest, pixiv_ready = publishing.create_upload_manifest(
+                    image_path=source,
+                    targets=["pixiv"],
+                    files={"validation": root / "validation.json"},
+                    hain_bridge=SimpleNamespace(read_metadata=lambda _: metadata),
+                    alias_data={},
+                    popularity_data={},
+                    age_rules={},
+                    civitai_dir=root,
+                    pixiv_dir=root,
+                    pixiv_privacy="public",
+                    pixiv_allow_tag_edits=False,
+                    llm_reverse_config={"enabled": True},
+                    ai_tags_by_platform={"pixiv": True},
+                )
+
+        self.assertTrue(pixiv_ready)
+        self.assertEqual(build_payload.call_count, 2)
+        general_tags = build_payload.call_args_list[1].kwargs["extra_groups"]["general"]
+        self.assertEqual(general_tags, [("女の子", 1.0), ("白髪", 1.0), ("小鳥", 1.0)])
+        self.assertEqual(
+            manifest["pixiv"]["final_tags"],
+            ["オリジナル", "AIイラスト", "女の子", "白髪", "小鳥"],
+        )
+        self.assertEqual(manifest["pixiv"]["title_ja"], "午後の羽音")
+        self.assertEqual(manifest["pixiv"]["title_zh"], "午后的羽音")
+        self.assertEqual(manifest["pixiv"]["caption_ja"], "静かな午後。")
+        self.assertEqual(manifest["pixiv"]["caption_zh"], "安静的午后。")
+        tagging = manifest["pixiv"]["llm_reverse"]["tagging"]
+        self.assertEqual(tagging["status"], "applied")
+        self.assertEqual(tagging["candidate_count"], 3)
+        self.assertEqual(tagging["added_tags"], ["女の子", "白髪", "小鳥"])
+
+    def test_original_tag_reserves_one_of_pixivs_ten_slots(self) -> None:
+        alias_data = {
+            "mappings": {},
+            "semantics": {
+                "ai_art": {
+                    "candidates": ["AIイラスト"],
+                    "default": "AIイラスト",
+                    "zh": "AI插画",
+                    "class": "meta",
+                    "domain": "both",
+                }
+            },
+        }
+        payload = support.build_pixiv_payload(
+            image_path=Path("source.png"),
+            metadata_info={},
+            alias_data=alias_data,
+            popularity_data={},
+            age_rules={},
+            extra_groups={"general": [(f"視覚タグ{i}", 1.0) for i in range(12)]},
+            general_jp_data={"force_original": True},
+            live_lookup=False,
+            live_jp_lookup=False,
+        )
+
+        self.assertEqual(len(payload["final_tags"]), 10)
+        self.assertEqual(payload["final_tags"][0], "オリジナル")
+        self.assertIn("AIイラスト", payload["final_tags"])
+
+
 class PixivBrowserReuseTests(unittest.TestCase):
     def test_profile_cdp_endpoint_ignores_stale_port_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

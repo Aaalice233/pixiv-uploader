@@ -4,6 +4,7 @@ import { messages, validateCatalogs } from '../frontend/src/locales.js';
 const errors = validateCatalogs();
 const source = await readFile(new URL('../frontend/src/flow-app.jsx', import.meta.url), 'utf8');
 const progressSource = await readFile(new URL('../pixiv_uploader/task_progress.py', import.meta.url), 'utf8');
+const llmPlatformSource = await readFile(new URL('../pixiv_uploader/pixiv/llm_platforms.py', import.meta.url), 'utf8');
 
 const cjkMatches = [...source.matchAll(/[\u3400-\u9fff]/g)];
 if (cjkMatches.length) {
@@ -29,6 +30,7 @@ const generatedKeys = [
   ...['bottom_right', 'bottom_left', 'top_right', 'top_left', 'center'].map(value => `pixiv.position.${value}`),
   ...['general', 'pixiv', 'llm', 'scheduler'].map(value => `settings.tab.${value}`),
   ...['random', 'oldest', 'latest', 'nameAsc', 'nameDesc'].map(value => `scheduler.order.${value}`),
+  ...[...llmPlatformSource.matchAll(/"label_key":\s*"([^"]+)"/g)].map(match => match[1]),
 ];
 for (const key of generatedKeys) {
   if (!Object.prototype.hasOwnProperty.call(messages['zh-CN'], key)) errors.push(`generated message key is missing: ${key}`);

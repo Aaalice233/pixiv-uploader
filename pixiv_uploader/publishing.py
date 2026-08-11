@@ -25,6 +25,7 @@ from .watermark import (
     WatermarkService,
 )
 from .pixiv.censor import CENSOR_CLASS_BY_NAME, CensorEngine, DEFAULT_CENSOR_CLASSES, DeepghsDetector, parse_class_set
+from .pixiv.llm_platforms import field_specs_for_consumer
 from .pixiv.llm_reverse import (
     apply_llm_result_to_pixiv_payload,
     build_llm_retry_activity,
@@ -139,6 +140,7 @@ from .pixiv.support import (
     fetch_pixiv_illust_data,
     force_pixiv_age_restriction,
     infer_age_restriction,
+    normalize_key,
     open_pixiv_browser,
     PIXIV_RULE_FIT_PROFILE_DIR,
     summarize_rule_fit_report,
@@ -160,6 +162,67 @@ CIVITAI_API = "https://civitai.red/api/v1"
 DONE_DAYS = 7
 _LORA_RE = re.compile(r"<lora:([^:>]+):([^>]+)>")
 TARGETS = {"civitai", "pixiv"}
+
+
+def _extract_llm_visual_keywords(result: dict) -> list[str]:
+    fields = result.get("fields") if result.get("status") == "ok" else None
+    if not isinstance(fields, dict):
+        return []
+    keyword_fields = field_specs_for_consumer("pixiv", "tag_candidates")
+    keyword_limit = max(
+        (int(field.get("max_count", 0) or 0) for field in keyword_fields),
+        default=20,
+    )
+    reserved_keys = {
+        normalize_key(value)
+        for field in keyword_fields
+        for value in field.get("forbidden_values", [])
+    }
+    source: list = []
+    for field in keyword_fields:
+        value = fields.get(str(field.get("key") or ""))
+        if isinstance(value, list):
+            source.extend(value)
+        elif isinstance(value, str):
+            source.append(value)
+
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for raw in source:
+        for part in re.split(r"[,，、;；\r\n]+", str(raw or "")):
+            keyword = re.sub(r"\s+", " ", part).strip().lstrip("#").strip()
+            key = normalize_key(keyword)
+            if (
+                not key
+                or key in seen
+                or key in reserved_keys
+                or len(keyword) > 50
+                or re.match(r"(?i)^(?:https?://|www\.)", keyword)
+            ):
+                continue
+            seen.add(key)
+            keywords.append(keyword)
+            if len(keywords) >= keyword_limit:
+                return keywords
+    return keywords
+
+
+def _merge_llm_keywords_into_groups(
+    groups: dict[str, list[tuple[str, float]]],
+    keywords: list[str],
+) -> dict[str, list[tuple[str, float]]]:
+    merged = {category: list(entries or []) for category, entries in groups.items()}
+    general = merged.setdefault("general", [])
+    seen = {
+        normalize_key(entry[0] if isinstance(entry, (tuple, list)) and entry else str(entry))
+        for entry in general
+    }
+    for keyword in keywords:
+        key = normalize_key(keyword)
+        if key and key not in seen:
+            general.append((keyword, 1.0))
+            seen.add(key)
+    return merged
 
 
 def sync_playwright():
@@ -817,7 +880,9 @@ def create_upload_manifest(
         log.info("    Pixiv 准备: 正在识别图片标签")
         tagger_result = tagger_bridge.predict_tags(image_path)
         if tagger_result.get("status") not in ("ok", "disabled") and not tagger_result.get("available"):
-            log.info(f"    tagger: {tagger_result.get('status')} — 仅用 prompt/文件名候选")
+            log.info(
+                f"    本地 tagger: {tagger_result.get('status')} — 先用 prompt/文件名候选；启用 LLM 时将补充视觉标签"
+            )
     else:
         tagger_result = {"available": False, "status": "disabled", "flat_tags": [], "groups": {}, "details": []}
     if needs_pixiv_payload:
@@ -915,9 +980,68 @@ def create_upload_manifest(
                         ),
                     )
                     if llm_reverse_result.get("status") == "ok":
+                        llm_keywords = _extract_llm_visual_keywords(llm_reverse_result)
+                        keyword_tagging = {
+                            "status": "no_keywords",
+                            "candidate_count": len(llm_keywords),
+                            "added_count": 0,
+                            "added_tags": [],
+                            "final_tag_count": len(pixiv_payload.get("final_tags") or []),
+                        }
+                        if llm_keywords:
+                            previous_tags = list(pixiv_payload.get("final_tags") or [])
+                            previous_age = str(pixiv_payload.get("age_restriction") or "all_ages")
+                            try:
+                                rebuilt_payload = build_pixiv_payload(
+                                    image_path=image_path,
+                                    metadata_info=source_meta,
+                                    alias_data=alias_data,
+                                    popularity_data=popularity_data,
+                                    age_rules=age_rules,
+                                    extra_candidates=extra_candidates,
+                                    extra_groups=_merge_llm_keywords_into_groups(extra_groups, llm_keywords),
+                                    jp_alias_cache=jp_alias_cache if jp_alias_cache is not None else {},
+                                    general_jp_data=general_jp_data or {},
+                                    pixiv_page=pixiv_page,
+                                    live_lookup=True,
+                                    live_jp_lookup=True,
+                                    include_ai_art=(ai_tags_by_platform or {}).get("pixiv", True),
+                                )
+                                rebuilt_payload["privacy"] = pixiv_privacy
+                                rebuilt_payload["allow_tag_edits"] = pixiv_allow_tag_edits
+                                if previous_age in {"r18", "r18g"}:
+                                    force_pixiv_age_restriction(rebuilt_payload, previous_age)
+                                previous_tag_set = set(previous_tags)
+                                added_tags = [
+                                    tag for tag in rebuilt_payload.get("final_tags") or []
+                                    if tag not in previous_tag_set
+                                ]
+                                pixiv_payload = rebuilt_payload
+                                keyword_tagging.update(
+                                    status="applied",
+                                    added_count=len(added_tags),
+                                    added_tags=added_tags,
+                                    final_tag_count=len(pixiv_payload.get("final_tags") or []),
+                                )
+                                log.info(
+                                    "    LLM 视觉标签: 候选 %s，新增 %s，最终 %s 个 — %s",
+                                    len(llm_keywords),
+                                    len(added_tags),
+                                    len(pixiv_payload.get("final_tags") or []),
+                                    ", ".join(pixiv_payload.get("final_tags") or []),
+                                )
+                            except Exception as exc:
+                                keyword_tagging.update(
+                                    status="failed",
+                                    error=f"{type(exc).__name__}: {exc}",
+                                )
+                                log.warning("    LLM 视觉标签整理失败，保留原标签: %s", exc)
+                        else:
+                            log.info("    LLM 视觉标签: 模型未返回 keywords，保留原标签")
+                        llm_reverse_result["tagging"] = keyword_tagging
                         apply_llm_result_to_pixiv_payload(pixiv_payload, llm_reverse_result)
                         log.info(
-                            f"    LLM 反推: 已生成标题/简介 ({llm_reverse_result.get('content_mode', 'sfw')})"
+                            f"    LLM 反推: 已生成标题/简介/视觉标签 ({llm_reverse_result.get('content_mode', 'sfw')})"
                         )
                     else:
                         log.warning(
@@ -1273,7 +1397,10 @@ def cmd_upload(args):
     _tagger_probe = getattr(tagger_bridge, "_model_dir", None) or getattr(tagger_bridge, "_dir", None)
     if "pixiv" in getattr(args, "targets", ""):
         if not _tagger_probe:
-            log.info("tagger: 未配置，将仅用 prompt/文件名候选（可在 web 设置面板或 launcher [6] 配置）")
+            log.info(
+                "本地 tagger: 未配置，将先用 prompt/文件名候选；启用 LLM 时会补充视觉标签"
+                "（本地模型可在 web 设置面板或 launcher [6] 配置）"
+            )
     jp_alias_cache = load_json(files["jp_aliases"], {})
     general_jp_data = load_json(files["general_jp"], {})
     danbooru_jp_map = load_json(files["danbooru_jp"], {})
@@ -1495,7 +1622,10 @@ def cmd_upload(args):
             save_json(files["jp_aliases"], jp_alias_cache)
             tagger_status = manifest.get("pixiv", {}).get("tagger", {}).get("status", "disabled")
             if "pixiv" in effective_targets and tagger_status not in {"ok", "disabled", "haintag_root_missing", "model_dir_not_configured", "onnxruntime_not_installed"}:
-                log.warning(f"    tagger 不可用: {tagger_status}（继续上传，仅用 prompt/文件名候选）")
+                log.warning(
+                    f"    本地 tagger 不可用: {tagger_status}"
+                    "（继续上传；先用 prompt/文件名候选，启用 LLM 时补充视觉标签）"
+                )
             manifest["dry_run"] = bool(args.dry_run)
             report_image("saving_manifest", stage_progress=0.0)
             write_manifest(manifest_path, manifest)
