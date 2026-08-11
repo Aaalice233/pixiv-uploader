@@ -84,7 +84,7 @@ Recommended first-time setup:
 3. For automatic copy and visual tags, configure the provider, Base URL, API key, model, and optional retry policy under **Settings → LLM copy & tags**
 4. Place images in `upload/`, or drag them into the publish dialog
 5. Select the target platforms in the **Publishing workspace** and create a task
-6. Follow live stages, progress, and errors in **Task center**, then inspect or copy full logs from **Activity log**
+6. Follow batch progress, the current image, total image count, and errors in **Task center**, then inspect or copy full logs from **Activity log**
 
 Do not close browser windows opened by the application while login or publishing is in progress. Account sessions stay in local browser profiles and are not uploaded to a project-owned server.
 

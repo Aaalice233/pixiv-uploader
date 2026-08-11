@@ -227,6 +227,7 @@ function PublishDialog({ images, status, defaults, llmConfig, onReloadImages, on
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [dragName, setDragName] = useState('');
+  const [removingNames, setRemovingNames] = useState(() => new Set());
   const [saving, setSaving] = useState(false);
   const [llmEnabled, setLlmEnabled] = useState(Boolean(defaults.llm_reverse && llmConfig.enabled));
   const [persona, setPersona] = useState(defaults.llm_persona || llmConfig.default_persona_id || '');
@@ -282,6 +283,26 @@ function PublishDialog({ images, status, defaults, llmConfig, onReloadImages, on
     finally { setUploading(false); setDragOver(false); }
   }
 
+  async function removeImages(fileNames) {
+    if (removingNames.size) return;
+    const names = [...new Set(fileNames)].filter(name => imageByName.has(name));
+    if (!names.length) return;
+    const confirmed = window.confirm(names.length === 1
+      ? t('publish.deleteOneConfirm', { name: names[0] })
+      : t('publish.deleteManyConfirm', { count: names.length }));
+    if (!confirmed) return;
+    setRemovingNames(new Set(names));
+    try {
+      await api('/api/images', jsonOptions('DELETE', { files: names }));
+      notify(t('publish.filesRemoved', { count: names.length }));
+    } catch (error) {
+      notify(localizedError(error, t), 'error');
+    } finally {
+      await onReloadImages().catch(() => {});
+      setRemovingNames(new Set());
+    }
+  }
+
   function toggleTarget(id) {
     setTargets(previous => {
       const next = new Set(previous);
@@ -334,29 +355,39 @@ function PublishDialog({ images, status, defaults, llmConfig, onReloadImages, on
     finally { setSaving(false); }
   }
 
+  const busy = saving || uploading || removingNames.size > 0;
+  const closeDialog = () => { if (!busy) onClose(); };
+
   return (
-    <Modal title={t('publish.title')} onClose={onClose} wide className="publish-modal" footer={<><span className="flow-footer-summary">{t('common.selectedImages', { count: selectedOrdered.length })} · {[...targets].map(id => PLATFORM_META[id].label).join(' + ') || t('common.noPlatform')}</span><Button onClick={onClose}>{t('common.cancel')}</Button><Button variant="primary" icon="upload" disabled={saving || !selectedOrdered.length || !targets.size} onClick={confirmPublish}>{saving ? t('publish.creating') : t('publish.start')}</Button></>}>
+    <Modal title={t('publish.title')} onClose={closeDialog} wide className="publish-modal" footer={<><span className="flow-footer-summary">{t('common.selectedImages', { count: selectedOrdered.length })} · {[...targets].map(id => PLATFORM_META[id].label).join(' + ') || t('common.noPlatform')}</span><Button onClick={onClose} disabled={busy}>{t('common.cancel')}</Button><Button variant="primary" icon="upload" disabled={busy || !selectedOrdered.length || !targets.size} onClick={confirmPublish}>{saving ? t('publish.creating') : t('publish.start')}</Button></>}>
       <div className="publish-layout">
         <div className="publish-library">
-          <div className={`flow-dropzone ${dragOver ? 'active' : ''}`} role="button" tabIndex={0} aria-busy={uploading} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); fileInput.current?.click(); } }} onDragEnter={event => { event.preventDefault(); setDragOver(true); }} onDragOver={event => event.preventDefault()} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragOver(false); }} onDrop={event => { event.preventDefault(); addFiles(event.dataTransfer.files); }} onClick={() => fileInput.current?.click()}>
-            <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden onChange={event => addFiles(event.target.files)}/>
+          <div className={`flow-dropzone ${dragOver ? 'active' : ''}`} role="button" tabIndex={busy ? -1 : 0} aria-busy={uploading} aria-disabled={busy} onKeyDown={event => { if (!busy && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); fileInput.current?.click(); } }} onDragEnter={event => { if (!busy) { event.preventDefault(); setDragOver(true); } }} onDragOver={event => { if (!busy) event.preventDefault(); }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget)) setDragOver(false); }} onDrop={event => { event.preventDefault(); if (!busy) addFiles(event.dataTransfer.files); }} onClick={() => { if (!busy) fileInput.current?.click(); }}>
+            <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden disabled={busy} onChange={event => { addFiles(event.target.files); event.target.value = ''; }}/>
             <Icon name="plus"/><span>{uploading ? t('publish.importing') : t('publish.dropHint')}</span>
           </div>
           <div className="publish-library-toolbar">
             <div className="flow-segmented" aria-label={t('publish.sortLabel')}>
               {[['time_desc','publish.sort.latest'],['name_asc','publish.sort.name'],['random','publish.sort.random'],['manual','publish.sort.manual']].map(([value, key]) => <button key={value} aria-pressed={sort === value} className={sort === value ? 'active' : ''} onClick={() => setSort(value)}>{t(key)}</button>)}
             </div>
-            <button className="flow-text-button" onClick={() => setSelected(selected.size === images.length ? new Set() : new Set(images.map(image => image.name)))}>{selected.size === images.length && images.length ? t('publish.clearSelection') : t('publish.selectAll')}</button>
+            <div className="publish-library-actions">
+              <button className="flow-text-button danger" disabled={!selected.size || removingNames.size > 0} onClick={() => removeImages([...selected])}><Icon name="trash" size={14}/><span>{removingNames.size ? t('publish.deleting') : t('publish.deleteSelected')}</span></button>
+              <button className="flow-text-button" disabled={removingNames.size > 0} onClick={() => setSelected(selected.size === images.length ? new Set() : new Set(images.map(image => image.name)))}>{selected.size === images.length && images.length ? t('publish.clearSelection') : t('publish.selectAll')}</button>
+            </div>
           </div>
           {images.length ? (
             <div className="publish-image-grid">
               {visible.map(image => {
                 const checked = selected.has(image.name);
-                return <button key={image.name} aria-pressed={checked} draggable={sort === 'manual'} onDragStart={() => setDragName(image.name)} onDragOver={event => { if (sort === 'manual') { event.preventDefault(); reorder(image.name); } }} onDragEnd={() => setDragName('')} className={`publish-thumb ${checked ? 'selected' : ''} ${dragName === image.name ? 'dragging' : ''}`} onClick={() => setSelected(previous => { const next = new Set(previous); if (next.has(image.name)) next.delete(image.name); else next.add(image.name); return next; })} title={image.name}>
-                  <img src={`/upload/${encodeURIComponent(image.name)}`} alt="" loading="lazy"/>
-                  <span className="publish-thumb-check"><Icon name="check" size={13}/></span>
-                  <small>{image.name}</small>
-                </button>;
+                const removing = removingNames.has(image.name);
+                return <article key={image.name} draggable={sort === 'manual' && !removing} onDragStart={() => setDragName(image.name)} onDragOver={event => { if (sort === 'manual' && !removing) { event.preventDefault(); reorder(image.name); } }} onDragEnd={() => setDragName('')} className={`publish-thumb ${checked ? 'selected' : ''} ${dragName === image.name ? 'dragging' : ''} ${removing ? 'removing' : ''}`} title={image.name}>
+                  <button className="publish-thumb-select" aria-label={`${t(checked ? 'publish.deselectImage' : 'publish.selectImage')}: ${image.name}`} aria-pressed={checked} disabled={removing} onClick={() => setSelected(previous => { const next = new Set(previous); if (next.has(image.name)) next.delete(image.name); else next.add(image.name); return next; })}>
+                    <img src={`/upload/${encodeURIComponent(image.name)}`} alt="" loading="lazy"/>
+                    <span className="publish-thumb-check"><Icon name="check" size={13}/></span>
+                    <small>{image.name}</small>
+                  </button>
+                  <button className="publish-thumb-delete" aria-label={`${t('publish.deleteImage')}: ${image.name}`} title={t('publish.deleteImage')} disabled={removingNames.size > 0} onClick={() => removeImages([image.name])}><Icon name="trash" size={14}/></button>
+                </article>;
               })}
             </div>
           ) : <div className="publish-empty"><Icon name="image" size={28}/><strong>{t('publish.emptyTitle')}</strong><span>{t('publish.emptyHint')}</span></div>}
@@ -449,20 +480,29 @@ function TaskRow({ task, onCancel, onRemove, onRetry }) {
   const displayProgress = task.status === 'done' ? 100 : Math.min(99, Math.floor(rawProgress * 100));
   const total = Math.max(0, Number(task.total || task.params?.files?.length || 0));
   const current = Math.max(0, Math.min(total || Number.MAX_SAFE_INTEGER, Number(task.current || 0)));
-  const itemIndex = Math.max(0, Number(task.item_index || 0));
+  const itemIndex = Math.max(0, Math.min(total || Number.MAX_SAFE_INTEGER, Number(task.item_index || 0)));
   const stageIndex = Math.max(0, Number(task.stage_index || 0));
   const stageCount = Math.max(0, Number(task.stage_count || 0));
   const stageLabel = taskStageLabel(task, t);
-  const title = task.cmd === 2 && total ? t('task.command.2.count', { count: total }) : t(`task.command.${task.cmd}`);
+  const commandKey = `task.command.${task.cmd}`;
+  const title = [2, 3].includes(Number(task.cmd)) && total
+    ? t(`${commandKey}.count`, { count: total })
+    : t(commandKey);
   const targetIds = String(task.params?.targets || (task.cmd === 3 ? 'pixiv' : '')).split(',').filter(id => PLATFORM_META[id]);
   const target = targetIds.length ? targetIds.map(id => PLATFORM_META[id].label).join(' + ') : t('task.target.local');
-  const itemLabel = itemIndex && total
-    ? t('task.progress.item', { current: formatNumber(itemIndex), total: formatNumber(total), name: task.item_name || title })
+  const imagePosition = itemIndex && total
+    ? t('task.progress.imagePosition', { current: formatNumber(itemIndex), total: formatNumber(total) })
     : total
-      ? t('task.progress.completed', { current: formatNumber(current), total: formatNumber(total) })
-      : t('task.progress.preparing');
+      ? t('task.progress.totalImages', { total: formatNumber(total) })
+      : '';
+  const itemDetail = task.item_name || (total
+    ? t('task.progress.completed', { current: formatNumber(current), total: formatNumber(total) })
+    : t('task.progress.preparing'));
   const activityLabel = taskActivityLabel(task, t, formatNumber);
+  const overallLabel = t('task.progress.overall', { percent: formatNumber(displayProgress) });
+  const progressAriaLabel = [stageLabel, imagePosition, overallLabel].filter(Boolean).join(' · ');
   const outcomeParts = [];
+  if (total) outcomeParts.push(t('task.progress.completed', { current: formatNumber(current), total: formatNumber(total) }));
   if (Number(task.succeeded || 0)) outcomeParts.push(t('task.progress.succeeded', { count: formatNumber(task.succeeded) }));
   if (Number(task.failed || 0)) outcomeParts.push(t('task.progress.failed', { count: formatNumber(task.failed) }));
   if (Number(task.canceled || 0)) outcomeParts.push(t('task.progress.canceled', { count: formatNumber(task.canceled) }));
@@ -470,9 +510,9 @@ function TaskRow({ task, onCancel, onRemove, onRetry }) {
     <div className={`flow-task-state ${statusTone}`}><i/>{t(`task.status.${task.status}`)}</div>
     <div className="flow-task-copy"><strong>{title}</strong><span>{target} · {task.created_at || t('common.justNow')}</span></div>
     <div className="flow-task-progress">
-      <div className="flow-task-stage"><strong>{stageLabel}</strong><span>{displayProgress}%</span></div>
-      <div className={`flow-task-meter ${task.status === 'running' ? 'active' : ''}`} role="progressbar" aria-label={stageLabel} aria-valuemin="0" aria-valuemax="100" aria-valuenow={displayProgress} aria-valuetext={`${stageLabel} ${displayProgress}%`}><i style={{ width: `${visualProgress}%` }}/></div>
-      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{activityLabel || itemLabel}</span>{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
+      <div className="flow-task-stage"><div className="flow-task-stage-heading"><strong>{stageLabel}</strong>{imagePosition && <span className="flow-task-image-position">{imagePosition}</span>}</div><span>{overallLabel}</span></div>
+      <div className={`flow-task-meter ${task.status === 'running' ? 'active' : ''}`} role="progressbar" aria-label={stageLabel} aria-valuemin="0" aria-valuemax="100" aria-valuenow={displayProgress} aria-valuetext={progressAriaLabel}><i style={{ width: `${visualProgress}%` }}/></div>
+      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{activityLabel || itemDetail}</span>{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
     </div>
     <div className="flow-task-controls">{task.status === 'failed' && <IconButton icon="refresh" label={t('task.retry')} onClick={() => onRetry(task)}/>} {(task.status === 'running' || task.status === 'queued' || task.status === 'waiting_input') ? <IconButton icon="pause" label={t('task.cancel')} onClick={() => onCancel(task.id)}/> : <IconButton icon="x" label={t('task.remove')} onClick={() => onRemove(task.id)}/>}</div>
   </article>;

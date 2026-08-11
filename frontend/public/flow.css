@@ -168,8 +168,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .flow-task-copy span { overflow: hidden; color: var(--flow-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .flow-task-progress { min-width: 0; display: grid; gap: 7px; }
 .flow-task-stage, .flow-task-progress-meta { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.flow-task-stage strong { overflow: hidden; color: var(--flow-muted); font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.flow-task-stage > span { color: var(--flow-text); font-family: var(--flow-mono); font-size: 11px; font-weight: 700; }
+.flow-task-stage-heading { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.flow-task-stage strong { min-width: 0; overflow: hidden; color: var(--flow-muted); font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.flow-task-image-position { min-height: 20px; padding: 2px 7px; display: inline-flex; align-items: center; flex: 0 0 auto; border: 1px solid var(--flow-line); border-radius: 999px; color: var(--flow-accent); background: var(--flow-surface-raised); font-family: var(--flow-mono); font-size: 9px; font-weight: 700; white-space: nowrap; }
+.flow-task-stage > span { flex: 0 0 auto; color: var(--flow-text); font-family: var(--flow-mono); font-size: 11px; font-weight: 700; white-space: nowrap; }
 .flow-task-meter { height: 6px; overflow: hidden; border-radius: 9px; background: var(--flow-surface-hover); }
 .flow-task-meter i { position: relative; display: block; height: 100%; overflow: hidden; border-radius: inherit; background: var(--flow-accent); transition: width .55s var(--flow-ease), background .2s ease; }
 .flow-task-meter.active i::after { content: ''; position: absolute; inset: 0; width: 45%; background: linear-gradient(90deg, transparent, rgba(255,255,255,.38), transparent); animation: flow-progress-scan 1.8s ease-in-out infinite; }
@@ -212,21 +214,34 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .flow-dropzone:hover, .flow-dropzone.active { color: var(--flow-text); background: var(--flow-surface-hover); transform: translateY(-1px); }
 .flow-dropzone:focus-visible { outline: 2px solid var(--flow-accent); outline-offset: 2px; }
 .flow-dropzone.active { box-shadow: 0 0 0 2px var(--flow-accent) inset; }
+.flow-dropzone[aria-disabled="true"] { opacity: .55; cursor: wait; transform: none; }
 .publish-library-toolbar { min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.publish-library-actions { display: flex; align-items: center; gap: 15px; }
+.publish-library-actions .flow-text-button { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.publish-library-actions .flow-text-button.danger { color: var(--flow-danger); }
+.publish-library-actions .flow-text-button:disabled { opacity: .4; cursor: not-allowed; }
 .flow-segmented { padding: 3px; display: inline-flex; gap: 2px; border-radius: 10px; background: var(--flow-surface-raised); }
 .flow-segmented button { min-height: 30px; padding: 0 10px; border: 0; border-radius: 7px; color: var(--flow-faint); background: transparent; font-size: 11px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .flow-segmented button:hover { color: var(--flow-text); }
 .flow-segmented button.active { color: var(--flow-text); background: var(--flow-surface-hover); box-shadow: 0 3px 10px rgba(0,0,0,.12); }
 .publish-image-grid { min-height: 0; padding: 1px 3px 12px; display: grid; grid-template-columns: repeat(6, minmax(70px, 1fr)); grid-auto-rows: 132px; gap: 9px; flex: 1; overflow: auto; align-content: start; }
-.publish-thumb { position: relative; min-width: 0; min-height: 105px; padding: 0; overflow: hidden; border: 0; border-radius: 11px; background: var(--flow-surface-raised); cursor: pointer; transition: transform .18s var(--flow-ease), opacity .18s, box-shadow .18s; }
-.publish-thumb:hover { transform: translateY(-2px); }
+.publish-thumb { position: relative; min-width: 0; min-height: 105px; overflow: hidden; border-radius: 11px; background: var(--flow-surface-raised); transition: transform .18s var(--flow-ease), opacity .18s, box-shadow .18s; }
+.publish-thumb:hover:not(.removing) { transform: translateY(-2px); }
 .publish-thumb.selected { box-shadow: 0 0 0 3px var(--flow-accent); }
 .publish-thumb.dragging { opacity: .45; transform: scale(.96); }
-.publish-thumb img { width: 100%; height: 100%; display: block; object-fit: cover; }
-.publish-thumb > small { position: absolute; inset: auto 0 0; padding: 20px 7px 5px; overflow: hidden; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.72)); font-size: 8px; text-align: left; text-overflow: ellipsis; white-space: nowrap; opacity: 0; transition: opacity .15s; }
-.publish-thumb:hover > small { opacity: 1; }
-.publish-thumb-check { position: absolute; top: 6px; right: 6px; width: 21px; height: 21px; display: grid; place-items: center; border-radius: 7px; color: #111; background: var(--flow-accent); box-shadow: 0 4px 12px rgba(0,0,0,.24); opacity: 0; transform: scale(.7); transition: opacity .15s, transform .15s; }
+.publish-thumb.removing { opacity: .45; transform: scale(.96); }
+.publish-thumb-select { width: 100%; height: 100%; padding: 0; display: block; overflow: hidden; border: 0; color: inherit; background: transparent; cursor: pointer; }
+.publish-thumb-select:focus-visible { outline: 2px solid var(--flow-accent); outline-offset: -3px; }
+.publish-thumb-select:disabled { cursor: wait; }
+.publish-thumb-select img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.publish-thumb-select > small { position: absolute; inset: auto 0 0; padding: 20px 7px 5px; overflow: hidden; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.72)); font-size: 8px; text-align: left; text-overflow: ellipsis; white-space: nowrap; opacity: 0; transition: opacity .15s; }
+.publish-thumb:hover .publish-thumb-select > small, .publish-thumb:focus-within .publish-thumb-select > small { opacity: 1; }
+.publish-thumb-check { position: absolute; z-index: 1; top: 6px; right: 6px; width: 21px; height: 21px; display: grid; place-items: center; border-radius: 7px; color: #111; background: var(--flow-accent); box-shadow: 0 4px 12px rgba(0,0,0,.24); opacity: 0; transform: scale(.7); transition: opacity .15s, transform .15s; pointer-events: none; }
 .publish-thumb.selected .publish-thumb-check { opacity: 1; transform: scale(1); }
+.publish-thumb-delete { position: absolute; z-index: 2; top: 6px; left: 6px; width: 27px; height: 27px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 8px; color: #fff; background: rgba(12, 15, 20, .76); box-shadow: 0 4px 12px rgba(0,0,0,.24); opacity: 0; transform: scale(.78); cursor: pointer; transition: opacity .15s, transform .15s, background .15s; }
+.publish-thumb:hover .publish-thumb-delete, .publish-thumb:focus-within .publish-thumb-delete { opacity: 1; transform: scale(1); }
+.publish-thumb-delete:hover, .publish-thumb-delete:focus-visible { color: #fff; background: var(--flow-danger); outline: none; }
+.publish-thumb-delete:disabled { cursor: wait; }
 .publish-empty { min-height: 0; flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--flow-faint); }
 .publish-empty strong { color: var(--flow-muted); font-size: 13px; }
 .publish-empty span { font-size: 11px; }
@@ -395,6 +410,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 @keyframes flow-pulse { 50% { opacity: .35; transform: scale(.75); } }
 @keyframes flow-progress-scan { from { transform: translateX(-120%); } to { transform: translateX(340%); } }
 
+@media (hover: none) {
+  .publish-thumb-delete { opacity: 1; transform: scale(1); }
+}
+
 @media (max-width: 1120px) {
   .quick-publish { grid-template-columns: 130px 115px 1fr; }
   .quick-preview { width: 130px; }
@@ -507,6 +526,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .publish-library { padding: 17px 14px; }
   .publish-image-grid { grid-template-columns: repeat(3, minmax(60px, 1fr)); gap: 7px; }
   .publish-library-toolbar { align-items: flex-start; flex-direction: column; padding: 11px 0; }
+  .publish-library-actions { width: 100%; justify-content: flex-end; }
   .flow-segmented { max-width: 100%; overflow-x: auto; }
   .flow-modal-footer .flow-button { padding-inline: 12px; }
   .flow-footer-summary { display: none; }

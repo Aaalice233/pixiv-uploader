@@ -197,7 +197,7 @@ LLM 增强 Pixiv 的 `title_*`、`caption_*` 和视觉 `keywords`。关键词只
 - `activity`：阶段内瞬时活动；LLM 重试使用 `kind=llm_retry` 和稳定 `event`，前端据此显示请求、退避等待、响应修复及模型切换，不从日志文本反推；
 - `result`：命令返回的结构化批次汇总。
 
-上传任务按目标平台和 LLM 开关动态构造阶段，按“初始化 4% + 所有图片加权阶段 94% + 收尾 2%”聚合。多图任务先完成当前图片的真实阶段，再进入下一张；失败或取消保留在最后到达的阶段和百分比，不伪装成 100%。长耗时步骤只显示活动动画，不用定时器制造虚假数值。
+上传任务按目标平台和 LLM 开关动态构造阶段，按“初始化 4% + 所有图片加权阶段 94% + 收尾 2%”聚合。多图任务中每张图片占图片处理区间的 `1 / total`，当前图片再按真实阶段权重填充这一份进度；任务中心必须同时显示当前图片序号、总图片数、已处理数和批次总百分比，不能把单张图片的阶段进度冒充批次进度。失败或取消保留在最后到达的阶段和百分比，不伪装成 100%。长耗时步骤只显示活动动画，不用定时器制造虚假数值。
 
 新增阶段时：先在 `STAGE_LABELS` 和对应 `ProgressProfile` 注册稳定 ID 与权重，再在领域边界上报事件，最后同步 `frontend/src/locales.js` 和 `tests/test_task_progress.py`。阶段文案由前端本地化，后端 `stage_label` 只作兼容回退。
 
@@ -207,7 +207,8 @@ LLM 增强 Pixiv 的 `title_*`、`caption_*` 和视觉 `keywords`。关键词只
 - `TASKS_LOCK` 保护任务状态；SSE 发送快照，不向外暴露线程和取消对象；
 - `InterruptedError` 映射为 `canceled`，其他异常保留原始错误并映射为 `failed`；
 - 页面关闭后只有在无 SSE 客户端、Scheduler 已取消、任务空闲时才退出；
-- Scheduler 状态保存在 `config.json.scheduler`，测试后必须关闭 `enabled`。
+- Scheduler 状态保存在 `config.json.scheduler`，测试后必须关闭 `enabled`；
+- `DELETE /api/images` 只接受 `upload/` 内受支持图片的纯文件名；不存在的文件按幂等成功处理，正在被排队或运行中发布任务引用的文件必须返回 `409 upload_files_in_use`，不得与发布线程争抢删除。
 
 前端固定文案必须进入 `frontend/src/locales.js`，组件通过 `frontend/src/i18n.jsx` 的 `useI18n()` 获取。不要在 JSX 或 API 判断中硬编码中文。
 

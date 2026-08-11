@@ -51,6 +51,7 @@ SCRIPT_DIR = PROJECT_ROOT
 CIVITAI_PROFILE_DIR = Path.home() / ".civitai_splitter_chrome"
 PORT = int(os.environ.get("WEB_PORT", "7788"))
 CONFIG_FILE = SCRIPT_DIR / "config.json"
+UPLOAD_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 
 def _find_chrome_executable() -> str | None:
@@ -701,7 +702,7 @@ def api_run(cmd):
         if not isinstance(files, list):
             return _api_error("files_must_be_array", detail="files 必须是数组")
         normalized_files = [Path(str(name)).name for name in files]
-        if any(Path(name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"} for name in normalized_files):
+        if any(Path(name).suffix.lower() not in UPLOAD_IMAGE_SUFFIXES for name in normalized_files):
             return _api_error("unsupported_file_in_list", detail="files 中包含不支持的图片格式")
         params["targets"] = targets
         params["files"] = normalized_files
@@ -1099,17 +1100,119 @@ def api_llm_reverse_config_post():
 def _list_upload_dir(folder: Path, source: str) -> list:
     if not folder.exists():
         return []
-    exts = {'.jpg', '.jpeg', '.png', '.webp'}
     return [
         {"name": f.name, "size": f.stat().st_size, "mtime": f.stat().st_mtime, "source": source}
         for f in sorted(folder.iterdir())
-        if f.is_file() and f.suffix.lower() in exts
+        if f.is_file() and f.suffix.lower() in UPLOAD_IMAGE_SUFFIXES
     ]
+
+
+def _active_upload_references() -> tuple[set[str], bool]:
+    referenced: set[str] = set()
+    blocks_all = False
+    with TASKS_LOCK:
+        active_tasks = [
+            task
+            for task in TASKS.values()
+            if task.get("cmd") in (2, 3)
+            and task.get("status") in {"queued", "running", "waiting_input"}
+        ]
+        for task in active_tasks:
+            files = (task.get("params") or {}).get("files")
+            if not isinstance(files, list) or not files:
+                blocks_all = True
+                continue
+            referenced.update(os.path.normcase(Path(str(name)).name) for name in files)
+    return referenced, blocks_all
 
 
 @app.route("/api/images")
 def api_images():
     return jsonify(_list_upload_dir(SCRIPT_DIR / "upload", "upload"))
+
+
+@app.route("/api/images", methods=["DELETE"])
+def api_images_delete():
+    body = request.get_json(silent=True) or {}
+    files = body.get("files") if isinstance(body, dict) else None
+    if not isinstance(files, list):
+        return _api_error("files_must_be_array", detail="files 必须是数组")
+
+    upload_dir = SCRIPT_DIR / "upload"
+    upload_root = upload_dir.resolve()
+    names: list[str] = []
+    candidates: dict[str, Path] = {}
+    invalid: list[str] = []
+    for value in files:
+        name = value if isinstance(value, str) else ""
+        if (
+            not name
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or "\x00" in name
+            or Path(name).suffix.lower() not in UPLOAD_IMAGE_SUFFIXES
+        ):
+            invalid.append(str(value))
+            continue
+        if name in candidates:
+            continue
+        candidate = upload_dir / name
+        try:
+            outside_upload = candidate.resolve().parent != upload_root
+        except (OSError, RuntimeError):
+            outside_upload = True
+        if candidate.is_symlink() or outside_upload:
+            invalid.append(name)
+            continue
+        names.append(name)
+        candidates[name] = candidate
+    if invalid:
+        invalid_names = ", ".join(invalid)
+        return _api_error("invalid_upload_file", detail=f"图片名称无效：{invalid_names}", files=invalid_names)
+    if not names:
+        return _api_error("files_required", detail="至少选择一张图片")
+
+    referenced, blocks_all = _active_upload_references()
+    in_use = [name for name in names if blocks_all or os.path.normcase(name) in referenced]
+    if in_use:
+        in_use_names = ", ".join(in_use)
+        return _api_error(
+            "upload_files_in_use",
+            409,
+            detail=f"图片正在发布，无法删除：{in_use_names}",
+            files=in_use_names,
+        )
+
+    deleted: list[str] = []
+    missing: list[str] = []
+    failed: list[str] = []
+    for name in names:
+        candidate = candidates[name]
+        if not candidate.exists():
+            missing.append(name)
+            continue
+        if not candidate.is_file():
+            failed.append(name)
+            continue
+        try:
+            candidate.unlink()
+            deleted.append(name)
+        except OSError:
+            failed.append(name)
+    if deleted or missing:
+        _broadcast_sse("images_changed", {})
+    if failed:
+        failed_names = ", ".join(failed)
+        return _api_error(
+            "upload_delete_failed",
+            500,
+            detail=f"无法删除以下图片：{failed_names}",
+            files=failed_names,
+            deleted=deleted,
+            missing=missing,
+        )
+    return jsonify({"deleted": deleted, "missing": missing})
 
 
 @app.route("/upload/<path:filename>")
@@ -1125,7 +1228,7 @@ def api_add_upload_files():
     rejected = [
         Path(uploaded.filename).name or uploaded.filename
         for uploaded in uploads
-        if Path(Path(uploaded.filename).name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
+        if Path(Path(uploaded.filename).name).suffix.lower() not in UPLOAD_IMAGE_SUFFIXES
     ]
     if rejected:
         names = ", ".join(rejected)
@@ -1161,8 +1264,7 @@ def api_open_folder():
 def api_status():
     model_path  = SCRIPT_DIR / "models" / "auto_censor.pt"
     upload_dir  = SCRIPT_DIR / "upload"
-    _img_exts = {'.png', '.jpg', '.jpeg', '.webp'}
-    upload_count = sum(1 for f in upload_dir.iterdir() if f.is_file() and f.suffix.lower() in _img_exts) if upload_dir.exists() else 0
+    upload_count = sum(1 for f in upload_dir.iterdir() if f.is_file() and f.suffix.lower() in UPLOAD_IMAGE_SUFFIXES) if upload_dir.exists() else 0
     api_key = os.environ.get("CIVITAI_API_KEY", "")
     if len(api_key) > 4:
         masked = "*" * (len(api_key) - 4) + api_key[-4:]
@@ -1595,9 +1697,8 @@ def _scheduler_fire() -> None:
     with TASKS_LOCK:
         any_running = any(t.get("status") in ("running", "queued", "waiting_input") for t in TASKS.values())
     upload_dir = SCRIPT_DIR / "upload"
-    img_exts = {'.jpg', '.jpeg', '.png', '.webp'}
     has_images = upload_dir.exists() and any(
-        f.is_file() and f.suffix.lower() in img_exts for f in upload_dir.iterdir()
+        f.is_file() and f.suffix.lower() in UPLOAD_IMAGE_SUFFIXES for f in upload_dir.iterdir()
     )
     sched["next_fire_at"] = None
     cfg["scheduler"] = sched
