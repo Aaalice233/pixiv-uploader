@@ -70,6 +70,33 @@ class TaskProgressStateTests(unittest.TestCase):
         self.assertGreater(second["progress"], preparing["progress"])
         self.assertLess(second["progress"], 1.0)
 
+    def test_activity_is_exposed_during_stage_and_cleared_on_transition(self) -> None:
+        state = TaskProgressState(
+            build_progress_profile(3, {"targets": "pixiv", "llm_reverse": True}),
+            total=1,
+        )
+        activity = {
+            "kind": "llm_retry",
+            "event": "retry_scheduled",
+            "attempt": 1,
+            "max_attempts": 6,
+        }
+
+        retrying = state.advance(
+            "generating_copy",
+            stage_progress=0.1,
+            item_index=1,
+            activity=activity,
+        )
+        self.assertEqual(retrying["activity"], activity)
+
+        next_stage = state.advance("watermarking", stage_progress=0.0, item_index=1)
+        self.assertEqual(next_stage["activity"], {})
+
+        state.advance("watermarking", stage_progress=0.1, item_index=1, activity=activity)
+        canceled = state.finish("canceled")
+        self.assertEqual(canceled["activity"], {})
+
     def test_profile_only_contains_requested_platform_and_llm_stages(self) -> None:
         civitai_stages = {
             stage.id for stage in build_progress_profile(

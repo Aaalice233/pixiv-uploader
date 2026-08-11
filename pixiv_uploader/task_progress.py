@@ -146,7 +146,7 @@ class TaskProgressState:
     so a failed or canceled publish can never look fully published.
     """
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self, profile: ProgressProfile, total: int = 0) -> None:
         self.profile = profile
@@ -157,6 +157,7 @@ class TaskProgressState:
         self.stage_index = 0
         self.item_index = 0
         self.item_name = ""
+        self.activity: dict[str, Any] = {}
         self.current = 0
         self.succeeded = 0
         self.failed = 0
@@ -213,6 +214,7 @@ class TaskProgressState:
         overall_progress: float | None = None,
         item_index: int | None = None,
         item_name: str | None = None,
+        activity: dict[str, Any] | None = None,
         total: int | None = None,
         current: int | None = None,
         succeeded: int | None = None,
@@ -226,11 +228,14 @@ class TaskProgressState:
             failed=failed,
             canceled=canceled,
         )
+        previous_stage = self.stage
         if stage == "item_complete":
             if item_index is not None:
                 self.item_index = max(0, int(item_index))
             if item_name is not None:
                 self.item_name = str(item_name)
+            if activity is not None:
+                self.activity = dict(activity)
             return self.snapshot()
 
         fraction = self._fraction(stage_progress)
@@ -270,6 +275,10 @@ class TaskProgressState:
             self.item_index = max(0, int(item_index))
         if item_name is not None:
             self.item_name = str(item_name)
+        if activity is not None:
+            self.activity = dict(activity)
+        elif str(stage) != previous_stage:
+            self.activity = {}
         self.stage = str(stage)
         self.stage_progress = fraction
         self.stage_index = stage_index
@@ -282,14 +291,17 @@ class TaskProgressState:
             self.stage = "done"
             self.stage_progress = 1.0
             self.stage_index = self.stage_count
+            self.activity = {}
             if self.profile.per_item and self.total:
                 self.current = self.total
         elif status == "canceled":
             self.progress = min(self.progress, 0.99)
+            self.activity = {}
             if self.stage == "queued":
                 self.stage = "canceled"
         else:
             self.progress = min(self.progress, 0.99)
+            self.activity = {}
             if self.stage == "queued":
                 self.stage = "failed"
         return self.snapshot()
@@ -305,6 +317,7 @@ class TaskProgressState:
             "stage_count": self.stage_count,
             "item_index": self.item_index,
             "item_name": self.item_name,
+            "activity": dict(self.activity),
             "current": self.current,
             "total": self.total,
             "succeeded": self.succeeded,

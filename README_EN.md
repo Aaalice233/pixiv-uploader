@@ -8,11 +8,11 @@ A local, **Pixiv-first** publishing workspace for artwork. It currently supports
 
 ## ✨ Features
 
-- **Publishing workspace** — manage pending images, platform status, true stage-based task progress, and activity logs
+- **Page-based workspace** — switch between publishing, Civitai splitting, tasks, activity logs, and settings from one sidebar
 - **Pixiv publishing** — fills titles, captions, tags, age ratings, and original/fan-art settings
 - **Civitai publishing** — publishes images and can split existing multi-image posts into individual posts
 - **Smart tagging** — PixAI tagger with a CL / WD14 fallback chain
-- **LLM copy generation** — generates Japanese Pixiv titles and captions through supported model APIs
+- **LLM copy generation** — generates Japanese Pixiv titles and captions with request retries, response repair, and fallback-model failover
 - **R-18 processing** — mosaic, Gaussian blur, and black-bar censor modes
 - **Text and image watermarks** — configurable position, size, opacity, margin, fonts, and transparent image marks
 - **Scheduled publishing** — automatically processes the queue at randomized intervals
@@ -49,7 +49,7 @@ py -3 -m venv .venv
 .venv/Scripts/patchright.exe install chromium
 ```
 
-The base dependency set excludes the large Tagger and censor runtimes; their setup wizards install them only when requested.
+The base dependency set excludes the large Tagger and censor runtimes; install them only when needed through the CLI wizard or **Settings → System maintenance**.
 
 R-18 auto-censoring is optional:
 
@@ -75,16 +75,16 @@ Or start it manually:
 .venv/Scripts/python.exe web_server.py
 ```
 
-Open [http://localhost:7788](http://localhost:7788) in your browser.
+Open [http://localhost:7788](http://localhost:7788) in your browser. The sidebar switches between full pages only; environment operations such as installing the R-18 censor model or updating the project live under **Settings → System maintenance** and never appear as publishing tasks.
 
 Recommended first-time setup:
 
-1. Open **Settings → Accounts** and configure the Pixiv / Civitai login or API key
+1. Open **Settings → General** and configure the Pixiv / Civitai login or API key
 2. Choose censoring and watermark behavior under **Settings → Pixiv processing**
-3. If copy generation is needed, configure the provider, Base URL, API key, and model under **Settings → LLM copy**
+3. If copy generation is needed, configure the provider, Base URL, API key, model, and optional retry policy under **Settings → LLM copy**
 4. Place images in `upload/`, or drag them into the publish dialog
-5. Select the target platforms and create a publishing task
-6. Follow live stages, progress, errors, and logs in the task workspace
+5. Select the target platforms in the **Publishing workspace** and create a task
+6. Follow live stages, progress, and errors in **Task center**, then inspect or copy full logs from **Activity log**
 
 Do not close browser windows opened by the application while login or publishing is in progress. Account sessions stay in local browser profiles and are not uploaded to a project-owned server.
 
@@ -162,11 +162,13 @@ The PixAI v0.9 model is approximately 1.27 GB; reserve enough disk space before 
 
 Pixiv copy generation supports OpenAI-compatible endpoints, Anthropic, and Google Gemini configurations. Each persona can keep its own prompt, content mode, and defaults. Vision requests use a JPEG preview with a 1536 px maximum edge to reduce latency and memory usage for large images; the publishing source remains unchanged.
 
+Generation uses three recovery levels: transient network, rate-limit, and server failures are retried with exponential backoff; empty or malformed JSON responses enter a repair round; and only then does the app move through configured fallback models. Authentication and permission failures stop immediately. **Settings → LLM copy → Multi-level retry and failover** exposes the per-request timeout, retry and repair counts, total time budget, and up to three fallback models. The Task center reports request, wait, repair, and failover activity in real time.
+
 Sensitive settings are stored in the local `config.json`. It is ignored by Git; never commit API keys, cookies, or other credentials.
 
 ## 💧 Watermarks
 
-Choose a text or image watermark under **Settings → Pixiv → Watermark**. Watermarks are applied only to cleaned Pixiv publishing copies; files in `upload/` stay unchanged.
+Choose a text or image watermark under **Settings → Pixiv processing → Watermark**. Watermarks are applied only to cleaned Pixiv publishing copies; files in `upload/` stay unchanged.
 
 - Text watermarks support imported fonts, font faces, colors, strokes, position, size, opacity, and margin
 - Image watermarks support PNG, JPEG, and WebP, preserving alpha from transparent PNG files

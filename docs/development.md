@@ -154,6 +154,14 @@ LLM 仅增强 Pixiv 的 `title_*` 和 `caption_*`，不负责 tag、年龄分级
 
 私有配置位于 `config.json.llm_reverse`。`manifest.pixiv.llm_reverse` 记录状态、人设、内容模式和不含凭据的错误摘要。SFW 模式遇到 R-18/R-18G 时应记录 `skipped_content_mode` 并保留规则文案；生成失败同样回落，不阻断上传。
 
+`llm_reverse.retry_policy` 定义三层恢复策略：
+
+1. **请求层**：对连接失败、超时、HTTP 408/409/425/429 和 5xx 重试；优先采用服务端 `Retry-After`，否则使用带随机抖动的指数退避。401/403 等认证错误不可重试；
+2. **响应层**：成功响应为空、JSON 无法解析或字段结构不合法时，追加严格 JSON 约束进入独立修复轮次；
+3. **模型层**：主模型所有轮次耗尽后，才按 `fallback_models` 顺序切换同一 provider 下的后备模型，最多 3 个。
+
+`request_attempts` 和 `repair_attempts` 控制每层次数，`base_delay_seconds` / `max_delay_seconds` 控制退避，`total_timeout_seconds` 是包含请求和等待的全局预算。`adaptive_image` 允许超时后只缩小发送给模型的内存 JPEG 预览，禁止修改发布原图。等待阶段必须轮询 `cancel_check`，不能让用户取消后继续睡眠或发起新请求。上报日志和 `LLMReverseError` 只允许包含稳定错误码、HTTP 状态、模型名和已脱敏摘要，不得写入 API key、Authorization 或完整请求体。
+
 ## 自动打码、水印和安全规则
 
 - `runtime/pixiv/censor.json`：`off`、`japan`、`strict` 三档预设；
@@ -174,12 +182,14 @@ LLM 仅增强 Pixiv 的 `title_*` 和 `caption_*`，不负责 tag、年龄分级
 
 任务快照的稳定字段包括：
 
+- `category`：`workflow` 或 `maintenance`；任务中心只消费前者，系统维护页只消费后者；
 - `progress`：`0..1` 的整体完成度；仅 `status=done` 可以等于 `1`；
 - `stage` / `stage_progress`：稳定阶段 ID 与阶段内完成度；
 - `stage_index` / `stage_count`：当前阶段与本任务动态阶段总数；
 - `item_index` / `item_name`：当前处理对象，不代表已经成功；
 - `current` / `total`：已经处理结束的对象数与总数；
 - `succeeded` / `failed` / `canceled`：互斥结果计数；
+- `activity`：阶段内瞬时活动；LLM 重试使用 `kind=llm_retry` 和稳定 `event`，前端据此显示请求、退避等待、响应修复及模型切换，不从日志文本反推；
 - `result`：命令返回的结构化批次汇总。
 
 上传任务按目标平台和 LLM 开关动态构造阶段，按“初始化 4% + 所有图片加权阶段 94% + 收尾 2%”聚合。多图任务先完成当前图片的真实阶段，再进入下一张；失败或取消保留在最后到达的阶段和百分比，不伪装成 100%。长耗时步骤只显示活动动画，不用定时器制造虚假数值。
@@ -195,6 +205,14 @@ LLM 仅增强 Pixiv 的 `title_*` 和 `caption_*`，不负责 tag、年龄分级
 - Scheduler 状态保存在 `config.json.scheduler`，测试后必须关闭 `enabled`。
 
 前端固定文案必须进入 `frontend/src/locales.js`，组件通过 `frontend/src/i18n.jsx` 的 `useI18n()` 获取。不要在 JSX 或 API 判断中硬编码中文。
+
+## Web 前端导航约束
+
+- `frontend/src/flow-app.jsx` 的 `APP_PAGES` 与 `SETTINGS_TABS` 是页面和设置分类的稳定 ID 集合；URL 使用 `#/page` 或 `#/settings/tab`，刷新与浏览器前进/后退必须恢复当前位置；
+- 侧边栏只放可切换的一级页面，不放“安装模型”“检查更新”等一次性命令，也不与页面内部标签重复；
+- 设置是一级页面，通用、Pixiv 处理、LLM 文案、定时发布和系统维护属于其内部分类；新增配置应优先归入现有分类，只有形成独立工作流时才新增侧边栏页面；
+- 发布与拆分任务使用 `category=workflow` 并进入任务中心；模型安装、更新等环境操作使用 `category=maintenance`，只在系统维护页展示其状态和输出；
+- 新增页面时同步路由解析、侧边栏入口、`page.*` / `nav.*` 双语文案及桌面/移动布局；不要再引入互相独立的弹窗导航状态。
 
 ## 扩展原则
 

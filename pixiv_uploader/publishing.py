@@ -27,6 +27,7 @@ from .watermark import (
 from .pixiv.censor import CENSOR_CLASS_BY_NAME, CensorEngine, DEFAULT_CENSOR_CLASSES, DeepghsDetector, parse_class_set
 from .pixiv.llm_reverse import (
     apply_llm_result_to_pixiv_payload,
+    build_llm_retry_activity,
     content_mode_can_handle_age,
     default_llm_reverse_config,
     infer_image_copy,
@@ -49,6 +50,16 @@ def _targets_need_copy(targets) -> bool:
 def _emit_progress(callback, stage: str, **details) -> None:
     if callback is not None:
         callback(stage, **details)
+
+
+def _emit_llm_retry_progress(callback, event: str, details: dict) -> None:
+    activity = build_llm_retry_activity(event, details)
+    _emit_progress(
+        callback,
+        "generating_copy",
+        stage_progress=float(details.get("progress") or 0.0),
+        activity=activity,
+    )
 
 
 def _load_watermark_for_targets(
@@ -899,6 +910,9 @@ def create_upload_manifest(
                         content_mode=llm_content_mode,
                         extra_context=_ctx,
                         cancel_event=cancel_event,
+                        event_callback=lambda event, details: _emit_llm_retry_progress(
+                            progress_callback, event, details
+                        ),
                     )
                     if llm_reverse_result.get("status") == "ok":
                         apply_llm_result_to_pixiv_payload(pixiv_payload, llm_reverse_result)

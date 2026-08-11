@@ -23,6 +23,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory, stream
 from .paths import FRONTEND_DIST_DIR, FRONTEND_PUBLIC_DIR, PROJECT_ROOT
 from .pixiv.llm_platforms import PLATFORM_SPECS
 from .pixiv.llm_reverse import (
+    build_llm_retry_activity,
     default_llm_reverse_config,
     infer_image_copy,
     mask_llm_config,
@@ -160,6 +161,7 @@ CMD_LABELS = {
     5: ("检查更新", "本地处理"),
     6: ("生成 Pixiv 文案", "本地处理"),
 }
+MAINTENANCE_COMMANDS = frozenset({4, 5})
 CMD_LOG_SOURCES = {
     1: "civitai",
     2: "publish",
@@ -347,6 +349,7 @@ def _new_task_record(
         "count": f"0 / {total}" if total else "—",
         "eta": "—",
         "cmd": command,
+        "category": "maintenance" if command in MAINTENANCE_COMMANDS else "workflow",
         "params": params,
         "cancel_flag": False,
         "cancel_event": threading.Event(),
@@ -621,6 +624,11 @@ def _run_task_locked(
                 persona_id=params.get("llm_persona", ""),
                 content_mode=params.get("llm_content_mode", ""),
                 cancel_event=cancel_event,
+                event_callback=lambda event, details: progress.report(
+                    "generating_copy",
+                    stage_progress=float(details.get("progress") or 0.0),
+                    activity=build_llm_retry_activity(event, details),
+                ),
             )
             progress.report("generating_copy", stage_progress=1.0)
             progress.report("finalizing", stage_progress=0.8)
@@ -1064,8 +1072,12 @@ def api_llm_reverse_config_get():
 @app.route("/api/llm-reverse-config", methods=["POST"])
 def api_llm_reverse_config_post():
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _api_error("settings_must_be_object")
     cfg = _load_config()
     current = normalize_llm_reverse_config(cfg.get("llm_reverse"))
+    if isinstance(body.get("retry_policy"), dict):
+        body["retry_policy"] = {**current.get("retry_policy", {}), **body["retry_policy"]}
     if body.pop("clear_api_key", False):
         body["api_key"] = ""
     else:

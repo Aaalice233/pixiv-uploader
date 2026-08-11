@@ -8,6 +8,27 @@ const PLATFORM_META = {
   civitai: { label: 'Civitai', short: 'C', tone: 'blue' },
   pixiv: { label: 'Pixiv', short: 'P', tone: 'cyan' },
 };
+const SIDEBAR_PAGES = Object.freeze([['workspace','upload'], ['split','split'], ['tasks','queue'], ['logs','terminal']]);
+const SETTINGS_NAV = Object.freeze([['general','settings'], ['pixiv','shield'], ['llm','wand'], ['scheduler','clock'], ['system','refresh']]);
+const APP_PAGES = new Set([...SIDEBAR_PAGES.map(([id]) => id), 'settings']);
+const SETTINGS_TABS = new Set(SETTINGS_NAV.map(([id]) => id));
+const ACTIVE_TASK_STATUSES = new Set(['queued', 'running', 'waiting_input']);
+const MAINTENANCE_COMMANDS = new Set([4, 5]);
+
+function readAppRoute(hash = window.location.hash) {
+  const [candidatePage = '', candidateTab = ''] = hash.replace(/^#\/?/, '').split('/');
+  const page = APP_PAGES.has(candidatePage) ? candidatePage : 'workspace';
+  const settingsTab = page === 'settings' && SETTINGS_TABS.has(candidateTab) ? candidateTab : 'general';
+  return { page, settingsTab };
+}
+
+function routeHash(page, settingsTab = 'general') {
+  return page === 'settings' ? `#/settings/${settingsTab}` : `#/${page}`;
+}
+
+function isMaintenanceTask(task) {
+  return task?.category === 'maintenance' || MAINTENANCE_COMMANDS.has(Number(task?.cmd));
+}
 
 class ApiError extends Error {
   constructor(message, { code = '', params = {}, payload = {}, status = 0 } = {}) {
@@ -360,16 +381,64 @@ function shuffled(values) {
   return result;
 }
 
-function PromptDialog({ title, label, placeholder, onClose, onConfirm }) {
-  const { t } = useI18n();
+function SplitPage({ onStart }) {
+  const { formatNumber, t } = useI18n();
   const [value, setValue] = useState('');
-  return <Modal title={title} onClose={onClose} footer={<><Button onClick={onClose}>{t('common.cancel')}</Button><Button variant="primary" disabled={!value.trim()} onClick={() => onConfirm(value)}>{t('common.continue')}</Button></>}><label className="flow-field"><span>{label}</span><textarea autoFocus rows="5" value={value} placeholder={placeholder} onChange={event => setValue(event.target.value)}/></label></Modal>;
+  const [busy, setBusy] = useState(false);
+  const posts = useMemo(() => value.split(/[\s,，]+/).map(item => item.trim()).filter(Boolean), [value]);
+  async function submit(event) {
+    event.preventDefault();
+    if (!posts.length || busy) return;
+    setBusy(true);
+    try {
+      if (await onStart(posts)) setValue('');
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <section className="split-page">
+    <div className="split-intro"><span><Icon name="split" size={23}/></span><div><h2>{t('split.heading')}</h2><p>{t('split.description')}</p></div></div>
+    <form className="split-form" onSubmit={submit}>
+      <label className="flow-field"><span>{t('dialog.splitLabel')}</span><textarea rows="8" value={value} placeholder={t('dialog.splitPlaceholder')} onChange={event => setValue(event.target.value)}/></label>
+      <div className="split-form-footer"><span>{posts.length ? t('split.detected', { count: formatNumber(posts.length) }) : t('split.inputHint')}</span><Button type="submit" variant="primary" icon="split" disabled={!posts.length || busy}>{busy ? t('split.creating') : t('split.start')}</Button></div>
+    </form>
+    <div className="split-notes"><div><Icon name="check" size={16}/><span>{t('split.noteMetadata')}</span></div><div><Icon name="check" size={16}/><span>{t('split.noteQueue')}</span></div></div>
+  </section>;
 }
 
 function InputRequiredDialog({ request, onSubmit }) {
   const { t } = useI18n();
   const [value, setValue] = useState('');
   return <Modal title={t('prompt.waitingTitle')} onClose={() => onSubmit('')} footer={<Button variant="primary" onClick={() => onSubmit(value || '\n')}>{t('prompt.continueTask')}</Button>}><p className="flow-prompt-text">{request.prompt || t('prompt.default')}</p><label className="flow-field"><span>{t('prompt.input')}</span><input autoFocus value={value} onChange={event => setValue(event.target.value)} placeholder={t('prompt.optional')}/></label></Modal>;
+}
+
+function taskStageLabel(task, t) {
+  const stageKey = `task.stage.${task?.stage || task?.status || 'queued'}`;
+  const translated = t(stageKey);
+  return translated === stageKey ? (task?.stage_label || t(`task.status.${task?.status || 'queued'}`)) : translated;
+}
+
+function taskActivityLabel(task, t, formatNumber) {
+  const activity = task?.activity;
+  if (activity?.kind !== 'llm_retry') return '';
+  const values = {
+    attempt: formatNumber(Math.max(0, Number(activity.attempt || 0))),
+    maximum: formatNumber(Math.max(1, Number(activity.max_attempts || 1))),
+    current: formatNumber(Math.max(0, Number(activity.repair_attempt || activity.model_index || 0))),
+    total: formatNumber(Math.max(1, Number(activity.repair_attempts || activity.model_count || 1))),
+    seconds: Number(activity.delay_seconds || 0).toFixed(1),
+    model: activity.model || '—',
+  };
+  const key = {
+    attempt_started: 'task.llmRetry.attempt',
+    attempt_failed: 'task.llmRetry.assessing',
+    retry_scheduled: 'task.llmRetry.waiting',
+    repair_started: 'task.llmRetry.repair',
+    fallback_started: 'task.llmRetry.fallback',
+    succeeded: 'task.llmRetry.recovered',
+    failed: 'task.llmRetry.exhausted',
+  }[activity.event];
+  return key ? t(key, values) : '';
 }
 
 function TaskRow({ task, onCancel, onRemove, onRetry }) {
@@ -383,9 +452,7 @@ function TaskRow({ task, onCancel, onRemove, onRetry }) {
   const itemIndex = Math.max(0, Number(task.item_index || 0));
   const stageIndex = Math.max(0, Number(task.stage_index || 0));
   const stageCount = Math.max(0, Number(task.stage_count || 0));
-  const stageKey = `task.stage.${task.stage || task.status || 'queued'}`;
-  const translatedStage = t(stageKey);
-  const stageLabel = translatedStage === stageKey ? (task.stage_label || t(`task.status.${task.status}`)) : translatedStage;
+  const stageLabel = taskStageLabel(task, t);
   const title = task.cmd === 2 && total ? t('task.command.2.count', { count: total }) : t(`task.command.${task.cmd}`);
   const targetIds = String(task.params?.targets || (task.cmd === 3 ? 'pixiv' : '')).split(',').filter(id => PLATFORM_META[id]);
   const target = targetIds.length ? targetIds.map(id => PLATFORM_META[id].label).join(' + ') : t('task.target.local');
@@ -394,6 +461,7 @@ function TaskRow({ task, onCancel, onRemove, onRetry }) {
     : total
       ? t('task.progress.completed', { current: formatNumber(current), total: formatNumber(total) })
       : t('task.progress.preparing');
+  const activityLabel = taskActivityLabel(task, t, formatNumber);
   const outcomeParts = [];
   if (Number(task.succeeded || 0)) outcomeParts.push(t('task.progress.succeeded', { count: formatNumber(task.succeeded) }));
   if (Number(task.failed || 0)) outcomeParts.push(t('task.progress.failed', { count: formatNumber(task.failed) }));
@@ -404,20 +472,35 @@ function TaskRow({ task, onCancel, onRemove, onRetry }) {
     <div className="flow-task-progress">
       <div className="flow-task-stage"><strong>{stageLabel}</strong><span>{displayProgress}%</span></div>
       <div className={`flow-task-meter ${task.status === 'running' ? 'active' : ''}`} role="progressbar" aria-label={stageLabel} aria-valuemin="0" aria-valuemax="100" aria-valuenow={displayProgress} aria-valuetext={`${stageLabel} ${displayProgress}%`}><i style={{ width: `${visualProgress}%` }}/></div>
-      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{itemLabel}</span>{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
+      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{activityLabel || itemLabel}</span>{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
     </div>
     <div className="flow-task-controls">{task.status === 'failed' && <IconButton icon="refresh" label={t('task.retry')} onClick={() => onRetry(task)}/>} {(task.status === 'running' || task.status === 'queued' || task.status === 'waiting_input') ? <IconButton icon="pause" label={t('task.cancel')} onClick={() => onCancel(task.id)}/> : <IconButton icon="x" label={t('task.remove')} onClick={() => onRemove(task.id)}/>}</div>
   </article>;
 }
 
-function Workbench({ tasks, logs, view, onViewChange, onCancel, onRemove, onRetry, clearLogs, notify }) {
-  const { t } = useI18n();
-  const logEnd = useRef(null);
-  const sortedTasks = useMemo(() => [...tasks].sort((a, b) => {
+function TaskCenter({ tasks, onCancel, onRemove, onRetry }) {
+  const { formatNumber, t } = useI18n();
+  const [filter, setFilter] = useState('all');
+  const workflowTasks = useMemo(() => tasks.filter(task => !isMaintenanceTask(task)), [tasks]);
+  const sortedTasks = useMemo(() => [...workflowTasks].sort((a, b) => {
     const rank = { running: 0, waiting_input: 1, queued: 2, failed: 3, done: 4, canceled: 5 };
     return (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || String(b.created_at || '').localeCompare(String(a.created_at || ''));
-  }), [tasks]);
-  useEffect(() => { if (view === 'logs') logEnd.current?.scrollIntoView({ block: 'nearest' }); }, [logs.length, view]);
+  }), [workflowTasks]);
+  const visibleTasks = sortedTasks.filter(task => filter === 'all' || (filter === 'active' ? ACTIVE_TASK_STATUSES.has(task.status) : task.status === filter));
+  const activeCount = workflowTasks.filter(task => ACTIVE_TASK_STATUSES.has(task.status)).length;
+  return <section className="flow-workbench flow-page-panel">
+    <header className="flow-page-toolbar"><div className="flow-page-summary"><Icon name="queue" size={17}/><span>{t('task.centerSummary', { total: formatNumber(workflowTasks.length), active: formatNumber(activeCount) })}</span></div><div className="flow-segmented task-filters" role="group" aria-label={t('task.filterLabel')}>{['all','active','failed'].map(id => <button key={id} aria-pressed={filter === id} className={filter === id ? 'active' : ''} onClick={() => setFilter(id)}>{t(`task.filter.${id}`)}</button>)}</div></header>
+    <div className="flow-task-list">{visibleTasks.length ? visibleTasks.map(task => <TaskRow key={task.id} task={task} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{workflowTasks.length ? t('task.filterEmpty') : t('task.emptyTitle')}</strong><span>{workflowTasks.length ? t('task.filterEmptyHint') : t('task.emptyHint')}</span></div>}</div>
+  </section>;
+}
+
+function ActivityLog({ logs, clearLogs, notify }) {
+  const { formatNumber, t } = useI18n();
+  const logView = useRef(null);
+  const followTail = useRef(true);
+  useEffect(() => {
+    if (followTail.current && logView.current) logView.current.scrollTop = logView.current.scrollHeight;
+  }, [logs.length]);
   async function copyLogs() {
     try {
       await writeClipboard(formatLogsForClipboard(logs));
@@ -426,9 +509,13 @@ function Workbench({ tasks, logs, view, onViewChange, onCancel, onRemove, onRetr
       notify(t('task.copyLogsFailed'), 'error');
     }
   }
-  return <section className="flow-workbench" id="workbench">
-    <header><div className="flow-workbench-tabs" role="tablist"><button role="tab" aria-selected={view === 'tasks'} className={view === 'tasks' ? 'active' : ''} onClick={() => onViewChange('tasks')}>{t('nav.tasks')} <span>{tasks.filter(task => ['running','queued','waiting_input'].includes(task.status)).length}</span></button><button role="tab" aria-selected={view === 'logs'} className={view === 'logs' ? 'active' : ''} onClick={() => onViewChange('logs')}>{t('nav.logs')}</button></div>{view === 'logs' && logs.length > 0 && <div className="flow-log-actions"><button className="flow-text-button" onClick={copyLogs}><Icon name="copy" size={14}/><span>{t('task.copyLogs')}</span></button><button className="flow-text-button" onClick={clearLogs}>{t('task.clearLogs')}</button></div>}</header>
-    {view === 'tasks' ? <div className="flow-task-list">{sortedTasks.length ? sortedTasks.map(task => <TaskRow key={task.id} task={task} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{t('task.emptyTitle')}</strong><span>{t('task.emptyHint')}</span></div>}</div> : <div className="flow-log-view">{logs.length ? logs.map((entry, index) => <div className={`flow-log-line ${String(entry.lvl || '').toLowerCase()}`} key={`${entry.t}-${index}`}><time>{entry.t}</time><b>{entry.src}</b><span>{entry.msg}</span></div>) : <div className="flow-workbench-empty"><Icon name="terminal" size={25}/><strong>{t('task.emptyLogs')}</strong></div>}<div ref={logEnd}/></div>}
+  function handleScroll(event) {
+    const element = event.currentTarget;
+    followTail.current = element.scrollHeight - element.scrollTop - element.clientHeight < 72;
+  }
+  return <section className="flow-workbench flow-page-panel">
+    <header className="flow-page-toolbar"><div className="flow-page-summary"><Icon name="terminal" size={17}/><span>{t('task.logSummary', { count: formatNumber(logs.length) })}</span></div>{logs.length > 0 && <div className="flow-log-actions"><button className="flow-text-button" onClick={copyLogs}><Icon name="copy" size={14}/><span>{t('task.copyLogs')}</span></button><button className="flow-text-button" onClick={clearLogs}>{t('task.clearLogs')}</button></div>}</header>
+    <div ref={logView} className="flow-log-view" onScroll={handleScroll}>{logs.length ? logs.map((entry, index) => <div className={`flow-log-line ${String(entry.lvl || '').toLowerCase()}`} key={`${entry.t}-${index}`}><time>{entry.t}</time><b>{entry.src}</b><span>{entry.msg}</span></div>) : <div className="flow-workbench-empty"><Icon name="terminal" size={25}/><strong>{t('task.emptyLogs')}</strong><span>{t('task.emptyLogsHint')}</span></div>}</div>
   </section>;
 }
 
@@ -686,9 +773,20 @@ function LlmSettings({ initialConfig, onSaved, notify }) {
   const [models, setModels] = useState([]);
   const [modelBusy, setModelBusy] = useState(false);
   const persona = (config.personas || []).find(item => item.id === selectedId) || config.personas?.[0];
+  const retryPolicy = {
+    request_attempts: 3,
+    repair_attempts: 1,
+    base_delay_seconds: 0.8,
+    max_delay_seconds: 10,
+    total_timeout_seconds: 180,
+    adaptive_image: true,
+    fallback_models: [],
+    ...(config.retry_policy || {}),
+  };
 
   useEffect(() => { setConfig(structuredClone(initialConfig)); }, [initialConfig]);
   function patchConfig(key, value) { setConfig(previous => ({ ...previous, [key]: value })); }
+  function patchRetryPolicy(key, value) { setConfig(previous => ({ ...previous, retry_policy: { ...retryPolicy, ...(previous.retry_policy || {}), [key]: value } })); }
   function patchPersona(key, value) { setConfig(previous => ({ ...previous, personas: previous.personas.map(item => item.id === selectedId ? { ...item, [key]: value } : item) })); }
   function addPersona() {
     const id = `pixiv_${Date.now().toString(36)}`;
@@ -717,7 +815,32 @@ function LlmSettings({ initialConfig, onSaved, notify }) {
   }
   if (!persona) return null;
   return <div className="settings-page">
-    <section className="settings-section"><h3>{t('llm.connection')}</h3><Toggle checked={Boolean(config.enabled)} onChange={value => patchConfig('enabled', value)} label={t('llm.enabled')}/><div className="settings-grid-two"><label className="flow-field"><span>{t('llm.provider')}</span><select value={config.provider || 'openai_compatible'} onChange={event => patchConfig('provider', event.target.value)}><option value="openai_compatible">{t('llm.openaiCompatible')}</option><option value="anthropic">Anthropic</option><option value="google_gemini">Google Gemini</option></select></label><label className="flow-field"><span>{t('llm.baseUrl')}</span><input value={config.base_url || ''} onChange={event => patchConfig('base_url', event.target.value)} placeholder="https://api.openai.com/v1" disabled={config.provider === 'anthropic'}/></label><form className="flow-field" onSubmit={event => { event.preventDefault(); fetchModels(); }}><input className="credential-username" type="text" autoComplete="username" value="llm-api" readOnly aria-hidden="true" tabIndex={-1}/><span>{t('llm.apiKey')}</span><input type="password" autoComplete="new-password" value={config.api_key || ''} onChange={event => patchConfig('api_key', event.target.value)} placeholder={config.api_key_masked || t('llm.apiKeyPlaceholder')}/></form><label className="flow-field"><span>{t('llm.model')}</span><div className="settings-model-field"><input list="llm-models" value={config.model || ''} onChange={event => patchConfig('model', event.target.value)}/><button onClick={fetchModels} disabled={modelBusy}>{modelBusy ? t('common.loading') : t('llm.fetchModels')}</button><datalist id="llm-models">{models.map(model => <option value={model} key={model}/>)}</datalist></div></label></div></section>
+    <section className="settings-section">
+      <h3>{t('llm.connection')}</h3>
+      <Toggle checked={Boolean(config.enabled)} onChange={value => patchConfig('enabled', value)} label={t('llm.enabled')}/>
+      <div className="settings-grid-two">
+        <label className="flow-field"><span>{t('llm.provider')}</span><select value={config.provider || 'openai_compatible'} onChange={event => patchConfig('provider', event.target.value)}><option value="openai_compatible">{t('llm.openaiCompatible')}</option><option value="anthropic">Anthropic</option><option value="google_gemini">Google Gemini</option></select></label>
+        <label className="flow-field"><span>{t('llm.baseUrl')}</span><input value={config.base_url || ''} onChange={event => patchConfig('base_url', event.target.value)} placeholder="https://api.openai.com/v1" disabled={config.provider === 'anthropic'}/></label>
+        <form className="flow-field" onSubmit={event => { event.preventDefault(); fetchModels(); }}><input className="credential-username" type="text" autoComplete="username" value="llm-api" readOnly aria-hidden="true" tabIndex={-1}/><span>{t('llm.apiKey')}</span><input type="password" autoComplete="new-password" value={config.api_key || ''} onChange={event => patchConfig('api_key', event.target.value)} placeholder={config.api_key_masked || t('llm.apiKeyPlaceholder')}/></form>
+        <label className="flow-field"><span>{t('llm.model')}</span><div className="settings-model-field"><input list="llm-models" value={config.model || ''} onChange={event => patchConfig('model', event.target.value)}/><button onClick={fetchModels} disabled={modelBusy}>{modelBusy ? t('common.loading') : t('llm.fetchModels')}</button><datalist id="llm-models">{models.map(model => <option value={model} key={model}/>)}</datalist></div></label>
+      </div>
+    </section>
+    <section className="settings-section llm-retry-settings">
+      <div className="settings-heading-copy"><h3>{t('llm.retryPolicy')}</h3><p>{t('llm.retryDescription')}</p></div>
+      <div className="llm-retry-layers" aria-label={t('llm.retryPolicy')}>
+        {[['01','transport'],['02','repair'],['03','fallback']].map(([number, layer]) => <div key={layer}><b>{number}</b><span><strong>{t(`llm.retryLayer.${layer}`)}</strong><small>{t(`llm.retryLayer.${layer}Hint`)}</small></span></div>)}
+      </div>
+      <div className="settings-grid-two llm-retry-fields">
+        <label className="flow-field"><span>{t('llm.requestTimeout')}</span><input type="number" min="5" max="300" step="1" value={config.timeout_seconds ?? 45} onChange={event => patchConfig('timeout_seconds', Number(event.target.value))}/></label>
+        <label className="flow-field"><span>{t('llm.requestAttempts')}</span><input type="number" min="1" max="6" step="1" value={retryPolicy.request_attempts} onChange={event => patchRetryPolicy('request_attempts', Number(event.target.value))}/></label>
+        <label className="flow-field"><span>{t('llm.repairAttempts')}</span><input type="number" min="0" max="3" step="1" value={retryPolicy.repair_attempts} onChange={event => patchRetryPolicy('repair_attempts', Number(event.target.value))}/></label>
+        <label className="flow-field"><span>{t('llm.totalRetryBudget')}</span><input type="number" min="15" max="900" step="5" value={retryPolicy.total_timeout_seconds} onChange={event => patchRetryPolicy('total_timeout_seconds', Number(event.target.value))}/></label>
+        <label className="flow-field"><span>{t('llm.baseRetryDelay')}</span><input type="number" min="0.1" max="30" step="0.1" value={retryPolicy.base_delay_seconds} onChange={event => patchRetryPolicy('base_delay_seconds', Number(event.target.value))}/></label>
+        <label className="flow-field"><span>{t('llm.maxRetryDelay')}</span><input type="number" min="0.1" max="120" step="0.5" value={retryPolicy.max_delay_seconds} onChange={event => patchRetryPolicy('max_delay_seconds', Number(event.target.value))}/></label>
+      </div>
+      <Toggle checked={Boolean(retryPolicy.adaptive_image)} onChange={value => patchRetryPolicy('adaptive_image', value)} label={t('llm.adaptiveImage')} description={t('llm.adaptiveImageHint')}/>
+      <label className="flow-field llm-fallback-models"><span>{t('llm.fallbackModels')}</span><textarea rows="3" value={(retryPolicy.fallback_models || []).join('\n')} onChange={event => patchRetryPolicy('fallback_models', event.target.value.split(/[\r\n,]+/).map(value => value.trim()).filter(Boolean).slice(0, 3))} placeholder={t('llm.fallbackModelsPlaceholder')}/><small>{t('llm.fallbackModelsHint')}</small></label>
+    </section>
     <section className="settings-section"><div className="settings-heading-row"><h3>{t('llm.personas')}</h3><Button icon="plus" onClick={addPersona}>{t('common.new')}</Button></div><div className="persona-layout"><nav>{config.personas.map(item => <button aria-pressed={item.id === selectedId} className={item.id === selectedId ? 'active' : ''} key={item.id} onClick={() => setSelectedId(item.id)}><strong>{item.label}</strong><small>{item.default_content_mode?.toUpperCase()}</small></button>)}</nav><div className="persona-editor"><div className="settings-grid-two"><label className="flow-field"><span>{t('llm.name')}</span><input value={persona.label} onChange={event => patchPersona('label', event.target.value)}/></label><label className="flow-field"><span>{t('llm.defaultRating')}</span><select value={persona.default_content_mode || 'sfw'} onChange={event => patchPersona('default_content_mode', event.target.value)}><option value="sfw">SFW</option><option value="nsfw">NSFW</option></select></label></div><label className="flow-field"><span>{t('llm.voice')}</span><textarea rows="3" value={persona.voice || ''} onChange={event => patchPersona('voice', event.target.value)}/></label><label className="flow-field"><span>{t('llm.sfwPrompt')}</span><textarea rows="3" value={persona.sfw_prompt || ''} onChange={event => patchPersona('sfw_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.nsfwPrompt')}</span><textarea rows="3" value={persona.nsfw_prompt || ''} onChange={event => patchPersona('nsfw_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.extraConstraints')}</span><textarea rows="2" value={persona.extra_prompt || ''} onChange={event => patchPersona('extra_prompt', event.target.value)}/></label><label className="flow-field"><span>{t('llm.avoidWords')}</span><input value={(persona.avoid || []).join(', ')} onChange={event => patchPersona('avoid', event.target.value.split(',').map(value => value.trim()).filter(Boolean))}/></label><div className="sample-heading"><strong>{t('llm.samples')}</strong><button onClick={addSample}><Icon name="plus" size={14}/>{t('common.add')}</button></div>{(persona.samples || []).map((sample, index) => <div className="persona-sample" key={index}><div><select value={sample.mode} onChange={event => patchSample(index, 'mode', event.target.value)}><option value="sfw">SFW</option><option value="nsfw">NSFW</option></select><input value={sample.note || ''} onChange={event => patchSample(index, 'note', event.target.value)} placeholder={t('llm.sampleNote')}/><IconButton icon="trash" label={t('llm.deleteSample')} onClick={() => removeSample(index)}/></div><input value={sample.fields?.title_ja || ''} onChange={event => patchSample(index, 'fields.title_ja', event.target.value)} placeholder={t('llm.japaneseTitle')}/><textarea rows="2" value={sample.fields?.caption_ja || ''} onChange={event => patchSample(index, 'fields.caption_ja', event.target.value)} placeholder={t('llm.japaneseCaption')}/></div>)}<div className="settings-actions spread"><Button variant="danger-ghost" icon="trash" onClick={deletePersona}>{t('llm.deletePersona')}</Button><label className="flow-radio"><input type="radio" checked={config.default_persona_id === selectedId} onChange={() => patchConfig('default_persona_id', selectedId)}/>{t('llm.setDefault')}</label></div></div></div></section>
     <div className="settings-sticky-save"><Button variant="primary" onClick={save} disabled={saving}>{saving ? t('common.saving') : t('llm.save')}</Button></div>
   </div>;
@@ -740,23 +863,46 @@ function SchedulerSettings({ scheduler, onChanged, llmConfig, notify }) {
   return <div className="settings-page"><section className="settings-section"><h3>{t('scheduler.autoPublish')}</h3><Toggle checked={Boolean(draft.enabled)} onChange={value => patch('enabled', value)} label={t('scheduler.enabled')} description={draft.next_fire_at ? t('scheduler.nextRun', { time: formatDateTime(draft.next_fire_at) }) : t('scheduler.runningHint')}/><div className="scheduler-platforms">{Object.keys(PLATFORM_META).map(id => <button key={id} aria-pressed={targets.has(id)} className={targets.has(id) ? 'active' : ''} onClick={() => toggleTarget(id)}><span className={`platform-mark ${PLATFORM_META[id].tone}`}>{PLATFORM_META[id].short}</span>{PLATFORM_META[id].label}<i>{targets.has(id) && <Icon name="check" size={13}/>}</i></button>)}</div><div className="settings-grid-two"><label className="flow-field"><span>{t('scheduler.count')}</span><input type="number" min="1" max="100" value={draft.count || 1} onChange={event => patch('count', Number(event.target.value))}/></label><label className="flow-field"><span>{t('scheduler.order')}</span><select value={draft.sort || 'random'} onChange={event => patch('sort', event.target.value)}>{[['random','random'],['time_asc','oldest'],['time_desc','latest'],['name_asc','nameAsc'],['name_desc','nameDesc']].map(([value,key]) => <option key={value} value={value}>{t(`scheduler.order.${key}`)}</option>)}</select></label><label className="flow-field"><span>{t('scheduler.minHours')}</span><input type="number" min="0.001" step="0.1" value={draft.min_hours ?? 0.4} onChange={event => patch('min_hours', Number(event.target.value))}/></label><label className="flow-field"><span>{t('scheduler.maxHours')}</span><input type="number" min="0.001" step="0.1" value={draft.max_hours ?? 0.8} onChange={event => patch('max_hours', Number(event.target.value))}/></label></div></section><section className="settings-section"><h3>{t('scheduler.pixivProcessing')}</h3><Toggle checked={(draft.ai_tags_by_platform || {}).pixiv !== false} onChange={value => patch('ai_tags_by_platform', { pixiv: value })} label={t('publish.aiTags')}/><Toggle checked={Boolean(draft.llm_reverse)} onChange={value => patch('llm_reverse', value)} disabled={!llmConfig.enabled || !targets.has('pixiv')} label={t('publish.generateCopy')} description={!llmConfig.enabled ? t('scheduler.llmRequired') : ''}/>{draft.llm_reverse && <div className="settings-grid-two"><label className="flow-field"><span>{t('publish.persona')}</span><select value={draft.llm_persona || ''} onChange={event => patch('llm_persona', event.target.value)}>{(llmConfig.personas || []).map(item => <option value={item.id} key={item.id}>{item.label}</option>)}</select></label><label className="flow-field"><span>{t('publish.rating')}</span><select value={draft.llm_content_mode || 'sfw'} onChange={event => patch('llm_content_mode', event.target.value)}><option value="sfw">SFW</option><option value="nsfw">NSFW</option></select></label></div>}</section><div className="settings-sticky-save"><Button variant="primary" onClick={save} disabled={saving}>{saving ? t('common.saving') : t('scheduler.save')}</Button></div></div>;
 }
 
-function SettingsDialog({ status, scheduler, llmConfig, theme, setTheme, onClose, reloadStatus, setScheduler, setLlmConfig, notify }) {
+function MaintenanceAction({ command, icon, title, description, actionLabel, task, onStart, onCancel, onViewLogs }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState('general');
-  const tabs = [['general','settings'],['pixiv','shield'],['llm','wand'],['scheduler','clock']];
-  return <Modal title={t('settings.title')} onClose={onClose} wide className="settings-modal"><div className="settings-layout"><nav>{tabs.map(([id,icon]) => <button aria-pressed={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => setTab(id)}><Icon name={icon}/><span>{t(`settings.tab.${id}`)}</span></button>)}</nav><main>{tab === 'general' && <GeneralSettings status={status} theme={theme} setTheme={setTheme} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'pixiv' && <PixivSettings status={status} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'llm' && <LlmSettings initialConfig={llmConfig} onSaved={setLlmConfig} notify={notify}/>} {tab === 'scheduler' && <SchedulerSettings scheduler={scheduler} onChanged={setScheduler} llmConfig={llmConfig} notify={notify}/>}</main></div></Modal>;
+  const active = task && ACTIVE_TASK_STATUSES.has(task.status);
+  const progress = task?.status === 'done' ? 100 : Math.min(99, Math.max(0, Math.floor(Number(task?.progress || 0) * 100)));
+  const tone = task?.status === 'failed' ? 'failed' : task?.status === 'done' ? 'done' : task?.status === 'canceled' ? 'canceled' : active ? 'running' : 'idle';
+  const statusLabel = task ? t(`task.status.${task.status}`) : t('maintenance.ready');
+  return <article className={`maintenance-action ${tone}`}>
+    <div className="maintenance-action-icon"><Icon name={icon} size={21}/></div>
+    <div className="maintenance-action-body"><div className="maintenance-action-heading"><h3>{title}</h3><span className={`maintenance-status ${tone}`}><i/>{statusLabel}</span></div><p>{description}</p>{task && <div className="maintenance-progress"><div><span>{taskStageLabel(task, t)}</span><b>{progress}%</b></div><div className={`flow-task-meter ${active ? 'active' : ''}`} role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progress}><i style={{ width: `${progress}%` }}/></div></div>}<div className="maintenance-action-footer"><span>{task ? t('maintenance.lastRun', { time: task.created_at || t('common.justNow') }) : t('maintenance.notRun')}</span><div>{task && <button className="flow-text-button" onClick={onViewLogs}>{t('maintenance.viewLogs')}</button>}<Button icon={active ? 'pause' : icon} onClick={() => active ? onCancel(task.id) : onStart(command)}>{active ? t('task.cancel') : actionLabel}</Button></div></div></div>
+  </article>;
 }
 
-function Sidebar({ status, theme, setTheme, onSplit, onSetupCensor, onUpdate, onSettings, mobileOpen, setMobileOpen }) {
+function SystemSettings({ status, tasks, connected, onStart, onCancel, onNavigate, reloadStatus }) {
   const { t } = useI18n();
+  const maintenanceTasks = useMemo(() => tasks.filter(isMaintenanceTask), [tasks]);
+  const latest = command => [...maintenanceTasks].reverse().find(task => Number(task.cmd) === command);
+  const censorTask = latest(4);
+  useEffect(() => { if (censorTask?.status === 'done') reloadStatus().catch(() => {}); }, [censorTask?.id, censorTask?.status]);
+  return <div className="settings-page system-settings">
+    <section className="settings-section"><h3>{t('maintenance.environment')}</h3><div className="system-facts"><div><span>{t('maintenance.version')}</span><strong>{status.version || '—'}</strong></div><div><span>{t('maintenance.service')}</span><strong className={connected ? 'online' : 'offline'}>{connected ? t('app.connected') : t('app.reconnecting')}</strong></div><div><span>{t('maintenance.censorState')}</span><strong className={status.mosaic_installed ? 'online' : ''}>{status.mosaic_installed ? t('maintenance.installed') : t('maintenance.notInstalled')}</strong></div></div></section>
+    <section className="settings-section"><h3>{t('maintenance.tools')}</h3><div className="maintenance-list"><MaintenanceAction command={4} icon="shield" title={t('maintenance.censorTitle')} description={t('maintenance.censorDescription')} actionLabel={status.mosaic_installed ? t('maintenance.verifyCensor') : t('maintenance.installCensor')} task={censorTask} onStart={onStart} onCancel={onCancel} onViewLogs={() => onNavigate('logs')}/><MaintenanceAction command={5} icon="refresh" title={t('maintenance.updateTitle')} description={t('maintenance.updateDescription')} actionLabel={t('maintenance.checkUpdates')} task={latest(5)} onStart={onStart} onCancel={onCancel} onViewLogs={() => onNavigate('logs')}/></div><div className="settings-warning"><Icon name="info" size={16}/><span>{t('maintenance.restartHint')}</span></div></section>
+  </div>;
+}
+
+function SettingsPage({ tab, onTabChange, status, scheduler, llmConfig, theme, setTheme, reloadStatus, setScheduler, setLlmConfig, notify, tasks, connected, onMaintenance, onCancel, onNavigate }) {
+  const { t } = useI18n();
+  return <section className="settings-shell"><div className="settings-layout"><nav aria-label={t('settings.sections')}><div>{SETTINGS_NAV.map(([id,icon]) => <button aria-current={tab === id ? 'page' : undefined} aria-pressed={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => onTabChange(id)}><Icon name={icon}/><span>{t(`settings.tab.${id}`)}</span></button>)}</div></nav><div className="settings-main"><div key={tab} className="settings-page-transition">{tab === 'general' && <GeneralSettings status={status} theme={theme} setTheme={setTheme} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'pixiv' && <PixivSettings status={status} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'llm' && <LlmSettings initialConfig={llmConfig} onSaved={setLlmConfig} notify={notify}/>} {tab === 'scheduler' && <SchedulerSettings scheduler={scheduler} onChanged={setScheduler} llmConfig={llmConfig} notify={notify}/>} {tab === 'system' && <SystemSettings status={status} tasks={tasks} connected={connected} onStart={onMaintenance} onCancel={onCancel} onNavigate={onNavigate} reloadStatus={reloadStatus}/>}</div></div></div></section>;
+}
+
+function Sidebar({ status, page, activeTaskCount, onNavigate, mobileOpen, setMobileOpen }) {
+  const { t } = useI18n();
+  function navigate(target) { onNavigate(target); setMobileOpen(false); }
   return <aside className={`app-sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
     <div className="app-brand"><span>PU</span><div><strong>{t('app.name')}</strong><small>{t('app.tagline')}</small></div></div>
     <IconButton className="mobile-menu-button" icon={mobileOpen ? 'x' : 'menu'} label={t('nav.menu')} onClick={() => setMobileOpen(!mobileOpen)}/>
     <div className="app-sidebar-content">
-      <div className="app-sidebar-tools"><small>{t('nav.tools')}</small><button onClick={() => { onSplit(); setMobileOpen(false); }}><Icon name="split"/><span>{t('nav.split')}</span></button><button onClick={() => { onSetupCensor(); setMobileOpen(false); }}><Icon name="shield"/><span>{t('nav.installCensor')}</span></button><button onClick={() => { onUpdate(); setMobileOpen(false); }}><Icon name="refresh"/><span>{t('nav.checkUpdates')}</span></button></div>
+      <nav className="app-sidebar-nav" aria-label={t('nav.pages')}><small>{t('nav.workspaceGroup')}</small>{SIDEBAR_PAGES.map(([id,icon]) => <button key={id} aria-current={page === id ? 'page' : undefined} className={page === id ? 'active' : ''} onClick={() => navigate(id)}><Icon name={icon}/><span>{t(`nav.${id}`)}</span>{id === 'tasks' && activeTaskCount > 0 && <b>{activeTaskCount}</b>}</button>)}</nav>
       <div className="app-sidebar-bottom">
         <div className="sidebar-platforms"><PlatformBadge id="civitai" connected={status.civitai_logged_in}/><PlatformBadge id="pixiv" connected={status.pixiv_logged_in}/></div>
-        <div className="sidebar-bottom-actions"><IconButton icon={theme === 'dark' ? 'sun' : 'moon'} label={t('nav.toggleTheme')} onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}/><button onClick={() => { onSettings(); setMobileOpen(false); }}><Icon name="settings"/><span>{t('nav.settings')}</span></button></div>
+        <div className="sidebar-bottom-actions"><button aria-current={page === 'settings' ? 'page' : undefined} className={page === 'settings' ? 'active' : ''} onClick={() => navigate('settings')}><Icon name="settings"/><span>{t('nav.settings')}</span></button></div>
       </div>
     </div>
   </aside>;
@@ -773,8 +919,20 @@ function QuickPublish({ images, scheduler, onPublish, onOpenFolder }) {
   </section>;
 }
 
+function WorkspaceOverview({ tasks, scheduler, onNavigate }) {
+  const { formatNumber, formatTime, t } = useI18n();
+  const workflowTasks = tasks.filter(task => !isMaintenanceTask(task));
+  const activeTasks = workflowTasks.filter(task => ACTIVE_TASK_STATUSES.has(task.status));
+  const currentTask = activeTasks.find(task => task.status === 'running' || task.status === 'waiting_input') || activeTasks[0];
+  return <section className="workspace-overview">
+    <article className="workspace-card"><div className="workspace-card-icon"><Icon name="queue" size={20}/></div><div className="workspace-card-copy"><span>{t('workspace.queue')}</span><strong>{activeTasks.length ? t('workspace.activeCount', { count: formatNumber(activeTasks.length) }) : t('workspace.queueIdle')}</strong><small>{currentTask ? taskStageLabel(currentTask, t) : t('workspace.queueIdleHint')}</small></div><Button icon="arrow" onClick={() => onNavigate('tasks')}>{t('workspace.viewTasks')}</Button></article>
+    <article className="workspace-card"><div className="workspace-card-icon"><Icon name="clock" size={20}/></div><div className="workspace-card-copy"><span>{t('workspace.scheduler')}</span><strong>{scheduler.enabled ? t('workspace.schedulerEnabled') : t('workspace.schedulerDisabled')}</strong><small>{scheduler.enabled && scheduler.next_fire_at ? t('workspace.nextRun', { time: formatTime(scheduler.next_fire_at) }) : t('workspace.schedulerHint')}</small></div><Button icon="settings" onClick={() => onNavigate('settings', 'scheduler')}>{t('workspace.configure')}</Button></article>
+  </section>;
+}
+
 function FlowConsoleApp() {
   const { t } = useI18n();
+  const [route, setRoute] = useState(() => readAppRoute());
   const [theme, setThemeState] = useState(() => localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark');
   const [status, setStatus] = useState({});
   const [images, setImages] = useState([]);
@@ -783,19 +941,42 @@ function FlowConsoleApp() {
   const [scheduler, setScheduler] = useState({ enabled: false, targets: 'civitai,pixiv', ai_tags_by_platform: { pixiv: true } });
   const [llmConfig, setLlmConfig] = useState({ enabled: false, personas: [] });
   const [uploadDefaults, setUploadDefaults] = useState({});
-  const [workbenchView, setWorkbenchView] = useState('tasks');
   const [connected, setConnected] = useState(false);
   const [dialog, setDialog] = useState('');
   const [inputRequest, setInputRequest] = useState(null);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
   const toastTimers = useRef(new Map());
+  const pageHeading = useRef(null);
 
   function setTheme(value) {
     setThemeState(value); localStorage.setItem(THEME_KEY, value);
     document.documentElement.dataset.flowTheme = value;
   }
+  function navigate(page, settingsTab) {
+    const nextTab = page === 'settings' ? (settingsTab || route.settingsTab || 'general') : 'general';
+    const nextHash = routeHash(page, nextTab);
+    if (window.location.hash === nextHash) setRoute({ page, settingsTab: nextTab });
+    else window.location.hash = nextHash;
+    setMobileOpen(false);
+  }
   useEffect(() => { document.documentElement.dataset.flowTheme = theme; }, []);
+  useEffect(() => {
+    const syncRoute = () => {
+      const nextRoute = readAppRoute();
+      const canonicalHash = routeHash(nextRoute.page, nextRoute.settingsTab);
+      if (window.location.hash !== canonicalHash) window.history.replaceState(null, '', canonicalHash);
+      setRoute(nextRoute);
+    };
+    syncRoute();
+    window.addEventListener('hashchange', syncRoute);
+    return () => window.removeEventListener('hashchange', syncRoute);
+  }, []);
+  useEffect(() => {
+    const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+    window.scrollTo({ top: 0, behavior });
+    pageHeading.current?.focus({ preventScroll: true });
+  }, [route.page, route.settingsTab]);
   function dismissToast(id) { setToasts(previous => previous.filter(toast => toast.id !== id)); clearTimeout(toastTimers.current.get(id)); toastTimers.current.delete(id); }
   function notify(message, type = 'success') {
     const id = `${Date.now()}-${Math.random()}`;
@@ -812,7 +993,10 @@ function FlowConsoleApp() {
     const listen = (name, handler) => source.addEventListener(name, event => { try { handler(JSON.parse(event.data)); } catch (_) {} });
     source.onopen = () => setConnected(true);
     source.onerror = () => setConnected(false);
-    listen('task_update', task => setTasks(previous => { const index = previous.findIndex(item => item.id === task.id); return index < 0 ? [...previous, task] : previous.map(item => item.id === task.id ? { ...item, ...task } : item); }));
+    listen('task_update', task => {
+      setTasks(previous => { const index = previous.findIndex(item => item.id === task.id); return index < 0 ? [...previous, task] : previous.map(item => item.id === task.id ? { ...item, ...task } : item); });
+      if (isMaintenanceTask(task) && task.status === 'done') reloadStatus().catch(() => {});
+    });
     listen('task_remove', data => setTasks(previous => previous.filter(task => task.id !== data.id)));
     listen('log', entry => setLogs(previous => [...previous.slice(-499), entry]));
     listen('images_changed', () => { reloadImages(); reloadStatus(); });
@@ -822,9 +1006,9 @@ function FlowConsoleApp() {
     return () => source.close();
   }, []);
 
-  async function runTask(command, params = {}) {
+  async function runTask(command, params = {}, noticeKey = 'task.queuedNotice') {
     const result = await api(`/api/run/${command}`, jsonOptions('POST', params));
-    notify(t('task.queuedNotice'));
+    notify(t(noticeKey));
     return result;
   }
   async function cancelTask(id) { try { await api(`/api/tasks/${id}/cancel`, { method: 'POST' }); notify(t('task.cancelNotice')); } catch (error) { notify(localizedError(error, t), 'error'); } }
@@ -832,24 +1016,35 @@ function FlowConsoleApp() {
   async function retryTask(task) { try { await runTask(task.cmd, task.params || {}); } catch (error) { notify(localizedError(error, t), 'error'); } }
   async function openFolder() { try { await api('/api/open-folder'); } catch (error) { notify(localizedError(error, t), 'error'); } }
   async function submitInput(answer) { try { await api(`/api/tasks/${inputRequest.task_id}/resume`, jsonOptions('POST', { answer })); setInputRequest(null); } catch (error) { notify(localizedError(error, t), 'error'); } }
-  function splitPost(raw) {
-    const posts = raw.split(/[\s,，]+/).map(value => value.trim()).filter(Boolean);
-    runTask(1, { posts }).catch(error => notify(localizedError(error, t), 'error')); setDialog('');
+  async function startSplit(posts) {
+    try { await runTask(1, { posts }); navigate('tasks'); return true; }
+    catch (error) { notify(localizedError(error, t), 'error'); return false; }
   }
+  async function startMaintenance(command) {
+    try { await runTask(command, {}, 'maintenance.started'); }
+    catch (error) { notify(localizedError(error, t), 'error'); }
+  }
+  async function startPublish(command, params) {
+    const result = await runTask(command, params);
+    navigate('tasks');
+    return result;
+  }
+  const activeTaskCount = tasks.filter(task => !isMaintenanceTask(task) && ACTIVE_TASK_STATUSES.has(task.status)).length;
 
   return <div className="flow-application">
-    <Sidebar status={status} theme={theme} setTheme={setTheme} onSplit={() => setDialog('split')} onSetupCensor={() => runTask(4).catch(error => notify(localizedError(error, t), 'error'))} onUpdate={() => runTask(5).catch(error => notify(localizedError(error, t), 'error'))} onSettings={() => setDialog('settings')} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen}/>
+    <Sidebar status={status} page={route.page} activeTaskCount={activeTaskCount} onNavigate={navigate} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen}/>
     {mobileOpen && <button className="mobile-menu-scrim" aria-label={t('nav.closeMenu')} onClick={() => setMobileOpen(false)}/>}
     <main className="app-main">
-      <header className="app-topbar"><div><h1>{t('app.workspace')}</h1><span className={connected ? 'connected' : ''}><i/>{connected ? t('app.connected') : t('app.reconnecting')}</span></div><span className="app-version">v{status.version || t('common.notAvailable')}</span></header>
-      <div className="app-content">
-        <QuickPublish images={images} scheduler={scheduler} onPublish={() => setDialog('publish')} onOpenFolder={openFolder}/>
-        <Workbench tasks={tasks} logs={logs} view={workbenchView} onViewChange={setWorkbenchView} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask} clearLogs={() => setLogs([])} notify={notify}/>
-      </div>
+      <header className="app-topbar"><div><h1 ref={pageHeading} tabIndex={-1}>{t(`page.${route.page}`)}</h1><span className={connected ? 'connected' : ''}><i/>{connected ? t('app.connected') : t('app.reconnecting')}</span></div><span className="app-version">v{status.version || t('common.notAvailable')}</span></header>
+      <div className="app-content"><div key={route.page} className="app-page">
+        {route.page === 'workspace' && <><QuickPublish images={images} scheduler={scheduler} onPublish={() => setDialog('publish')} onOpenFolder={openFolder}/><WorkspaceOverview tasks={tasks} scheduler={scheduler} onNavigate={navigate}/></>}
+        {route.page === 'split' && <SplitPage onStart={startSplit}/>}
+        {route.page === 'tasks' && <TaskCenter tasks={tasks} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask}/>}
+        {route.page === 'logs' && <ActivityLog logs={logs} clearLogs={() => setLogs([])} notify={notify}/>}
+        {route.page === 'settings' && <SettingsPage tab={route.settingsTab} onTabChange={tab => navigate('settings', tab)} status={status} scheduler={scheduler} llmConfig={llmConfig} theme={theme} setTheme={setTheme} reloadStatus={reloadStatus} setScheduler={setScheduler} setLlmConfig={setLlmConfig} notify={notify} tasks={tasks} connected={connected} onMaintenance={startMaintenance} onCancel={cancelTask} onNavigate={navigate}/>}
+      </div></div>
     </main>
-    {dialog === 'publish' && <PublishDialog images={images} status={status} defaults={uploadDefaults} llmConfig={llmConfig} onReloadImages={reloadImages} onClose={() => setDialog('')} onRun={runTask} notify={notify}/>}
-    {dialog === 'split' && <PromptDialog title={t('dialog.splitTitle')} label={t('dialog.splitLabel')} placeholder={t('dialog.splitPlaceholder')} onClose={() => setDialog('')} onConfirm={splitPost}/>}
-    {dialog === 'settings' && <SettingsDialog status={status} scheduler={scheduler} llmConfig={llmConfig} theme={theme} setTheme={setTheme} onClose={() => setDialog('')} reloadStatus={reloadStatus} setScheduler={setScheduler} setLlmConfig={setLlmConfig} notify={notify}/>}
+    {dialog === 'publish' && <PublishDialog images={images} status={status} defaults={uploadDefaults} llmConfig={llmConfig} onReloadImages={reloadImages} onClose={() => setDialog('')} onRun={startPublish} notify={notify}/>}
     {inputRequest && <InputRequiredDialog request={inputRequest} onSubmit={submitInput}/>}
     <ToastStack toasts={toasts} dismiss={dismissToast}/>
   </div>;

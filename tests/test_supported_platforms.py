@@ -95,15 +95,65 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(task["current"], 0)
         self.assertEqual(task["total"], 1)
         self.assertEqual(task["cmd"], 2)
-        self.assertEqual(task["progress_version"], 2)
+        self.assertEqual(task["category"], "workflow")
+        self.assertEqual(task["progress_version"], 3)
         self.assertEqual(task["progress"], 0.0)
         self.assertEqual(task["stage"], "queued")
         self.assertEqual(task["stage_label"], "等待执行")
         self.assertGreater(task["stage_count"], 2)
         self.assertEqual(task["item_index"], 0)
+        self.assertEqual(task["activity"], {})
         self.assertEqual(task["succeeded"], 0)
         self.assertEqual(task["failed"], 0)
         self.assertEqual(task["canceled"], 0)
+
+    def test_maintenance_commands_are_classified_outside_workflow_tasks(self) -> None:
+        with patch.object(self.web_server.threading.Thread, "start"):
+            for command in (4, 5):
+                with self.subTest(command=command):
+                    response = self.client.post(f"/api/run/{command}", json={})
+                    self.assertEqual(response.status_code, 200)
+                    task_id = response.get_json()["task_id"]
+                    task = next(item for item in self.client.get("/api/tasks").get_json() if item["id"] == task_id)
+                    self.assertEqual(task["cmd"], command)
+                    self.assertEqual(task["category"], "maintenance")
+
+    def test_llm_retry_policy_is_persisted_as_a_nested_partial_update(self) -> None:
+        initial = self.client.post("/api/llm-reverse-config", json={
+            "enabled": True,
+            "provider": "openai_compatible",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "secret-value",
+            "model": "primary-model",
+            "retry_policy": {
+                "request_attempts": 4,
+                "repair_attempts": 2,
+                "fallback_models": ["fallback-a", "fallback-b"],
+            },
+        })
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.get_json()["retry_policy"]["request_attempts"], 4)
+        self.assertNotIn("secret-value", initial.get_data(as_text=True))
+
+        updated = self.client.post("/api/llm-reverse-config", json={
+            "api_key": "",
+            "retry_policy": {"total_timeout_seconds": 240},
+        })
+        self.assertEqual(updated.status_code, 200)
+        policy = updated.get_json()["retry_policy"]
+        self.assertEqual(policy["request_attempts"], 4)
+        self.assertEqual(policy["repair_attempts"], 2)
+        self.assertEqual(policy["total_timeout_seconds"], 240.0)
+        self.assertEqual(policy["fallback_models"], ["fallback-a", "fallback-b"])
+
+        saved = json.loads(self.config_path.read_text(encoding="utf-8"))["llm_reverse"]
+        self.assertEqual(saved["api_key"], "secret-value")
+
+    def test_llm_config_rejects_non_object_payload(self) -> None:
+        response = self.client.post("/api/llm-reverse-config", json=["invalid"])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error_code"], "settings_must_be_object")
 
     def test_task_log_handler_uses_command_specific_source(self) -> None:
         handler = self.web_server._SseLogHandler(
