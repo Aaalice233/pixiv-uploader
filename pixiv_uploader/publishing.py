@@ -46,6 +46,11 @@ def _targets_need_copy(targets) -> bool:
     return any(PLATFORM_RULES.get(t, {}).get("needs_copy") for t in targets)
 
 
+def _emit_progress(callback, stage: str, **details) -> None:
+    if callback is not None:
+        callback(stage, **details)
+
+
 def _load_watermark_for_targets(
     targets: list[str],
 ) -> tuple[WatermarkService | None, TextWatermarkSpec | ImageWatermarkSpec | None]:
@@ -94,6 +99,11 @@ def _build_llm_extra_context(
 
 from .pixiv.standalone import StandaloneMetadataReader, StandaloneTaggerBridge
 from .pixiv.pixai_tagger import PixAITaggerBridge
+from .pixiv.tagger_settings import (
+    load_haintag_settings,
+    resolve_cl_model_dir,
+    resolve_pixai_model_dir,
+)
 from .pixiv.storage import (
     append_validation_case,
     create_manifest_path,
@@ -111,6 +121,7 @@ from .pixiv.support import (
     collect_artwork_urls_from_source,
     collect_rule_fit_sample_manifests,
     compare_rule_fit_samples,
+    close_pixiv_browser,
     create_pixiv_post,
     ensure_pixiv_logged_in,
     extract_artwork_id,
@@ -224,19 +235,6 @@ def _resolve_haintag_root() -> Path:
     return SCRIPT_DIR.parent / "haintag"
 
 
-def _load_haintag_settings() -> dict:
-    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    cfg = Path(appdata) / "HainTag" / "settings.json"
-    if cfg.exists():
-        try:
-            payload = json.loads(cfg.read_text(encoding="utf-8"))
-            s = payload.get("settings", payload) if isinstance(payload, dict) else {}
-            return s if isinstance(s, dict) else {}
-        except Exception:
-            pass
-    return {}
-
-
 def _make_bridges():
     """
     返回 (metadata_bridge, tagger_bridge)。
@@ -251,13 +249,13 @@ def _make_bridges():
         metadata_reader = StandaloneMetadataReader()
 
     # tagger bridge: PixAI → CL → None (with runtime fallback)
-    settings = _load_haintag_settings()
+    settings = load_haintag_settings()
     tagger = None
-    pixai_dir = settings.get("pixai_tagger_model_dir", "")
-    if pixai_dir and (Path(pixai_dir) / "model.onnx").exists():
+    pixai_dir = resolve_pixai_model_dir(settings)
+    if pixai_dir:
         try:
-            t = PixAITaggerBridge(Path(pixai_dir))
-            sample = Path(pixai_dir) / "sample.webp"
+            t = PixAITaggerBridge(pixai_dir)
+            sample = pixai_dir / "sample.webp"
             if sample.exists():
                 probe = t.predict_tags(sample)
                 if probe.get("available"):
@@ -268,8 +266,9 @@ def _make_bridges():
                 tagger = t
         except Exception as exc:
             log.info(f"PixAI tagger 异常 ({exc}), 尝试 WD14 回退")
-    if tagger is None and settings.get("tagger_model_dir"):
-        tagger = StandaloneTaggerBridge()
+    cl_dir = resolve_cl_model_dir(settings)
+    if tagger is None and cl_dir:
+        tagger = StandaloneTaggerBridge(cl_dir)
 
     return metadata_reader, tagger
 
@@ -744,20 +743,27 @@ def create_upload_manifest(
     watermark_service: WatermarkService | None = None,
     watermark_spec: TextWatermarkSpec | ImageWatermarkSpec | None = None,
     cancel_event=None,
+    progress_callback=None,
 ) -> tuple[dict, bool]:
     _raise_if_canceled(cancel_event)
+    _emit_progress(progress_callback, "reading_metadata", stage_progress=0.0)
     source_meta = hain_bridge.read_metadata(image_path)
+    _emit_progress(progress_callback, "reading_metadata", stage_progress=1.0)
 
     civitai_blocked = False
     civitai_block_reason = ""
-    if "civitai" in targets and civitai_safety_cfg:
-        _raise_if_canceled(cancel_event)
-        civitai_blocked, civitai_block_reason = check_civitai_safety(
-            image_path, source_meta, age_rules, civitai_safety_cfg
-        )
-        if civitai_blocked:
-            log.info(f"    Civitai 安全过滤：{civitai_block_reason}")
+    if "civitai" in targets:
+        _emit_progress(progress_callback, "safety_check", stage_progress=0.0)
+        if civitai_safety_cfg:
+            _raise_if_canceled(cancel_event)
+            civitai_blocked, civitai_block_reason = check_civitai_safety(
+                image_path, source_meta, age_rules, civitai_safety_cfg
+            )
+            if civitai_blocked:
+                log.info(f"    Civitai 安全过滤：{civitai_block_reason}")
+        _emit_progress(progress_callback, "safety_check", stage_progress=1.0)
 
+    _emit_progress(progress_callback, "preparing_artifacts", stage_progress=0.0)
     civitai_copy = strip_prompts_keep_lora(image_path, civitai_dir) if "civitai" in targets else None
     _raise_if_canceled(cancel_event)
     # Sanitize / tag pipeline runs if ANY target needs it (PLATFORM_RULES table).
@@ -765,9 +771,12 @@ def create_upload_manifest(
     needs_pixiv_payload = any(PLATFORM_RULES.get(t, {}).get("needs_copy") for t in targets)
     pixiv_clean = sanitize_image_for_pixiv(image_path, pixiv_dir) if needs_sanitize else None
     _raise_if_canceled(cancel_event)
+    _emit_progress(progress_callback, "preparing_artifacts", stage_progress=1.0)
 
     # Run auto-censor on the sanitized pixiv copy if engine present.
     censor_result = None
+    if needs_pixiv_payload:
+        _emit_progress(progress_callback, "censoring", stage_progress=0.0)
     if pixiv_clean is not None and censor_engine is not None:
         log.info("    Pixiv 准备: 正在执行内容安全检查")
         _raise_if_canceled(cancel_event)
@@ -783,12 +792,16 @@ def create_upload_manifest(
         elif censor_result.status == "ok":
             log.info(f"    censor: 无需打码 — {censor_result.detail}")
         # other statuses already logged by engine
+    if needs_pixiv_payload:
+        _emit_progress(progress_callback, "censoring", stage_progress=1.0)
 
     pixiv_metadata_check = (
         hain_bridge.read_metadata(pixiv_clean.output_path) if pixiv_clean is not None
         else {"status": "skipped", "detected_types": [], "details": []}
     )
     _raise_if_canceled(cancel_event)
+    if needs_pixiv_payload:
+        _emit_progress(progress_callback, "tagging", stage_progress=0.0)
     if needs_pixiv_payload and tagger_bridge is not None:
         log.info("    Pixiv 准备: 正在识别图片标签")
         tagger_result = tagger_bridge.predict_tags(image_path)
@@ -796,6 +809,8 @@ def create_upload_manifest(
             log.info(f"    tagger: {tagger_result.get('status')} — 仅用 prompt/文件名候选")
     else:
         tagger_result = {"available": False, "status": "disabled", "flat_tags": [], "groups": {}, "details": []}
+    if needs_pixiv_payload:
+        _emit_progress(progress_callback, "tagging", stage_progress=1.0)
     extra_candidates: list[str] = []
     extra_groups: dict[str, list[tuple[str, float]]] = {}
     if tagger_result.get("available"):
@@ -804,6 +819,7 @@ def create_upload_manifest(
             extra_groups[category] = [(tag, float(score)) for tag, score in entries]
     if needs_pixiv_payload:
         log.info("    Pixiv 准备: 正在整理标签与分级")
+        _emit_progress(progress_callback, "organizing_tags", stage_progress=0.0)
     pixiv_payload = (
         build_pixiv_payload(
             image_path=image_path,
@@ -823,6 +839,8 @@ def create_upload_manifest(
         if needs_pixiv_payload else None
     )
     _raise_if_canceled(cancel_event)
+    if needs_pixiv_payload:
+        _emit_progress(progress_callback, "organizing_tags", stage_progress=1.0)
 
     llm_reverse_result = {"enabled": False, "status": "disabled", "error": ""}
     if pixiv_payload is not None:
@@ -873,6 +891,7 @@ def create_upload_manifest(
                     _ctx = _build_llm_extra_context(pixiv_payload, source_meta=source_meta)
                     log.info(f"    LLM 反推: extra_context={_ctx!r}")
                     log.info("    LLM 反推: 正在生成文案")
+                    _emit_progress(progress_callback, "generating_copy", stage_progress=0.0)
                     llm_reverse_result = infer_image_copy(
                         image_path=Path(pixiv_clean.output_path) if pixiv_clean else image_path,
                         config=llm_reverse_config,
@@ -890,8 +909,15 @@ def create_upload_manifest(
                         log.warning(
                             f"    LLM 反推: {llm_reverse_result.get('status')} — {llm_reverse_result.get('error', '')}"
                         )
+                    _emit_progress(
+                        progress_callback,
+                        "generating_copy",
+                        stage_progress=1.0 if llm_reverse_result.get("status") == "ok" else 0.0,
+                    )
             _raise_if_canceled(cancel_event)
 
+    if needs_pixiv_payload:
+        _emit_progress(progress_callback, "watermarking", stage_progress=0.0)
     watermark_failed = False
     watermark_error = ""
     watermark_result = {
@@ -924,6 +950,12 @@ def create_upload_manifest(
             label = "图片水印" if watermark_spec is not None and watermark_spec.renderer == "image" else "文字水印"
             log.error(f"    {label}失败: {watermark_error}")
     _raise_if_canceled(cancel_event)
+    if needs_pixiv_payload:
+        _emit_progress(
+            progress_callback,
+            "watermarking",
+            stage_progress=0.0 if watermark_failed else 1.0,
+        )
 
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -1011,6 +1043,8 @@ def create_upload_manifest(
 
 
 def cmd_split(args):
+    progress_callback = getattr(args, "progress_callback", None)
+    _emit_progress(progress_callback, "split_discover", stage_progress=0.0)
     api_key = args.api_key or os.environ.get("CIVITAI_API_KEY")
     if not api_key:
         log.error("需要 API key。用 --api-key 或设置 CIVITAI_API_KEY 环境变量。")
@@ -1028,13 +1062,22 @@ def cmd_split(args):
     log.info(f"\n准备拆分 {len(post_ids)} 个 post: {post_ids}")
 
     all_tasks = []
-    for post_id in post_ids:
+    failed_posts = 0
+    for post_index, post_id in enumerate(post_ids, 1):
+        _raise_if_canceled(getattr(args, "cancel_event", None))
         try:
             images = fetch_post_images(post_id, api_key)
         except Exception as exc:
+            failed_posts += 1
             log.error(f"  Post {post_id} 获取图片失败: {exc}")
             log.debug(traceback.format_exc())
             continue
+        finally:
+            _emit_progress(
+                progress_callback,
+                "split_discover",
+                stage_progress=post_index / max(1, len(post_ids)),
+            )
         if not images:
             log.info(f"  Post {post_id} 没有找到图片，跳过")
             continue
@@ -1042,11 +1085,23 @@ def cmd_split(args):
 
     if not all_tasks:
         log.info("没有需要处理的图片。")
-        return
+        return {
+            "status": "no_work",
+            "total": 0,
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "unprocessed": 0,
+            "failed_posts": failed_posts,
+        }
 
     total_images = sum(len(images) for _, images in all_tasks)
     log.info(f"\n共 {total_images} 张图需要拆分。")
 
+    processed_count = 0
+    success_count = 0
+    fail_count = 0
+    completed_work = 0.0
     PROGRESS_DIR.mkdir(exist_ok=True)
     for post_id, images in all_tasks:
         log.info(f"\n--- 处理 Post {post_id} ({len(images)} 张图) ---")
@@ -1058,6 +1113,10 @@ def cmd_split(args):
         progress = load_progress(progress_path)
 
         completed_ids = {item["image_id"] for item in progress["completed"]}
+        completed_here = sum(1 for image in images if image["id"] in completed_ids)
+        processed_count += completed_here
+        success_count += completed_here
+        completed_work += completed_here
         remaining_images = [img for img in images if img["id"] not in completed_ids]
         if not remaining_images:
             log.info("  所有图片已处理完毕。")
@@ -1065,16 +1124,56 @@ def cmd_split(args):
 
         temp_dir = make_temp_dir(f"civitai_split_{post_id}_")
         try:
+            _raise_if_canceled(getattr(args, "cancel_event", None))
+            _emit_progress(
+                progress_callback,
+                "split_download",
+                stage_progress=0.0,
+                overall_progress=completed_work / max(1, total_images),
+                total=total_images,
+                current=processed_count,
+                succeeded=success_count,
+                failed=fail_count,
+            )
             log.info(f"  下载 {len(remaining_images)} 张图片...")
             local_paths = download_and_embed_metadata(remaining_images, api_key, temp_dir)
+            completed_work += 0.35 * len(local_paths)
+            _emit_progress(
+                progress_callback,
+                "split_download",
+                stage_progress=1.0,
+                overall_progress=completed_work / max(1, total_images),
+                total=total_images,
+                current=processed_count,
+                succeeded=success_count,
+                failed=fail_count,
+            )
 
             log.info("  开始上传（每张独立开关浏览器，规避验证码）...")
             with sync_playwright() as pw:
                 for idx, (img, local_path) in enumerate(zip(remaining_images, local_paths), 1):
+                    _raise_if_canceled(getattr(args, "cancel_event", None))
+                    _emit_progress(
+                        progress_callback,
+                        "split_publish",
+                        stage_progress=0.0,
+                        overall_progress=completed_work / max(1, total_images),
+                        item_index=processed_count + 1,
+                        item_name=str(img["id"]),
+                        total=total_images,
+                        current=processed_count,
+                        succeeded=success_count,
+                        failed=fail_count,
+                    )
                     log.info(f"\n  [{idx}/{len(remaining_images)}] 上传图片 {img['id']}...")
                     context, page = open_civitai_browser(pw)
                     try:
-                        new_url = create_civitai_post(page, local_path, args.delay)
+                        new_url = create_civitai_post(
+                            page,
+                            local_path,
+                            args.delay,
+                            cancel_event=getattr(args, "cancel_event", None),
+                        )
                     except Exception as exc:
                         log.error(f"    图片 {img['id']} 发布异常: {exc}")
                         log.debug(traceback.format_exc())
@@ -1083,15 +1182,56 @@ def cmd_split(args):
                         context.close()
                     if new_url:
                         progress["completed"].append({"image_id": img["id"], "new_post_url": new_url})
+                        success_count += 1
                     else:
                         progress["failed"].append({"image_id": img["id"], "error": "发布失败"})
+                        fail_count += 1
+                    processed_count += 1
+                    completed_work += 0.65
                     save_progress(progress_path, progress)
+                    _emit_progress(
+                        progress_callback,
+                        "split_publish",
+                        stage_progress=1.0 if new_url else 0.0,
+                        overall_progress=completed_work / max(1, total_images),
+                        item_index=processed_count,
+                        item_name=str(img["id"]),
+                        total=total_images,
+                        current=processed_count,
+                        succeeded=success_count,
+                        failed=fail_count,
+                    )
+        except InterruptedError:
+            raise
         except Exception as exc:
             log.error(f"  Post {post_id} 处理异常: {exc}")
             log.debug(traceback.format_exc())
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
         log.info(f"\n  Post {post_id} 完成: {len(progress['completed'])} 成功, {len(progress['failed'])} 失败")
+
+    unprocessed_count = max(0, total_images - processed_count)
+    status = "success" if not failed_posts and not fail_count and not unprocessed_count else "failed"
+    if status == "success":
+        _emit_progress(
+            progress_callback,
+            "finalizing",
+            stage_progress=1.0,
+            overall_progress=1.0,
+            total=total_images,
+            current=processed_count,
+            succeeded=success_count,
+            failed=fail_count,
+        )
+    return {
+        "status": status,
+        "total": total_images,
+        "processed": processed_count,
+        "succeeded": success_count,
+        "failed": fail_count,
+        "unprocessed": unprocessed_count,
+        "failed_posts": failed_posts,
+    }
 
 
 def _select_by_sort(images: list, sort_mode: str, count: int) -> list:
@@ -1108,10 +1248,13 @@ def _select_by_sort(images: list, sort_mode: str, count: int) -> list:
 
 
 def cmd_upload(args):
+    progress_callback = getattr(args, "progress_callback", None)
+    _emit_progress(progress_callback, "initializing", stage_progress=0.1)
     files = ensure_runtime_files(SCRIPT_DIR)
     alias_data = load_json(files["aliases"], {})
     popularity_data = load_json(files["popularity"], {})
     age_rules = load_json(files["age_rules"], {})
+    _emit_progress(progress_callback, "initializing", stage_progress=0.3)
     hain_bridge, tagger_bridge = _make_bridges()
     _tagger_probe = getattr(tagger_bridge, "_model_dir", None) or getattr(tagger_bridge, "_dir", None)
     if "pixiv" in getattr(args, "targets", ""):
@@ -1125,6 +1268,7 @@ def cmd_upload(args):
         log.info(f"Danbooru→JP 词典已加载: {len(danbooru_jp_map)} 条")
     civitai_safety_cfg = load_json(files["civitai_safety"], {})
     llm_reverse_config = load_llm_reverse_config()
+    _emit_progress(progress_callback, "initializing", stage_progress=0.5)
     llm_reverse_enabled = bool(getattr(args, "llm_reverse", False)) and llm_reverse_config.get("enabled")
     if getattr(args, "llm_reverse", False) and not llm_reverse_enabled:
         log.warning("LLM 反推: 已请求但未启用或配置不完整，将跳过")
@@ -1141,6 +1285,7 @@ def cmd_upload(args):
 
     targets = parse_targets(args.targets)
     watermark_service, watermark_spec = _load_watermark_for_targets(targets)
+    _emit_progress(progress_callback, "initializing", stage_progress=0.65)
 
     all_images = sorted(
         file for file in UPLOAD_DIR.iterdir()
@@ -1148,7 +1293,14 @@ def cmd_upload(args):
     )
     if not all_images:
         log.info(f"upload/ 目录没有图片。\n  {UPLOAD_DIR}")
-        return
+        return {
+            "status": "no_work",
+            "total": 0,
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "unprocessed": 0,
+        }
 
     # Auto-censor is opt-in through models/auto_censor.pt. Runtime tunables
     # only affect Pixiv's sanitized publishing copy.
@@ -1205,20 +1357,44 @@ def cmd_upload(args):
             )
         else:
             log.info("自动打码: 未启用（如需放模型到 models/auto_censor.pt + pip install ultralytics opencv-python）")
+    _emit_progress(progress_callback, "initializing", stage_progress=0.8)
     sort_mode = getattr(args, "sort", "random")
-    selected_names = getattr(args, "files", None) or []
+    selected_names = [str(name) for name in (getattr(args, "files", None) or [])]
     if selected_names:
         upload_by_name = {file.name.lower(): file for file in all_images}
-        image_files = [upload_by_name[name.lower()] for name in selected_names if name.lower() in upload_by_name]
-        if not image_files:
-            log.warning("指定的文件不在 upload/ 目录，改用排序规则")
-            image_files = _select_by_sort(all_images, sort_mode, 1)
+        missing_names = [name for name in selected_names if name.lower() not in upload_by_name]
+        if missing_names:
+            log.error(f"指定文件已不在 upload/，任务未开始: {missing_names}")
+            _emit_progress(
+                progress_callback,
+                "initializing",
+                stage_progress=1.0,
+                total=len(selected_names),
+                current=len(missing_names),
+                failed=len(missing_names),
+            )
+            return {
+                "status": "missing_files",
+                "total": len(selected_names),
+                "processed": len(missing_names),
+                "succeeded": 0,
+                "failed": len(missing_names),
+                "unprocessed": len(selected_names) - len(missing_names),
+                "missing_files": missing_names,
+            }
+        image_files = [upload_by_name[name.lower()] for name in selected_names]
     else:
         requested = max(0, int(getattr(args, "count", 0) or 0))
         count = min(requested, len(all_images)) if requested else min(random.randint(1, 5), len(all_images))
         image_files = _select_by_sort(all_images, sort_mode, count)
 
     image_queue = [(image, targets) for image in image_files]
+    _emit_progress(
+        progress_callback,
+        "initializing",
+        stage_progress=1.0,
+        total=len(image_queue),
+    )
     all_processed_targets = list(targets)
     log.info(f"upload/ {len(all_images)} 张，本次处理 {len(image_files)} 张；目标：{targets}\n")
 
@@ -1232,11 +1408,13 @@ def cmd_upload(args):
     civitai_page = pixiv_page = None
     success_count = 0
     fail_count = 0
+    canceled_count = 0
     consecutive_failures = 0
     abort_threshold = max(1, int(args.abort_after_failures))
     playwright = None
     target_success_counts = {target: 0 for target in all_processed_targets}
     target_fail_counts = {target: 0 for target in all_processed_targets}
+    target_canceled_counts = {target: 0 for target in all_processed_targets}
 
     try:
         if not args.dry_run and targets:
@@ -1249,6 +1427,16 @@ def cmd_upload(args):
             if _cancel_ev and _cancel_ev.is_set():
                 log.info("收到取消信号，停止上传")
                 break
+
+            def report_image(stage: str, **details) -> None:
+                details.setdefault("item_index", index)
+                details.setdefault("item_name", orig_path.name)
+                details.setdefault("total", len(image_queue))
+                details.setdefault("current", success_count + fail_count)
+                details.setdefault("succeeded", success_count)
+                details.setdefault("failed", fail_count)
+                _emit_progress(progress_callback, stage, **details)
+
             log.info(f"[{index}/{len(image_queue)}] {orig_path.name}")
             if "pixiv" in effective_targets:
                 log.info("    Pixiv 准备: 正在处理图片、标签和文案，完成后自动打开投稿页")
@@ -1286,6 +1474,7 @@ def cmd_upload(args):
                 watermark_service=watermark_service,
                 watermark_spec=watermark_spec,
                 cancel_event=_cancel_ev,
+                progress_callback=report_image,
             )
             _raise_if_canceled(_cancel_ev)
             # Persist any new JP aliases learned during this image's payload build
@@ -1294,9 +1483,11 @@ def cmd_upload(args):
             if "pixiv" in effective_targets and tagger_status not in {"ok", "disabled", "haintag_root_missing", "model_dir_not_configured", "onnxruntime_not_installed"}:
                 log.warning(f"    tagger 不可用: {tagger_status}（继续上传，仅用 prompt/文件名候选）")
             manifest["dry_run"] = bool(args.dry_run)
+            report_image("saving_manifest", stage_progress=0.0)
             write_manifest(manifest_path, manifest)
             if "pixiv" in effective_targets:
                 save_json(files["popularity"], popularity_data)
+            report_image("saving_manifest", stage_progress=1.0)
 
             if args.dry_run:
                 for target in effective_targets:
@@ -1304,20 +1495,30 @@ def cmd_upload(args):
                         manifest["status_by_target"][target] = "dry_run"
                 write_manifest(manifest_path, manifest)
                 log.info("    dry-run 完成，未执行发布。")
+                report_image("finalizing_image", stage_progress=1.0)
                 success_count += 1
+                report_image(
+                    "item_complete",
+                    current=index,
+                    succeeded=success_count,
+                    failed=fail_count,
+                )
                 continue
 
             all_succeeded = True
             cancel_requested = False
 
             if "civitai" in effective_targets:
+                report_image("publishing_civitai", stage_progress=0.0)
                 if "civitai" in skip_targets:
                     inherited_url = prior_successes["civitai"]
                     manifest["civitai"]["post_url"] = inherited_url
                     manifest["status_by_target"]["civitai"] = "skipped_already_done"
+                    report_image("publishing_civitai", stage_progress=1.0)
                     log.info(f"    Civitai 已发过，跳过: {inherited_url}")
                 elif manifest["status_by_target"].get("civitai") == "skipped_civitai_safety":
                     reason = manifest["civitai"].get("skip_reason", "")
+                    report_image("publishing_civitai", stage_progress=1.0)
                     log.info(f"    Civitai 安全跳过: {reason}")
                 else:
                     civitai_copy = Path(manifest["civitai"]["clean_copy_path"])
@@ -1333,6 +1534,7 @@ def cmd_upload(args):
                     if civitai_url:
                         manifest["civitai"]["post_url"] = civitai_url
                         manifest["status_by_target"]["civitai"] = "success"
+                        report_image("publishing_civitai", stage_progress=1.0)
                         log.info(f"    Civitai 发布成功: {civitai_url}")
                     elif cancel_requested and manifest["status_by_target"].get("civitai") == "pending":
                         manifest["status_by_target"]["civitai"] = "canceled"
@@ -1349,15 +1551,18 @@ def cmd_upload(args):
                     "pixiv" not in skip_targets
                     and pixiv_ready
                     and not cancel_requested
-                    and pixiv_page is None
                 ):
-                    log.info("    Pixiv 准备完成: 正在打开浏览器并填写投稿表单")
-                    try:
-                        pixiv_context, pixiv_page = open_pixiv_browser(playwright)
-                    except Exception as exc:
-                        pixiv_browser_error = str(exc)
-                        log.error(f"    Pixiv 浏览器启动失败: {pixiv_browser_error}")
-                        log.debug(traceback.format_exc())
+                    report_image("opening_pixiv", stage_progress=0.0)
+                    if pixiv_page is None:
+                        log.info("    Pixiv 准备完成: 正在打开浏览器并填写投稿表单")
+                        try:
+                            pixiv_context, pixiv_page = open_pixiv_browser(playwright)
+                        except Exception as exc:
+                            pixiv_browser_error = str(exc)
+                            log.error(f"    Pixiv 浏览器启动失败: {pixiv_browser_error}")
+                            log.debug(traceback.format_exc())
+                    if pixiv_page is not None and not pixiv_browser_error:
+                        report_image("opening_pixiv", stage_progress=1.0)
 
                 if "pixiv" in skip_targets:
                     inherited_url = prior_successes["pixiv"]
@@ -1392,13 +1597,20 @@ def cmd_upload(args):
                     pixiv_steps: list = []
                     for attempt in range(max_retries + 1):
                         try:
+                            report_image("filling_pixiv", stage_progress=0.0)
                             pixiv_url, pixiv_steps = create_pixiv_post(
-                                pixiv_page, payload, pixiv_copy, args.delay, log_dir=LOG_DIR, cancel_event=_cancel_ev,
+                                pixiv_page,
+                                payload,
+                                pixiv_copy,
+                                args.delay,
+                                log_dir=LOG_DIR,
+                                cancel_event=_cancel_ev,
+                                progress_callback=report_image,
                             )
-                        except InterruptedError:
+                        except InterruptedError as exc:
                             cancel_requested = True
                             pixiv_url = None
-                            pixiv_steps = []
+                            pixiv_steps = list(getattr(exc, "pixiv_steps", pixiv_steps))
                             break
                         except Exception as exc:
                             log.error(f"    Pixiv 发布异常 (attempt {attempt + 1}): {exc}")
@@ -1411,6 +1623,13 @@ def cmd_upload(args):
                         already_clicked = any(getattr(s, "name", "") == "publish_click" and getattr(s, "ok", False) for s in pixiv_steps)
                         if already_clicked:
                             log.warning("    publish 已点击，疑似已发布，跳过重试")
+                            break
+                        browser_closed = any(
+                            getattr(step, "reason", "") == "browser_closed"
+                            for step in pixiv_steps
+                        )
+                        if browser_closed:
+                            log.error("    Pixiv 浏览器已关闭，停止重试；请保持投稿窗口打开")
                             break
                         captcha_timeout = any(
                             getattr(s, "name", "") == "redirect" and not getattr(s, "ok", False)
@@ -1431,6 +1650,7 @@ def cmd_upload(args):
                     elif pixiv_url:
                         manifest["pixiv"]["post_url"] = pixiv_url
                         manifest["status_by_target"]["pixiv"] = "success"
+                        report_image("verifying_pixiv", stage_progress=1.0)
                         log.info(f"    Pixiv 发布成功: {pixiv_url}")
                     else:
                         # If publish button was clicked successfully but redirect detection
@@ -1469,10 +1689,14 @@ def cmd_upload(args):
                     target_success_counts[target] += 1
                 elif status == "failed":
                     target_fail_counts[target] += 1
+                elif status == "canceled":
+                    target_canceled_counts[target] += 1
 
             if all_succeeded:
+                report_image("finalizing_image", stage_progress=0.0)
                 dest = move_to_done(orig_path)
                 log.info(f"    已移动到: {dest.name}")
+                report_image("finalizing_image", stage_progress=1.0)
                 success_count += 1
                 consecutive_failures = 0
             else:
@@ -1490,25 +1714,39 @@ def cmd_upload(args):
                     else:
                         target_summaries.append(f"{target} {status}")
                 log.error(f"    {'，'.join(target_summaries)}，文件保留在 upload/")
-                fail_count += 1
+                if cancel_requested:
+                    canceled_count += 1
+                else:
+                    fail_count += 1
                 ok_statuses = {"success", "skipped_already_done", "skipped_civitai_safety", "maybe_posted"}
                 any_target_ok = any(manifest["status_by_target"].get(target) in ok_statuses for target in effective_targets)
                 if any_target_ok:
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
-                if consecutive_failures >= abort_threshold:
-                    log.error(f"\n连续 {consecutive_failures} 张失败，中断本次批次（避免触发风控）")
-                    break
+            report_image(
+                "item_complete",
+                current=success_count + fail_count + canceled_count,
+                succeeded=success_count,
+                failed=fail_count,
+                canceled=canceled_count,
+            )
+            if consecutive_failures >= abort_threshold:
+                log.error(f"\n连续 {consecutive_failures} 张失败，中断本次批次（避免触发风控）")
+                break
 
         if args.dry_run:
             log.info(f"\n完成。dry-run 样本 {success_count}，未实际发布。")
         else:
-            log.info(f"\n完成。双站都成功 {success_count}，未全部成功 {fail_count}。")
+            if len(all_processed_targets) == 1:
+                log.info(f"\n完成。成功 {success_count}，未成功 {fail_count}。")
+            else:
+                log.info(f"\n完成。全部目标成功 {success_count}，未全部成功 {fail_count}。")
             for target in all_processed_targets:
                 log.info(
                     f"  {target}: 成功 {target_success_counts.get(target, 0)}，"
-                    f"失败 {target_fail_counts.get(target, 0)}"
+                    f"失败 {target_fail_counts.get(target, 0)}，"
+                    f"取消 {target_canceled_counts.get(target, 0)}"
                 )
     finally:
         if civitai_context is not None:
@@ -1518,12 +1756,34 @@ def cmd_upload(args):
                 pass
         if pixiv_context is not None:
             try:
-                pixiv_context.close()
+                close_pixiv_browser(pixiv_context)
             except Exception:
                 pass
         if playwright is not None:
             playwright.stop()
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+    processed_count = success_count + fail_count + canceled_count
+    unprocessed_count = max(0, len(image_queue) - processed_count)
+    if canceled_count or (getattr(args, "cancel_event", None) and args.cancel_event.is_set()):
+        status = "canceled"
+    elif fail_count or unprocessed_count:
+        status = "failed"
+    else:
+        status = "success"
+    return {
+        "status": status,
+        "total": len(image_queue),
+        "processed": processed_count,
+        "succeeded": success_count,
+        "failed": fail_count,
+        "canceled": canceled_count,
+        "unprocessed": unprocessed_count,
+        "targets": all_processed_targets,
+        "target_succeeded": target_success_counts,
+        "target_failed": target_fail_counts,
+        "target_canceled": target_canceled_counts,
+    }
 
 
 def cmd_pixiv_fit_collect(args):

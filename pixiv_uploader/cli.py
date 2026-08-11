@@ -11,6 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .paths import PROJECT_ROOT
+from .pixiv.tagger_settings import (
+    load_haintag_settings as _read_haintag_settings,
+    resolve_cl_model_dir,
+    resolve_pixai_model_dir,
+    save_haintag_settings as _write_haintag_settings,
+)
 
 SCRIPT_DIR = PROJECT_ROOT
 PUBLISHING_COMMAND = ["-m", "pixiv_uploader.publishing"]
@@ -262,38 +268,6 @@ def cmd_setup_tagger() -> None:
     run(["-m", "pixiv_uploader.pixiv.setup_tagger"])
 
 
-def _read_haintag_settings() -> dict:
-    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    cfg = Path(appdata) / "HainTag" / "settings.json"
-    if cfg.exists():
-        try:
-            payload = json.loads(cfg.read_text(encoding="utf-8"))
-            s = payload.get("settings", payload) if isinstance(payload, dict) else {}
-            return s if isinstance(s, dict) else {}
-        except Exception:
-            pass
-    return {}
-
-
-def _write_haintag_settings(settings: dict) -> None:
-    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    path = Path(appdata) / "HainTag" / "settings.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    if isinstance(existing, dict) and "settings" in existing:
-        existing["settings"].update(settings)
-    elif isinstance(existing, dict):
-        existing.update(settings)
-    else:
-        existing = settings
-    path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def _tagger_download_pixai(target_dir: str) -> None:
     try:
         from huggingface_hub import snapshot_download
@@ -325,14 +299,16 @@ def cmd_tagger_menu() -> None:
     ht = _read_haintag_settings()
     pixai_dir = ht.get("pixai_tagger_model_dir", "")
     cl_dir = ht.get("tagger_model_dir", "")
-    if pixai_dir and (Path(pixai_dir) / "model.onnx").exists():
-        print(f"  PixAI  : {pixai_dir}  [激活]")
+    resolved_pixai = resolve_pixai_model_dir(ht)
+    resolved_cl = resolve_cl_model_dir(ht)
+    if resolved_pixai:
+        print(f"  PixAI  : {resolved_pixai}  [激活]")
     elif pixai_dir:
         print(f"  PixAI  : {pixai_dir}  [model.onnx 未找到]")
     else:
         print("  PixAI  : 未配置")
-    if cl_dir and os.path.isdir(cl_dir):
-        print(f"  CL/WD14: {cl_dir}  [目录存在]")
+    if resolved_cl:
+        print(f"  CL/WD14: {resolved_cl}  [激活]")
     elif cl_dir:
         print(f"  CL/WD14: {cl_dir}  [目录不存在]")
     else:

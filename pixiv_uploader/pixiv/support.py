@@ -30,6 +30,13 @@ from .storage import (
     safe_stem,
     write_manifest,
 )
+from .tagger_settings import (
+    haintag_settings_path,
+    load_haintag_settings,
+    resolve_cl_model_dir,
+    resolve_tagger_python,
+    scan_cl_model_dir,
+)
 
 log = logging.getLogger("pixiv_uploader")
 
@@ -143,6 +150,10 @@ class PixivStep:
 
     def to_dict(self) -> dict[str, Any]:
         return {"name": self.name, "ok": self.ok, "reason": self.reason, "detail": self.detail}
+
+
+class PixivBrowserClosedError(RuntimeError):
+    pass
 
 
 PIXIV_SELECTORS: dict[str, Any] = {
@@ -364,7 +375,8 @@ class HainTagTaggerBridge:
 
     @property
     def _model_dir(self) -> str:
-        return self._load_settings().get("tagger_model_dir", "")
+        resolved = resolve_cl_model_dir(self._load_settings())
+        return str(resolved) if resolved else ""
 
     def predict_tags(self, path: Path) -> dict[str, Any]:
         engine = self._ensure_engine()
@@ -425,9 +437,9 @@ class HainTagTaggerBridge:
 
         settings = self._load_settings()
         self._settings = settings
-        model_dir = settings.get("tagger_model_dir", "")
-        external_python = settings.get("tagger_python_path", "") or None
-        appdata_dir = os.environ.get("APPDATA", "") or str(Path.home() / "AppData" / "Roaming")
+        model_dir_path = resolve_cl_model_dir(settings)
+        model_dir = str(model_dir_path) if model_dir_path else ""
+        external_python = resolve_tagger_python(settings)
         _source_engine = None
         try:
             module = importlib.import_module("native_app.tagger")
@@ -438,7 +450,7 @@ class HainTagTaggerBridge:
             engine = engine_cls(model_dir=model_dir or None)
             model_path, mapping_path = engine.find_model(
                 custom_dir=model_dir or None,
-                appdata_dir=str(Path(appdata_dir) / "HainTag"),
+                appdata_dir=str(haintag_settings_path().parent),
             )
             if (not model_path or not mapping_path) and model_dir:
                 model_path, mapping_path = self._scan_model_dir(model_dir)
@@ -470,12 +482,9 @@ class HainTagTaggerBridge:
         import sys as _sys
         settings = self._load_settings()
         self._settings = settings
-        model_dir = settings.get("tagger_model_dir", "")
-        appdata_dir = os.environ.get("APPDATA", "") or str(Path.home() / "AppData" / "Roaming")
+        model_dir_path = resolve_cl_model_dir(settings)
+        model_dir = str(model_dir_path) if model_dir_path else ""
         model_path, mapping_path = self._scan_model_dir(model_dir) if model_dir else (None, None)
-        if not model_path or not mapping_path:
-            model_sub = str(Path(appdata_dir) / "HainTag" / "models" / "cl_tagger")
-            model_path, mapping_path = self._scan_model_dir(model_sub)
         if not model_path or not mapping_path:
             self._status = "model_not_found"
             return None
@@ -491,33 +500,14 @@ class HainTagTaggerBridge:
 
     @staticmethod
     def _scan_model_dir(path: str) -> tuple[str | None, str | None]:
-        if not path or not os.path.isdir(path):
-            return None, None
-        model_file = mapping_file = None
-        for f in os.listdir(path):
-            fl = f.lower()
-            if fl.endswith(".onnx") and not model_file:
-                model_file = os.path.join(path, f)
-            elif fl.endswith(".json") and any(x in fl for x in ("tag", "mapping", "label")) and not mapping_file:
-                mapping_file = os.path.join(path, f)
-            elif fl.endswith(".csv") and any(x in fl for x in ("tag", "label")) and not mapping_file:
-                mapping_file = os.path.join(path, f)
-        if model_file and mapping_file:
-            return model_file, mapping_file
+        model_path, mapping_path = scan_cl_model_dir(path)
+        if model_path and mapping_path:
+            return str(model_path), str(mapping_path)
         return None, None
 
     @staticmethod
     def _load_settings() -> dict[str, Any]:
-        appdata_root = os.environ.get("APPDATA")
-        base_path = Path(appdata_root) if appdata_root else Path.home() / "AppData" / "Roaming"
-        settings_path = base_path / "HainTag" / "settings.json"
-        if not settings_path.exists():
-            return {}
-        try:
-            payload = json.loads(settings_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        return payload.get("settings", payload) if isinstance(payload, dict) else {}
+        return load_haintag_settings()
 
 
 def sanitize_image_for_pixiv(src: Path, dest_dir: Path) -> CleanResult:
@@ -1730,6 +1720,7 @@ def open_pixiv_browser(pw, profile_dir: Path | None = None):
         if not browser.contexts:
             raise RuntimeError("Pixiv login browser has no usable context")
         context = browser.contexts[0]
+        setattr(context, "_pixiv_uploader_attached", True)
         page = next(
             (candidate for candidate in reversed(context.pages) if "pixiv.net" in candidate.url),
             context.pages[0] if context.pages else context.new_page(),
@@ -1754,12 +1745,19 @@ def open_pixiv_browser(pw, profile_dir: Path | None = None):
                     "无法启动 Pixiv 自动化浏览器；请关闭占用该账号配置的 Chrome 窗口后重试"
                 ) from exc
             raise
+        setattr(context, "_pixiv_uploader_attached", False)
         page = context.pages[0] if context.pages else context.new_page()
     try:
         page.set_viewport_size({"width": 1920, "height": 1080})
     except Exception:
         pass
     return context, page
+
+
+def close_pixiv_browser(context) -> None:
+    if getattr(context, "_pixiv_uploader_attached", False) is True:
+        return
+    context.close()
 
 
 def extract_artwork_id(url: str) -> str | None:
@@ -2526,6 +2524,7 @@ def safe_goto(page, url: str, wait: float = 5.0) -> None:
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
     except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         log.warning(f"safe_goto({url}) 失败: {type(exc).__name__}: {exc}")
     time.sleep(wait)
 
@@ -2661,13 +2660,36 @@ def _human_move_and_click(page, locator, *, cancel_event=None) -> None:
     page.mouse.click(target_x, target_y)
 
 
+def _is_browser_closed_exception(exc: BaseException) -> bool:
+    if isinstance(exc, PixivBrowserClosedError):
+        return True
+    message = str(exc).lower()
+    return type(exc).__name__ == "TargetClosedError" or any(
+        marker in message
+        for marker in (
+            "target page, context or browser has been closed",
+            "page has been closed",
+            "browser has been closed",
+            "context has been closed",
+        )
+    )
+
+
+def _raise_if_browser_closed_exception(exc: BaseException) -> None:
+    if _is_browser_closed_exception(exc):
+        raise PixivBrowserClosedError(
+            "Pixiv 浏览器窗口已关闭；发布完成前请保持该窗口打开"
+        ) from exc
+
+
 def _first_visible_locator(page, selectors: list[str]):
     for selector in selectors:
-        locator = page.locator(selector)
         try:
+            locator = page.locator(selector)
             if locator.count() > 0:
                 return locator.first
-        except Exception:
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
             continue
     return None
 
@@ -2679,7 +2701,8 @@ def _click_first(page, selectors: list[str], cancel_event=None) -> bool:
     try:
         _human_move_and_click(page, locator, cancel_event=cancel_event)
         return True
-    except Exception:
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         return False
 
 
@@ -2687,6 +2710,8 @@ def _capture_failure(page, log_dir: Path | None, step_name: str) -> str:
     if log_dir is None:
         return ""
     try:
+        if page.is_closed():
+            return ""
         log_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe = re.sub(r"[^A-Za-z0-9_-]+", "_", step_name)
@@ -2695,11 +2720,15 @@ def _capture_failure(page, log_dir: Path | None, step_name: str) -> str:
         try:
             page.screenshot(path=str(png), full_page=True)
         except Exception as exc:
+            if _is_browser_closed_exception(exc):
+                return ""
             log.warning(f"截图失败: {type(exc).__name__}: {exc}")
             png = None
         try:
             html.write_text(page.content(), encoding="utf-8")
         except Exception as exc:
+            if _is_browser_closed_exception(exc):
+                return ""
             log.warning(f"dump HTML 失败: {type(exc).__name__}: {exc}")
             html = None
         bits = []
@@ -2709,6 +2738,8 @@ def _capture_failure(page, log_dir: Path | None, step_name: str) -> str:
             bits.append(f"html={html.name}")
         return " ".join(bits)
     except Exception as exc:
+        if _is_browser_closed_exception(exc):
+            return ""
         log.warning(f"_capture_failure 异常: {type(exc).__name__}: {exc}")
         return ""
 
@@ -2729,6 +2760,8 @@ def _fill_if_found(page, name: str, selectors: list[str], value: str, cancel_eve
             )
             return PixivStep(name, True, detail="js_fallback")
         except Exception as exc2:
+            _raise_if_browser_closed_exception(exc1)
+            _raise_if_browser_closed_exception(exc2)
             return PixivStep(
                 name, False, "fill_failed",
                 f"click_fill: {type(exc1).__name__}: {exc1} | js: {type(exc2).__name__}: {exc2}",
@@ -2759,14 +2792,15 @@ def _click_radio(page, name: str, selectors_per_choice: dict[str, list[str]], ch
 def _read_checked_state(locator) -> bool | None:
     try:
         return bool(locator.is_checked())
-    except Exception:
-        pass
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
     try:
         aria = locator.get_attribute("aria-checked")
         if aria is None:
             return None
         return aria == "true"
-    except Exception:
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         return None
 
 
@@ -2910,6 +2944,7 @@ def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], canc
         except InterruptedError:
             raise
         except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
             failed.append(f"{tag}({type(exc).__name__})")
             last_exc = f"{type(exc).__name__}: {exc}"
     detail = f"{len(tags)} tags (autocomplete={autocomplete_used}, raw={raw_used})"
@@ -2943,6 +2978,7 @@ def _set_radio_by_attr(page, name: str, attr_name: str, attr_value: str, cancel_
     except InterruptedError:
         raise
     except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         return PixivStep(name, False, "exception", f"{type(exc).__name__}: {exc}")
 
 
@@ -2982,6 +3018,7 @@ def _accept_safety_check(page) -> tuple:
     except InterruptedError:
         raise
     except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         return PixivStep("safety_check", True, detail=f"skipped: {exc}"), stop_fn
 
 
@@ -3005,7 +3042,8 @@ def _set_checkbox_by_attr(page, name: str, attr_name: str, desired: bool, cancel
             if (label && label.tagName === 'LABEL') { label.click(); return true; }
             return false;
         }""")
-    except Exception:
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         clicked_label = False
     if clicked_label:
         _jsleep(0.4, cancel_event=cancel_event)
@@ -3019,8 +3057,8 @@ def _set_checkbox_by_attr(page, name: str, attr_name: str, desired: bool, cancel
         final = _read_checked_state(locator)
         if final == desired:
             return PixivStep(name, True, detail=f"toggled to {desired} via locator.click")
-    except Exception:
-        pass
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
 
     try:
         locator.evaluate("""el => {
@@ -3032,8 +3070,8 @@ def _set_checkbox_by_attr(page, name: str, attr_name: str, desired: bool, cancel
         final = _read_checked_state(locator)
         if final == desired:
             return PixivStep(name, True, detail=f"toggled to {desired} via js")
-    except Exception:
-        pass
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
 
     final = _read_checked_state(locator)
     return PixivStep(name, False, "verify_failed", f"after all strategies state={final}")
@@ -3044,9 +3082,10 @@ def _record_step(steps: list[PixivStep], page, log_dir: Path | None, step: Pixiv
     if step.ok:
         log.info(f"    pixiv: {step.name} ✓ {step.detail}".rstrip())
     else:
-        capture = _capture_failure(page, log_dir, step.name)
-        if capture:
-            step.detail = (step.detail + f" | {capture}").strip(" |")
+        if step.reason != "browser_closed":
+            capture = _capture_failure(page, log_dir, step.name)
+            if capture:
+                step.detail = (step.detail + f" | {capture}").strip(" |")
         log.error(f"    pixiv: {step.name} ✗ [{step.reason}] {step.detail}")
     # Small random pause after every recorded operation — reduces fingerprint
     # similarity across requests and lowers risk of triggering Pixiv's bot check.
@@ -3054,18 +3093,52 @@ def _record_step(steps: list[PixivStep], page, log_dir: Path | None, step: Pixiv
     return step
 
 
-def create_pixiv_post(
+def _create_pixiv_post(
     page,
     payload: dict[str, Any],
     image_path: Path,
     delay: float,
-    log_dir: Path | None = None,
-    cancel_event=None,
+    log_dir: Path | None,
+    cancel_event,
+    steps: list[PixivStep],
+    progress_callback=None,
 ) -> tuple[str | None, list[PixivStep]]:
-    steps: list[PixivStep] = []
+    form_progress = {
+        "ensure_upload_page": 0.05,
+        "select_file": 0.15,
+        "fill_title": 0.25,
+        "fill_caption": 0.32,
+        "fill_tags": 0.48,
+        "age_restriction": 0.58,
+        "ai_flag": 0.66,
+        "sexual_flag": 0.72,
+        "original_flag": 0.79,
+        "privacy": 0.87,
+        "allow_tag_edits": 0.94,
+        "safety_check": 1.0,
+    }
+
+    def report(stage: str, stage_progress: float) -> None:
+        if progress_callback is not None:
+            progress_callback(stage, stage_progress=stage_progress)
 
     def record(step: PixivStep) -> PixivStep:
-        return _record_step(steps, page, log_dir, step, cancel_event=cancel_event)
+        result = _record_step(steps, page, log_dir, step, cancel_event=cancel_event)
+        if step.name in form_progress:
+            report("filling_pixiv", form_progress[step.name])
+        elif step.name == "locate_publish":
+            report("submitting_pixiv", 0.1)
+        elif step.name == "publish_enable":
+            report("submitting_pixiv", 0.55)
+        elif step.name == "publish_click":
+            report("submitting_pixiv", 1.0 if step.ok else 0.8)
+            if step.ok:
+                report("verifying_pixiv", 0.0)
+        elif step.name == "redirect":
+            report("verifying_pixiv", 1.0 if step.ok else 0.1)
+        return result
+
+    report("filling_pixiv", 0.0)
 
     try:
         _raise_if_canceled(cancel_event)
@@ -3074,6 +3147,7 @@ def create_pixiv_post(
     except InterruptedError:
         raise
     except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         record(PixivStep("ensure_upload_page", False, "exception", f"{type(exc).__name__}: {exc}"))
         return None, steps
 
@@ -3085,6 +3159,7 @@ def create_pixiv_post(
         file_input.set_input_files(str(image_path))
         record(PixivStep("select_file", True, detail=image_path.name))
     except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         record(PixivStep("select_file", False, "exception", f"{type(exc).__name__}: {exc}"))
         return None, steps
 
@@ -3092,12 +3167,15 @@ def create_pixiv_post(
 
     record(_fill_if_found(
         page, "fill_title", PIXIV_SELECTORS["title"],
-        payload["title_ja"],
+        payload["title_ja"], cancel_event=cancel_event,
     ))
     _jsleep(0.5, cancel_event=cancel_event)
     caption_text = "\n".join(s for s in (payload.get("caption_ja", ""), payload.get("caption_zh", "")) if s).strip()
     if caption_text:
-        record(_fill_if_found(page, "fill_caption", PIXIV_SELECTORS["caption"], caption_text))
+        record(_fill_if_found(
+            page, "fill_caption", PIXIV_SELECTORS["caption"], caption_text,
+            cancel_event=cancel_event,
+        ))
     else:
         record(PixivStep("fill_caption", True, detail="empty (skipped)"))
     _jsleep(0.4, cancel_event=cancel_event)
@@ -3179,8 +3257,8 @@ def create_pixiv_post(
             if publish_locator.is_enabled():
                 enabled = True
                 break
-        except Exception:
-            pass
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
         _sleep_with_cancel(2, cancel_event)
     if not enabled:
         record(PixivStep("publish_enable", False, "verify_failed", "publish 按钮 120 秒内未启用"))
@@ -3193,6 +3271,7 @@ def create_pixiv_post(
         _human_move_and_click(page, publish_locator, cancel_event=cancel_event)
         record(PixivStep("publish_click", True))
     except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         record(PixivStep("publish_click", False, "exception", f"{type(exc).__name__}: {exc}"))
         return None, steps
 
@@ -3218,23 +3297,22 @@ def create_pixiv_post(
     captcha_grace = time.monotonic() + 6  # give 6 s for normal redirect before captcha detection
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
-        time.sleep(1.5)
+        _sleep_with_cancel(1.5, cancel_event)
         try:
             url = page.url
         except Exception as exc:
-            record(PixivStep("redirect", False, "exception", f"page closed: {exc}"))
+            _raise_if_browser_closed_exception(exc)
+            record(PixivStep("redirect", False, "exception", f"page unavailable: {exc}"))
             return None, steps
         if artwork_re.search(url):
-            if cancel_event is None or not cancel_event.is_set():
-                time.sleep(delay)
+            _sleep_with_cancel(delay, cancel_event)
             record(PixivStep("redirect", True, detail=f"artwork url={url}"))
             stop_alert()
             return url, steps
         upload_in_url = "upload.php" in url or "illustration/create" in url
         if not upload_in_url:
             # Left the upload page → success (probably to user mypage / artwork list)
-            if cancel_event is None or not cancel_event.is_set():
-                time.sleep(delay)
+            _sleep_with_cancel(delay, cancel_event)
             record(PixivStep("redirect", True, detail=f"left upload page url={url}"))
             stop_alert()
             return url, steps
@@ -3242,23 +3320,21 @@ def create_pixiv_post(
         # Check BEFORE captcha to avoid false positives during the success modal.
         try:
             if _first_visible_locator(page, PIXIV_SELECTORS["file_input"]) is None:
-                if cancel_event is None or not cancel_event.is_set():
-                    time.sleep(delay)
+                _sleep_with_cancel(delay, cancel_event)
                 record(PixivStep("redirect", True, detail=f"form unmounted url={url}"))
                 stop_alert()
                 return url, steps
-        except Exception:
-            pass
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
         # Success modal text ("作品投稿成功") — appears while URL is still the upload page.
         try:
             if page.locator('text=作品投稿成功').count() > 0:
-                if cancel_event is None or not cancel_event.is_set():
-                    time.sleep(delay)
+                _sleep_with_cancel(delay, cancel_event)
                 record(PixivStep("redirect", True, detail=f"success modal text detected url={url}"))
                 stop_alert()
                 return url, steps
-        except Exception:
-            pass
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
         # Captcha detection: only after grace period so normal redirects finish first.
         if not captcha_detected and upload_in_url and time.monotonic() > captcha_grace:
             if _first_visible_locator(page, captcha_selectors) is not None:
@@ -3273,3 +3349,35 @@ def create_pixiv_post(
     )
     record(PixivStep("redirect", False, "verify_failed", timeout_msg))
     return None, steps
+
+
+def create_pixiv_post(
+    page,
+    payload: dict[str, Any],
+    image_path: Path,
+    delay: float,
+    log_dir: Path | None = None,
+    cancel_event=None,
+    progress_callback=None,
+) -> tuple[str | None, list[PixivStep]]:
+    steps: list[PixivStep] = []
+    try:
+        return _create_pixiv_post(
+            page,
+            payload,
+            image_path,
+            delay,
+            log_dir,
+            cancel_event,
+            steps,
+            progress_callback,
+        )
+    except InterruptedError as exc:
+        exc.pixiv_steps = steps
+        raise
+    except Exception as exc:
+        if not _is_browser_closed_exception(exc):
+            raise
+        step = PixivStep("browser_session", False, "browser_closed", str(exc))
+        _record_step(steps, page, log_dir, step, cancel_event=cancel_event)
+        return None, steps

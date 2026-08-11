@@ -8,7 +8,7 @@ A local, **Pixiv-first** publishing workspace for artwork. It currently supports
 
 ## ✨ Features
 
-- **Publishing workspace** — manage pending images, platform status, task progress, and activity logs
+- **Publishing workspace** — manage pending images, platform status, true stage-based task progress, and activity logs
 - **Pixiv publishing** — fills titles, captions, tags, age ratings, and original/fan-art settings
 - **Civitai publishing** — publishes images and can split existing multi-image posts into individual posts
 - **Smart tagging** — PixAI tagger with a CL / WD14 fallback chain
@@ -156,11 +156,11 @@ Configure models from CLI menu **[6]** or the Web UI settings. Automatic PixAI d
 .venv/Scripts/python.exe -m pip install huggingface_hub
 ```
 
-The PixAI v0.9 model is approximately 1.27 GB; reserve enough disk space before downloading it.
+The PixAI v0.9 model is approximately 1.27 GB; reserve enough disk space before downloading it. The app validates configured directories and discovers valid models under the current project's `models/` or HainTag data directory; stale absolute paths are never executed.
 
 ## ✍️ LLM copy generation
 
-Pixiv copy generation supports OpenAI-compatible endpoints, Anthropic, and Google Gemini configurations. Each persona can keep its own prompt, content mode, and defaults.
+Pixiv copy generation supports OpenAI-compatible endpoints, Anthropic, and Google Gemini configurations. Each persona can keep its own prompt, content mode, and defaults. Vision requests use a JPEG preview with a 1536 px maximum edge to reduce latency and memory usage for large images; the publishing source remains unchanged.
 
 Sensitive settings are stored in the local `config.json`. It is ignored by Git; never commit API keys, cookies, or other credentials.
 

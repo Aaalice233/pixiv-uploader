@@ -8,7 +8,7 @@
 
 ## ✨ 功能概览
 
-- **发布工作台**：集中管理待发布图片、平台状态、任务进度和运行日志
+- **发布工作台**：集中管理待发布图片、平台状态、真实分阶段任务进度和运行日志
 - **Pixiv 发布**：自动填写标题、说明、标签、年龄分级和原创/二创选项
 - **Civitai 发布**：支持发布图片，也可把已有多图帖子拆成单图帖子
 - **智能标签**：支持 PixAI tagger，以及 CL / WD14 tagger 回退链
@@ -156,11 +156,11 @@ PixAI tagger → CL / WD14 tagger → metadata / 文件名候选
 .venv/Scripts/python.exe -m pip install huggingface_hub
 ```
 
-PixAI v0.9 模型约 1.27 GB，请预留磁盘空间。
+PixAI v0.9 模型约 1.27 GB，请预留磁盘空间。应用会验证已配置目录，并自动发现当前项目 `models/` 或 HainTag 数据目录中的有效模型；失效的旧绝对路径不会再被执行。
 
 ## ✍️ LLM 文案
 
-Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Gemini 配置。每个人设可独立配置提示词、内容模式和默认行为。
+Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Gemini 配置。每个人设可独立配置提示词、内容模式和默认行为。视觉请求只发送最长边 1536 px 的 JPEG 预览，以降低大图请求的耗时和内存占用；发布原图不受影响。
 
 敏感配置保存在本机 `config.json`。该文件已被 Git 忽略，请不要主动提交 API key、Cookie 或其他凭据。
 

@@ -8,6 +8,13 @@ import sys
 from pathlib import Path
 
 from ..paths import PROJECT_ROOT
+from .tagger_settings import (
+    haintag_settings_path,
+    load_haintag_settings as _read_haintag_settings,
+    resolve_cl_model_dir,
+    resolve_pixai_model_dir,
+    save_haintag_settings as _write_haintag_settings,
+)
 
 # 强制 UTF-8 输出，避免 Windows GBK 控制台乱码
 if hasattr(sys.stdout, "buffer"):
@@ -17,8 +24,8 @@ if hasattr(sys.stderr, "buffer"):
 
 PROJECT_DIR = PROJECT_ROOT
 CONFIG_PATH = PROJECT_DIR / "config.json"
-APPDATA_DIR = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-HAINTAG_SETTINGS_PATH = APPDATA_DIR / "HainTag" / "settings.json"
+HAINTAG_SETTINGS_PATH = haintag_settings_path()
+APPDATA_DIR = HAINTAG_SETTINGS_PATH.parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -55,36 +62,6 @@ def _read_config() -> dict:
 
 def _write_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _read_haintag_settings() -> dict:
-    if HAINTAG_SETTINGS_PATH.exists():
-        try:
-            payload = json.loads(HAINTAG_SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                return payload.get("settings", payload)
-        except Exception:
-            pass
-    return {}
-
-
-def _write_haintag_settings(settings: dict) -> None:
-    HAINTAG_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    existing = {}
-    if HAINTAG_SETTINGS_PATH.exists():
-        try:
-            existing = json.loads(HAINTAG_SETTINGS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    if isinstance(existing, dict) and "settings" in existing:
-        existing["settings"].update(settings)
-    elif isinstance(existing, dict):
-        existing.update(settings)
-    else:
-        existing = settings
-    HAINTAG_SETTINGS_PATH.write_text(
-        json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
 
 
 def _scan_model_dir(path: str) -> tuple[str | None, str | None]:
@@ -256,7 +233,8 @@ def step2_model_dir() -> str | None:
     print()
 
     ht_settings = _read_haintag_settings()
-    current_dir = ht_settings.get("tagger_model_dir", "")
+    resolved_dir = resolve_cl_model_dir(ht_settings)
+    current_dir = str(resolved_dir) if resolved_dir else ""
 
     if current_dir:
         print(f"  Current value: {current_dir}")
@@ -323,7 +301,8 @@ def step2_pixai_model_dir() -> str | None:
     print()
 
     ht_settings = _read_haintag_settings()
-    current_dir = ht_settings.get("pixai_tagger_model_dir", "")
+    resolved_dir = resolve_pixai_model_dir(ht_settings)
+    current_dir = str(resolved_dir) if resolved_dir else ""
 
     if current_dir:
         print(f"  Current value: {current_dir}")
@@ -560,9 +539,9 @@ def main() -> int:
     print("  Setup complete.")
     print()
     ht_settings = _read_haintag_settings()
-    effective_pixai = ht_settings.get("pixai_tagger_model_dir", "")
-    effective_cl = ht_settings.get("tagger_model_dir", "")
-    if effective_pixai and os.path.isfile(os.path.join(effective_pixai, "model.onnx")):
+    effective_pixai = resolve_pixai_model_dir(ht_settings)
+    effective_cl = resolve_cl_model_dir(ht_settings)
+    if effective_pixai:
         print(f"  Active tagger : PixAI ({effective_pixai})")
     elif effective_cl:
         print(f"  Active tagger : CL/WD14 ({effective_cl})")

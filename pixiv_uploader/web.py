@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import queue
-import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +31,14 @@ from .pixiv.llm_reverse import (
 )
 from .pixiv.storage import ensure_runtime_files, load_json, save_json
 from .pixiv.support import PIXIV_PROFILE_DIR
+from .pixiv.tagger_settings import (
+    load_haintag_settings as _load_haintag_settings,
+    resolve_cl_model_dir,
+    resolve_pixai_model_dir,
+    save_haintag_settings as _save_haintag_settings,
+)
 from .runtime import ensure_runtime_layout
+from .task_progress import TaskProgressState, build_progress_profile
 from .watermark import (
     MAX_FONT_UPLOAD_BYTES,
     MAX_IMAGE_UPLOAD_BYTES,
@@ -154,6 +160,14 @@ CMD_LABELS = {
     5: ("检查更新", "本地处理"),
     6: ("生成 Pixiv 文案", "本地处理"),
 }
+CMD_LOG_SOURCES = {
+    1: "civitai",
+    2: "publish",
+    3: "pixiv",
+    4: "setup",
+    5: "update",
+    6: "llm",
+}
 
 # ── Flask app ──────────────────────────────────────────────────
 app = Flask(__name__, static_folder=None)
@@ -257,8 +271,91 @@ def _broadcast_sse(event_type: str, data: dict) -> None:
             SSE_CLIENTS.remove(q)
 
 
-_PROGRESS_RE = re.compile(r'\[(\d+)/(\d+)\]')
-_TOTAL_RE    = re.compile(r'upload/ 有 (\d+) 张图片')
+_TASK_PRIVATE_FIELDS = {"thread", "log_lines", "pending_input", "cancel_event"}
+
+
+def _task_snapshot(task: dict) -> dict:
+    return {key: value for key, value in task.items() if key not in _TASK_PRIVATE_FIELDS}
+
+
+class _TaskProgressController:
+    def __init__(self, task_id: str, command: int, params: dict) -> None:
+        with TASKS_LOCK:
+            total = int(TASKS.get(task_id, {}).get("total") or 0)
+        self._task_id = task_id
+        self._state = TaskProgressState(build_progress_profile(command, params), total=total)
+
+    def report(self, stage: str, **details) -> None:
+        with TASKS_LOCK:
+            task = TASKS.get(self._task_id)
+            if task is None or task.get("status") in {"done", "failed", "canceled"}:
+                return
+            fields = self._state.advance(stage, **details)
+            task.update(fields)
+            task["count"] = f"{task['current']} / {task['total']}" if task["total"] else "—"
+            snap = _task_snapshot(task)
+        _broadcast_sse("task_update", snap)
+
+    def store_result(self, result) -> None:
+        with TASKS_LOCK:
+            task = TASKS.get(self._task_id)
+            if task is None:
+                return
+            task["result"] = result
+            if isinstance(result, dict):
+                task.update(
+                    self._state.advance(
+                        "item_complete",
+                        total=result.get("total"),
+                        current=result.get("processed"),
+                        succeeded=result.get("succeeded"),
+                        failed=result.get("failed"),
+                        canceled=result.get("canceled"),
+                    )
+                )
+
+    def finish(self, status: str) -> None:
+        with TASKS_LOCK:
+            task = TASKS.get(self._task_id)
+            if task is None:
+                return
+            task.update(self._state.finish(status))
+            task["status"] = status
+            task["count"] = f"{task['current']} / {task['total']}" if task["total"] else "—"
+            snap = _task_snapshot(task)
+        _broadcast_sse("task_update", snap)
+
+
+def _initial_progress(command: int, params: dict, total: int) -> dict:
+    return TaskProgressState(build_progress_profile(command, params), total=total).snapshot()
+
+
+def _new_task_record(
+    task_id: str,
+    command: int,
+    params: dict,
+    *,
+    title: str,
+    target: str,
+    total: int,
+) -> dict:
+    return {
+        "id": task_id,
+        "title": title,
+        "status": "queued",
+        "target": target,
+        "count": f"0 / {total}" if total else "—",
+        "eta": "—",
+        "cmd": command,
+        "params": params,
+        "cancel_flag": False,
+        "cancel_event": threading.Event(),
+        "created_at": datetime.now().strftime("%H:%M:%S"),
+        "log_lines": [],
+        "pending_input": None,
+        "thread": None,
+        **_initial_progress(command, params, total),
+    }
 
 
 def _push_log_line(task_id: str, lvl: str, src: str, msg: str) -> None:
@@ -272,38 +369,26 @@ def _push_log_line(task_id: str, lvl: str, src: str, msg: str) -> None:
     with TASKS_LOCK:
         if task_id in TASKS:
             TASKS[task_id]["log_lines"].append(entry)
-            # parse progress from [N/M] pattern
-            m = _PROGRESS_RE.search(msg)
-            if m:
-                cur, total = int(m.group(1)), int(m.group(2))
-                TASKS[task_id]["progress"] = cur / total if total > 0 else 0
-                TASKS[task_id]["current"] = cur
-                TASKS[task_id]["total"] = total
-                TASKS[task_id]["count"] = f"{cur} / {total} 张"
-            # parse total from "upload/ 有 X 张图片"
-            tm = _TOTAL_RE.search(msg)
-            if tm and TASKS[task_id]["count"] == "—":
-                TASKS[task_id]["current"] = 0
-                TASKS[task_id]["total"] = int(tm.group(1))
-                TASKS[task_id]["count"] = f"0 / {tm.group(1)} 张"
     _broadcast_sse("log", entry)
-    # broadcast updated task snapshot if progress changed
-    if _PROGRESS_RE.search(msg) or _TOTAL_RE.search(msg):
-        with TASKS_LOCK:
-            if task_id in TASKS:
-                snap = {k: v for k, v in TASKS[task_id].items()
-                        if k not in ("thread", "log_lines", "pending_input", "cancel_event")}
-        _broadcast_sse("task_update", snap)
 
 
 def _set_task_status(task_id: str, status: str, progress: float | None = None) -> None:
     with TASKS_LOCK:
         if task_id not in TASKS:
             return
-        TASKS[task_id]["status"] = status
+        task = TASKS[task_id]
+        task["status"] = status
         if progress is not None:
-            TASKS[task_id]["progress"] = progress
-        snap = {k: v for k, v in TASKS[task_id].items() if k not in ("thread", "log_lines", "pending_input", "cancel_event")}
+            task["progress"] = progress
+        if status in {"failed", "canceled"}:
+            if task.get("stage") == "queued":
+                task["stage"] = status
+            task["progress"] = min(float(task.get("progress") or 0.0), 0.99)
+        elif status == "done":
+            task["stage"] = "done"
+            task["stage_progress"] = 1.0
+            task["progress"] = 1.0
+        snap = _task_snapshot(task)
     _broadcast_sse("task_update", snap)
 
 
@@ -333,13 +418,14 @@ class _ThreadWriter(TextIOBase):
 
 
 class _SseLogHandler(logging.Handler):
-    def __init__(self, task_id: str) -> None:
+    def __init__(self, task_id: str, source: str = "app") -> None:
         super().__init__()
         self._task_id = task_id
+        self._source = source
 
     def emit(self, record: logging.LogRecord) -> None:
         lvl = record.levelname
-        _push_log_line(self._task_id, lvl, "civitai", self.format(record))
+        _push_log_line(self._task_id, lvl, self._source, self.format(record))
 
 
 # ── Input capture (挂起线程等前端回复) ─────────────────────────
@@ -368,20 +454,27 @@ class _WebInput:
 
 # ── Task runner ────────────────────────────────────────────────
 def _run_task(task_id: str, cmd: int, params: dict) -> None:
+    progress = _TaskProgressController(task_id, cmd, params)
     with TASKS_LOCK:
         cancel_event = TASKS[task_id].get("cancel_event")
 
     if cancel_event and cancel_event.is_set():
         _push_log_line(task_id, "INFO", "worker", "任务已取消")
-        _set_task_status(task_id, "canceled")
+        progress.finish("canceled")
         return
 
     with _EXEC_LOCK:
         _set_task_status(task_id, "running")
-        _run_task_locked(task_id, cmd, params)
+        progress.report("initializing", stage_progress=0.05)
+        _run_task_locked(task_id, cmd, params, progress)
 
 
-def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
+def _run_task_locked(
+    task_id: str,
+    cmd: int,
+    params: dict,
+    progress: _TaskProgressController,
+) -> None:
     orig_stdout = sys.stdout
     orig_stderr = sys.stderr
     orig_input  = builtins.input
@@ -391,7 +484,7 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
 
     app_logger = logging.getLogger("pixiv_uploader")
     app_logger.setLevel(logging.DEBUG)
-    sse_handler = _SseLogHandler(task_id)
+    sse_handler = _SseLogHandler(task_id, CMD_LOG_SOURCES.get(cmd, "app"))
     sse_handler.setFormatter(logging.Formatter('%(message)s'))
     app_logger.addHandler(sse_handler)
 
@@ -401,7 +494,7 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
     try:
         if cancel_event and cancel_event.is_set():
             _push_log_line(task_id, "INFO", "worker", "任务已取消")
-            _set_task_status(task_id, "canceled")
+            progress.finish("canceled")
             return
 
         if cmd == 1:
@@ -411,11 +504,16 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                 api_key=os.environ.get("CIVITAI_API_KEY", params.get("api_key", "")),
                 delay=params.get("delay", 10),
                 cancel_event=cancel_event,
+                progress_callback=progress.report,
             )
-            cmd_split(args)
+            result = cmd_split(args)
+            progress.store_result(result)
             if _is_task_canceled(task_id):
                 _push_log_line(task_id, "INFO", "worker", "任务已取消")
-                _set_task_status(task_id, "canceled")
+                progress.finish("canceled")
+                return
+            if isinstance(result, dict) and result.get("status") != "success":
+                progress.finish("failed")
                 return
 
         elif cmd in (2, 3):
@@ -438,14 +536,21 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                 llm_content_mode=params.get("llm_content_mode", ""),
                 ai_tags_by_platform={"pixiv": bool((params.get("ai_tags_by_platform") or {}).get("pixiv", True))},
                 cancel_event=cancel_event,
+                progress_callback=progress.report,
             )
-            cmd_upload(args)
+            result = cmd_upload(args)
+            progress.store_result(result)
+            _broadcast_sse("images_changed", {})
             if _is_task_canceled(task_id):
                 _push_log_line(task_id, "INFO", "worker", "任务已取消")
-                _set_task_status(task_id, "canceled")
+                progress.finish("canceled")
+                return
+            if isinstance(result, dict) and result.get("status") != "success":
+                progress.finish("failed")
                 return
 
         elif cmd == 4:
+            progress.report("installing", stage_progress=0.05)
             # setup_censor has interactive pip install — run as subprocess
             proc = subprocess.Popen(
                 [sys.executable, "-m", "pixiv_uploader.pixiv.setup_censor"],
@@ -465,13 +570,18 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
             proc.wait()
             if _is_task_canceled(task_id):
                 _push_log_line(task_id, "INFO", "worker", "任务已取消")
-                _set_task_status(task_id, "canceled")
+                progress.finish("canceled")
                 return
+            if proc.returncode:
+                raise RuntimeError(f"打码模型安装失败，退出码 {proc.returncode}")
+            progress.report("installing", stage_progress=1.0)
 
         elif cmd == 5:
             from . import cli as _launcher
+            progress.report("checking_updates", stage_progress=0.05)
             # Patch _do_pull to capture output into web log (subprocess.call bypasses sys.stdout)
             def _web_do_pull() -> bool:
+                progress.report("applying_update", stage_progress=0.05)
                 try:
                     r = subprocess.run(
                         ["git", "-C", str(SCRIPT_DIR), "pull", "--ff-only"],
@@ -479,6 +589,8 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                     )
                     if r.stdout: print(r.stdout.rstrip())
                     if r.stderr: print(r.stderr.rstrip())
+                    if r.returncode == 0:
+                        progress.report("applying_update", stage_progress=1.0)
                     return r.returncode == 0
                 except Exception as exc:
                     print(f"  pull 失败: {exc}")
@@ -491,14 +603,17 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                 _launcher._do_pull = _orig_do_pull
             if _is_task_canceled(task_id):
                 _push_log_line(task_id, "INFO", "worker", "任务已取消")
-                _set_task_status(task_id, "canceled")
+                progress.finish("canceled")
                 return
+            progress.report("finalizing", stage_progress=1.0)
 
         elif cmd == 6:
+            progress.report("preparing_copy", stage_progress=0.2)
             cfg = normalize_llm_reverse_config(_load_config().get("llm_reverse"))
             image_name = str(params.get("image", "")).strip()
             image_path = SCRIPT_DIR / "upload" / Path(image_name).name if image_name else None
             image_url = str(params.get("image_url", "")).strip() or None
+            progress.report("generating_copy", stage_progress=0.0)
             result = infer_image_copy(
                 image_path=image_path,
                 image_url=image_url,
@@ -507,27 +622,32 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                 content_mode=params.get("llm_content_mode", ""),
                 cancel_event=cancel_event,
             )
-            with TASKS_LOCK:
-                if task_id in TASKS:
-                    TASKS[task_id]["result"] = result
+            progress.report("generating_copy", stage_progress=1.0)
+            progress.report("finalizing", stage_progress=0.8)
+            progress.store_result(result)
             _push_log_line(task_id, "INFO", "worker", f"LLM 反推: {result.get('status')}")
+            if result.get("status") != "ok":
+                progress.finish("failed")
+                return
 
         if cancel_event and cancel_event.is_set():
             _push_log_line(task_id, "INFO", "worker", "任务已取消")
-            _set_task_status(task_id, "canceled")
+            progress.finish("canceled")
         else:
-            _set_task_status(task_id, "done", 1.0)
-            _broadcast_sse("images_changed", {})
+            progress.report("completing", stage_progress=0.8)
+            progress.finish("done")
+            if cmd not in (2, 3):
+                _broadcast_sse("images_changed", {})
 
     except InterruptedError:
         _push_log_line(task_id, "INFO", "worker", "任务已取消")
-        _set_task_status(task_id, "canceled")
+        progress.finish("canceled")
     except SystemExit as exc:
         _push_log_line(task_id, "ERR", "worker", f"Task exited: {exc}")
-        _set_task_status(task_id, "failed")
+        progress.finish("failed")
     except Exception as exc:
         _push_log_line(task_id, "ERR", "worker", f"Task error: {exc}")
-        _set_task_status(task_id, "failed")
+        progress.finish("failed")
 
     finally:
         app_logger.removeHandler(sse_handler)
@@ -587,29 +707,17 @@ def api_run(cmd):
         except (TypeError, ValueError):
             requested_total = 0
     task_id = uuid.uuid4().hex[:8]
-    task = {
-        "id":         task_id,
-        "title":      label,
-        "status":     "queued",
-        "progress":   0.0,
-        "target":     target,
-        "count":      "—",
-        "current":    0,
-        "total":      requested_total,
-        "eta":        "—",
-        "cmd":        cmd,
-        "params":     params,
-        "cancel_flag": False,
-        "cancel_event": threading.Event(),
-        "created_at": datetime.now().strftime("%H:%M:%S"),
-        "log_lines":  [],
-        "pending_input": None,
-        "thread":     None,
-    }
+    task = _new_task_record(
+        task_id,
+        cmd,
+        params,
+        title=label,
+        target=target,
+        total=requested_total,
+    )
     with TASKS_LOCK:
         TASKS[task_id] = task
-    snap = {k: v for k, v in task.items() if k not in ("thread", "log_lines", "pending_input", "cancel_event")}
-    _broadcast_sse("task_update", snap)
+    _broadcast_sse("task_update", _task_snapshot(task))
 
     t = threading.Thread(target=_run_task, args=(task_id, cmd, params), daemon=True)
     task["thread"] = t
@@ -620,10 +728,7 @@ def api_run(cmd):
 @app.route("/api/tasks")
 def api_tasks():
     with TASKS_LOCK:
-        result = [
-            {k: v for k, v in t.items() if k not in ("thread", "log_lines", "pending_input", "cancel_event")}
-            for t in TASKS.values()
-        ]
+        result = [_task_snapshot(task) for task in TASKS.values()]
     return jsonify(result)
 
 
@@ -1140,43 +1245,6 @@ def api_status():
     })
 
 
-APPDATA_DIR = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-HAINTAG_SETTINGS_PATH = APPDATA_DIR / "HainTag" / "settings.json"
-
-
-def _load_haintag_settings() -> dict:
-    payload = load_json(HAINTAG_SETTINGS_PATH, {})
-    if isinstance(payload, dict):
-        return payload.get("settings", payload)
-    return {}
-
-
-def _save_haintag_settings(settings: dict) -> None:
-    existing = load_json(HAINTAG_SETTINGS_PATH, {})
-    if isinstance(existing, dict) and "settings" in existing:
-        existing["settings"].update(settings)
-    elif isinstance(existing, dict):
-        existing.update(settings)
-    else:
-        existing = settings
-    save_json(HAINTAG_SETTINGS_PATH, existing)
-
-
-def _scan_model_dir(path: str) -> tuple:
-    if not path or not os.path.isdir(path):
-        return None, None
-    model_file = mapping_file = None
-    for f in os.listdir(path):
-        fl = f.lower()
-        if fl.endswith(".onnx") and not model_file:
-            model_file = os.path.join(path, f)
-        elif fl.endswith(".json") and any(x in fl for x in ("tag", "mapping", "label")) and not mapping_file:
-            mapping_file = os.path.join(path, f)
-        elif fl.endswith(".csv") and any(x in fl for x in ("tag", "label")) and not mapping_file:
-            mapping_file = os.path.join(path, f)
-    return model_file, mapping_file
-
-
 @app.route("/api/tagger-config", methods=["GET"])
 def api_tagger_config_get():
     cfg = _load_config()
@@ -1191,12 +1259,8 @@ def api_tagger_config_get():
         haintag_ok = (root_p / "native_app" / "tagger.py").exists() or \
                      (root_p / "_internal" / "native_app" / "tagger_subprocess.py").exists()
 
-    model_ok = False
-    if model_dir:
-        m, mp = _scan_model_dir(model_dir)
-        model_ok = bool(m and mp)
-
-    pixai_ok = bool(pixai_dir) and (Path(pixai_dir) / "model.onnx").exists()
+    model_ok = resolve_cl_model_dir(ht) is not None
+    pixai_ok = resolve_pixai_model_dir(ht) is not None
 
     return jsonify({
         "haintag_root": haintag_root,
@@ -1205,7 +1269,7 @@ def api_tagger_config_get():
         "model_ok": model_ok,
         "pixai_model_dir": pixai_dir,
         "pixai_ok": pixai_ok,
-        "needs_setup": not model_dir and not pixai_dir,
+        "needs_setup": not model_ok and not pixai_ok,
     })
 
 
@@ -1540,18 +1604,17 @@ def _scheduler_fire() -> None:
             "ai_tags_by_platform": sched.get("ai_tags_by_platform") or {},
         }
         task_id = uuid.uuid4().hex[:8]
-        task = {
-            "id": task_id, "title": f"自动发布 {count} 张图片",
-            "status": "queued", "progress": 0.0, "target": _target_label(targets_str),
-            "count": "—", "current": 0, "total": count, "eta": "—", "cmd": cmd, "params": params,
-            "cancel_flag": False, "cancel_event": threading.Event(),
-            "created_at": datetime.now().strftime("%H:%M:%S"),
-            "log_lines": [], "pending_input": None, "thread": None,
-        }
+        task = _new_task_record(
+            task_id,
+            cmd,
+            params,
+            title=f"自动发布 {count} 张图片",
+            target=_target_label(targets_str),
+            total=count,
+        )
         with TASKS_LOCK:
             TASKS[task_id] = task
-        snap = {k: v for k, v in task.items() if k not in ("thread", "log_lines", "pending_input", "cancel_event")}
-        _broadcast_sse("task_update", snap)
+        _broadcast_sse("task_update", _task_snapshot(task))
         t = threading.Thread(target=_run_task, args=(task_id, cmd, params), daemon=True)
         task["thread"] = t
         t.start()
@@ -1624,10 +1687,7 @@ def api_stream():
     def generate():
         # Push current state snapshot on connect
         with TASKS_LOCK:
-            all_tasks = [
-                {k: v for k, v in t.items() if k not in ("thread", "log_lines", "pending_input", "cancel_event")}
-                for t in TASKS.values()
-            ]
+            all_tasks = [_task_snapshot(task) for task in TASKS.values()]
             recent_logs = []
             for t in TASKS.values():
                 recent_logs.extend(t.get("log_lines", [])[-10:])

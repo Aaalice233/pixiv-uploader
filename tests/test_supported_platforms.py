@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -94,6 +95,27 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(task["current"], 0)
         self.assertEqual(task["total"], 1)
         self.assertEqual(task["cmd"], 2)
+        self.assertEqual(task["progress_version"], 2)
+        self.assertEqual(task["progress"], 0.0)
+        self.assertEqual(task["stage"], "queued")
+        self.assertEqual(task["stage_label"], "等待执行")
+        self.assertGreater(task["stage_count"], 2)
+        self.assertEqual(task["item_index"], 0)
+        self.assertEqual(task["succeeded"], 0)
+        self.assertEqual(task["failed"], 0)
+        self.assertEqual(task["canceled"], 0)
+
+    def test_task_log_handler_uses_command_specific_source(self) -> None:
+        handler = self.web_server._SseLogHandler(
+            "task-id",
+            self.web_server.CMD_LOG_SOURCES[3],
+        )
+        record = logging.LogRecord("pixiv_uploader", logging.INFO, "", 0, "message", (), None)
+
+        with patch.object(self.web_server, "_push_log_line") as push:
+            handler.emit(record)
+
+        push.assert_called_once_with("task-id", "INFO", "pixiv", "message")
 
     def test_upload_defaults_are_reduced_to_current_two_platform_schema(self) -> None:
         self.config_path.write_text(json.dumps({

@@ -72,6 +72,47 @@ class PixivBrowserReuseTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "关闭占用该账号配置的 Chrome 窗口"):
                 support.open_pixiv_browser(pw)
 
+    def test_attached_login_browser_is_not_closed_after_task(self) -> None:
+        context = Mock()
+        context._pixiv_uploader_attached = True
+
+        support.close_pixiv_browser(context)
+
+        context.close.assert_not_called()
+
+    def test_owned_browser_is_closed_after_task(self) -> None:
+        context = Mock(spec=["close"])
+
+        support.close_pixiv_browser(context)
+
+        context.close.assert_called_once_with()
+
+
+class PixivUploadFailureTests(unittest.TestCase):
+    def test_closed_browser_returns_one_actionable_failure_step(self) -> None:
+        page = Mock()
+        page.url = "https://www.pixiv.net/upload.php"
+        page.is_closed.return_value = True
+        page.locator.side_effect = RuntimeError(
+            "Target page, context or browser has been closed"
+        )
+
+        progress_events = []
+        with patch.object(support.random, "uniform", return_value=0):
+            url, steps = support.create_pixiv_post(
+                page,
+                {},
+                Path("image.png"),
+                delay=0,
+                progress_callback=lambda stage, **details: progress_events.append((stage, details)),
+            )
+
+        self.assertIsNone(url)
+        self.assertEqual(progress_events, [("filling_pixiv", {"stage_progress": 0.0})])
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0].name, "browser_session")
+        self.assertEqual(steps[0].reason, "browser_closed")
+
 
 class PixivUploadStartupTests(unittest.TestCase):
     def test_pixiv_browser_opens_after_manifest_preparation(self) -> None:
@@ -93,6 +134,7 @@ class PixivUploadStartupTests(unittest.TestCase):
             files["manifests"] = root / "manifests"
             files["manifests"].mkdir()
             events = []
+            progress_events = []
             page = object()
             context = Mock()
             playwright = Mock()
@@ -127,9 +169,12 @@ class PixivUploadStartupTests(unittest.TestCase):
                 events.append("open")
                 return context, page
 
-            def publish(received_page, *_args, **_kwargs):
+            def publish(received_page, *_args, **kwargs):
                 self.assertIs(received_page, page)
                 events.append("publish")
+                kwargs["progress_callback"]("filling_pixiv", stage_progress=0.48)
+                kwargs["progress_callback"]("submitting_pixiv", stage_progress=1.0)
+                kwargs["progress_callback"]("verifying_pixiv", stage_progress=1.0)
                 return "https://www.pixiv.net/artworks/123", []
 
             args = SimpleNamespace(
@@ -140,6 +185,7 @@ class PixivUploadStartupTests(unittest.TestCase):
                 llm_persona="", llm_content_mode="",
                 llm_personas_by_platform={}, llm_content_modes_by_platform={},
                 ai_tags_by_platform={"pixiv": True}, cancel_event=None,
+                progress_callback=lambda stage, **details: progress_events.append((stage, details)),
             )
 
             with ExitStack() as stack:
@@ -161,9 +207,16 @@ class PixivUploadStartupTests(unittest.TestCase):
                 stack.enter_context(patch.object(splitter, "write_manifest"))
                 stack.enter_context(patch.object(splitter, "save_json"))
                 stack.enter_context(patch.object(splitter, "move_to_done", return_value=root / "done" / source.name))
-                splitter.cmd_upload(args)
+                summary = splitter.cmd_upload(args)
 
             self.assertEqual(events, ["prepare", "open", "publish"])
+            progress_stages = [stage for stage, _details in progress_events]
+            self.assertLess(progress_stages.index("opening_pixiv"), progress_stages.index("filling_pixiv"))
+            self.assertLess(progress_stages.index("filling_pixiv"), progress_stages.index("submitting_pixiv"))
+            self.assertEqual(progress_stages[-1], "item_complete")
+            self.assertEqual(progress_events[-1][1]["current"], 1)
+            self.assertEqual(summary["status"], "success")
+            self.assertEqual(summary["succeeded"], 1)
             context.close.assert_called_once_with()
             playwright.stop.assert_called_once_with()
 

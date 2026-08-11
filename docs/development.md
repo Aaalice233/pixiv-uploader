@@ -15,6 +15,7 @@ pixiv_uploader/                 Python 应用包
   runtime.py                    运行目录创建与旧数据迁移
   pixiv/                        Pixiv 领域模块
     storage.py                  原子 JSON 持久化、运行规则与 manifest
+    tagger_settings.py          HainTag 设置与模型目录解析
     support.py                  标签、元数据、浏览器发布与规则拟合
   resources/                    随版本发布、只读的默认数据
     pixiv/                      标签、年龄、打码默认规则及压缩词典
@@ -84,6 +85,8 @@ config.json                     本机设置、凭据和 Scheduler 状态
 6. 持续写入 `runtime/manifests/`；所有目标成功后把原图移入 `done/`。
 
 取消只在可逆阶段立即生效。进入实际 publish 点击后，流程优先完成收尾并记录远端成功结果，避免远端已发布而本地误报取消。
+
+LLM 视觉请求只发送最长边 1536 px 的 JPEG 预览，不得直接 base64 编码发布原图。Pixiv 浏览器通过 CDP 复用登录窗口时，任务结束只断开自动化连接，不关闭用户浏览器；仅关闭由任务自身创建的 persistent context。浏览器会话中途关闭必须记录 `browser_closed` 并立即停止后续 DOM 操作。
 
 ## 平台边界
 
@@ -165,6 +168,24 @@ LLM 仅增强 Pixiv 的 `title_*` 和 `caption_*`，不负责 tag、年龄分级
 .venv/Scripts/python.exe -m pixiv_uploader.pixiv.setup_censor
 ```
 
+## 任务进度协议
+
+`pixiv_uploader/task_progress.py` 是任务阶段、权重和聚合算法的单一来源。业务流程通过 `progress_callback(stage, **details)` 显式上报，不得再从日志文本（例如 `[1/3]`）推导进度。
+
+任务快照的稳定字段包括：
+
+- `progress`：`0..1` 的整体完成度；仅 `status=done` 可以等于 `1`；
+- `stage` / `stage_progress`：稳定阶段 ID 与阶段内完成度；
+- `stage_index` / `stage_count`：当前阶段与本任务动态阶段总数；
+- `item_index` / `item_name`：当前处理对象，不代表已经成功；
+- `current` / `total`：已经处理结束的对象数与总数；
+- `succeeded` / `failed` / `canceled`：互斥结果计数；
+- `result`：命令返回的结构化批次汇总。
+
+上传任务按目标平台和 LLM 开关动态构造阶段，按“初始化 4% + 所有图片加权阶段 94% + 收尾 2%”聚合。多图任务先完成当前图片的真实阶段，再进入下一张；失败或取消保留在最后到达的阶段和百分比，不伪装成 100%。长耗时步骤只显示活动动画，不用定时器制造虚假数值。
+
+新增阶段时：先在 `STAGE_LABELS` 和对应 `ProgressProfile` 注册稳定 ID 与权重，再在领域边界上报事件，最后同步 `frontend/src/locales.js` 和 `tests/test_task_progress.py`。阶段文案由前端本地化，后端 `stage_label` 只作兼容回退。
+
 ## Web 后端约束
 
 - 同一时间只运行一个重型上传任务，防止浏览器 profile、模型内存和运行目录互相争用；
@@ -233,6 +254,8 @@ Python：
 | `ensure_runtime_files` | `pixiv_uploader/pixiv/storage.py` | 初始化用户规则和资源路径 |
 | `WatermarkService` | `pixiv_uploader/watermark.py` | 水印配置、资源与渲染入口 |
 | `_arm_scheduler` | `pixiv_uploader/web.py` | Web Scheduler timer |
+| `TaskProgressState` | `pixiv_uploader/task_progress.py` | 阶段配置、权重聚合与终态约束 |
+| `_TaskProgressController` | `pixiv_uploader/web.py` | 领域进度事件到任务快照 / SSE 的桥接 |
 | `api_stream` | `pixiv_uploader/web.py` | SSE 状态流 |
 | `PixAITaggerBridge` | `pixiv_uploader/pixiv/pixai_tagger.py` | PixAI ONNX bridge |
 

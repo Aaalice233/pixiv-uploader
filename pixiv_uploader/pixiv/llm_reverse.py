@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
-import mimetypes
 import re
 from copy import deepcopy
 from pathlib import Path
@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import httpx
+from PIL import Image, ImageOps
 
 from .llm_platforms import (
     DEFAULT_PLATFORM_ID,
@@ -31,6 +32,8 @@ POLITICAL_RE = re.compile(
 )
 
 MAX_FEW_SHOT_SAMPLES = 4
+LLM_IMAGE_MAX_EDGE = 1536
+LLM_IMAGE_JPEG_QUALITY = 85
 log = logging.getLogger(__name__)
 
 
@@ -535,9 +538,26 @@ def _extract_anthropic_content(data: dict[str, Any]) -> str:
 
 
 def _image_to_data_url(path: Path) -> str:
-    mime = mimetypes.guess_type(str(path))[0] or "image/png"
-    data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{data}"
+    with Image.open(path) as source:
+        source.seek(0)
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail((LLM_IMAGE_MAX_EDGE, LLM_IMAGE_MAX_EDGE), Image.Resampling.LANCZOS)
+        if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+            rgba = image.convert("RGBA")
+            rgb = Image.new("RGB", rgba.size, "white")
+            rgb.paste(rgba, mask=rgba.getchannel("A"))
+        else:
+            rgb = image.convert("RGB")
+        buffer = io.BytesIO()
+        rgb.save(
+            buffer,
+            format="JPEG",
+            quality=LLM_IMAGE_JPEG_QUALITY,
+            optimize=True,
+            progressive=True,
+        )
+    data = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{data}"
 
 
 def _extract_message_content(data: dict[str, Any]) -> str:

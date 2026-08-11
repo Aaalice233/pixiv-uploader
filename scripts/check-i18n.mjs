@@ -3,6 +3,7 @@ import { messages, validateCatalogs } from '../frontend/src/locales.js';
 
 const errors = validateCatalogs();
 const source = await readFile(new URL('../frontend/src/flow-app.jsx', import.meta.url), 'utf8');
+const progressSource = await readFile(new URL('../pixiv_uploader/task_progress.py', import.meta.url), 'utf8');
 
 const cjkMatches = [...source.matchAll(/[\u3400-\u9fff]/g)];
 if (cjkMatches.length) {
@@ -15,8 +16,13 @@ for (const key of new Set(staticKeys)) {
   if (!Object.prototype.hasOwnProperty.call(messages['zh-CN'], key)) errors.push(`flow-app.jsx uses unknown message key: ${key}`);
 }
 
+const progressStages = new Set([
+  ...[...progressSource.matchAll(/ProgressStage\("([^"]+)"/g)].map(match => match[1]),
+  'queued', 'initializing', 'completing', 'done', 'failed', 'canceled', 'waiting_input',
+]);
 const generatedKeys = [
   ...['queued', 'running', 'done', 'failed', 'canceled', 'waiting_input'].map(value => `task.status.${value}`),
+  ...[...progressStages].map(value => `task.stage.${value}`),
   ...[1, 2, 3, 4, 5, 6].map(value => `task.command.${value}`),
   ...['off', 'japan', 'strict'].map(value => `pixiv.preset.${value}`),
   ...['mosaic', 'blur', 'bar', 'heart'].map(value => `pixiv.method.${value}`),

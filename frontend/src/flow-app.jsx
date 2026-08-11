@@ -47,6 +47,40 @@ function jsonOptions(method, body) {
   return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
 }
 
+function formatLogsForClipboard(logs) {
+  return logs.map(entry => [entry.t, entry.src, entry.msg]
+    .map(value => String(value ?? '').trim())
+    .filter(Boolean)
+    .join('\t'))
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function writeClipboard(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch (_) {
+    // Fall through for browsers that expose the API but block it by policy.
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.style.position = 'fixed';
+  textarea.style.inset = '-9999px auto auto -9999px';
+  document.body.appendChild(textarea);
+  let copied = false;
+  try {
+    textarea.select();
+    copied = document.execCommand('copy');
+  } finally {
+    textarea.remove();
+  }
+  if (!copied) throw new Error('Clipboard write failed');
+}
+
 function Icon({ name, size = 18 }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true };
   const paths = {
@@ -75,6 +109,7 @@ function Icon({ name, size = 18 }) {
     menu: <><path d="M4 7h16M4 12h16M4 17h16"/></>,
     alert: <><path d="M12 3 2.8 20h18.4Z"/><path d="M12 9v5M12 17h.01"/></>,
     logout: <><path d="M9 5H4v14h5"/><path d="M13 8l4 4-4 4M17 12H8"/></>,
+    copy: <><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"/></>,
   };
   return <svg {...common}>{paths[name] || null}</svg>;
 }
@@ -339,23 +374,43 @@ function InputRequiredDialog({ request, onSubmit }) {
 
 function TaskRow({ task, onCancel, onRemove, onRetry }) {
   const { formatNumber, t } = useI18n();
-  const statusTone = { queued: 'idle', running: 'running', done: 'done', failed: 'failed', canceled: 'idle', waiting_input: 'waiting' }[task.status] || 'idle';
-  const progress = Math.max(0, Math.min(100, Number(task.progress || 0) * 100));
-  const total = Number(task.total || task.params?.files?.length || 0);
-  const current = Number.isFinite(Number(task.current)) ? Number(task.current) : Math.round(total * progress / 100);
+  const statusTone = { queued: 'idle', running: 'running', done: 'done', failed: 'failed', canceled: 'canceled', waiting_input: 'waiting' }[task.status] || 'idle';
+  const rawProgress = Math.max(0, Math.min(1, Number(task.progress || 0)));
+  const visualProgress = task.status === 'done' ? 100 : Math.min(99, rawProgress * 100);
+  const displayProgress = task.status === 'done' ? 100 : Math.min(99, Math.floor(rawProgress * 100));
+  const total = Math.max(0, Number(task.total || task.params?.files?.length || 0));
+  const current = Math.max(0, Math.min(total || Number.MAX_SAFE_INTEGER, Number(task.current || 0)));
+  const itemIndex = Math.max(0, Number(task.item_index || 0));
+  const stageIndex = Math.max(0, Number(task.stage_index || 0));
+  const stageCount = Math.max(0, Number(task.stage_count || 0));
+  const stageKey = `task.stage.${task.stage || task.status || 'queued'}`;
+  const translatedStage = t(stageKey);
+  const stageLabel = translatedStage === stageKey ? (task.stage_label || t(`task.status.${task.status}`)) : translatedStage;
   const title = task.cmd === 2 && total ? t('task.command.2.count', { count: total }) : t(`task.command.${task.cmd}`);
   const targetIds = String(task.params?.targets || (task.cmd === 3 ? 'pixiv' : '')).split(',').filter(id => PLATFORM_META[id]);
   const target = targetIds.length ? targetIds.map(id => PLATFORM_META[id].label).join(' + ') : t('task.target.local');
-  return <article className="flow-task-row">
+  const itemLabel = itemIndex && total
+    ? t('task.progress.item', { current: formatNumber(itemIndex), total: formatNumber(total), name: task.item_name || title })
+    : total
+      ? t('task.progress.completed', { current: formatNumber(current), total: formatNumber(total) })
+      : t('task.progress.preparing');
+  const outcomeParts = [];
+  if (Number(task.succeeded || 0)) outcomeParts.push(t('task.progress.succeeded', { count: formatNumber(task.succeeded) }));
+  if (Number(task.failed || 0)) outcomeParts.push(t('task.progress.failed', { count: formatNumber(task.failed) }));
+  if (Number(task.canceled || 0)) outcomeParts.push(t('task.progress.canceled', { count: formatNumber(task.canceled) }));
+  return <article className={`flow-task-row ${statusTone}`}>
     <div className={`flow-task-state ${statusTone}`}><i/>{t(`task.status.${task.status}`)}</div>
     <div className="flow-task-copy"><strong>{title}</strong><span>{target} · {task.created_at || t('common.justNow')}</span></div>
-    <div className="flow-task-meter"><i style={{ width: `${progress}%` }}/></div>
-    <div className="flow-task-count">{total ? `${formatNumber(current)} / ${formatNumber(total)}` : t('common.notAvailable')}</div>
+    <div className="flow-task-progress">
+      <div className="flow-task-stage"><strong>{stageLabel}</strong><span>{displayProgress}%</span></div>
+      <div className={`flow-task-meter ${task.status === 'running' ? 'active' : ''}`} role="progressbar" aria-label={stageLabel} aria-valuemin="0" aria-valuemax="100" aria-valuenow={displayProgress} aria-valuetext={`${stageLabel} ${displayProgress}%`}><i style={{ width: `${visualProgress}%` }}/></div>
+      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{itemLabel}</span>{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
+    </div>
     <div className="flow-task-controls">{task.status === 'failed' && <IconButton icon="refresh" label={t('task.retry')} onClick={() => onRetry(task)}/>} {(task.status === 'running' || task.status === 'queued' || task.status === 'waiting_input') ? <IconButton icon="pause" label={t('task.cancel')} onClick={() => onCancel(task.id)}/> : <IconButton icon="x" label={t('task.remove')} onClick={() => onRemove(task.id)}/>}</div>
   </article>;
 }
 
-function Workbench({ tasks, logs, view, onViewChange, onCancel, onRemove, onRetry, clearLogs }) {
+function Workbench({ tasks, logs, view, onViewChange, onCancel, onRemove, onRetry, clearLogs, notify }) {
   const { t } = useI18n();
   const logEnd = useRef(null);
   const sortedTasks = useMemo(() => [...tasks].sort((a, b) => {
@@ -363,8 +418,16 @@ function Workbench({ tasks, logs, view, onViewChange, onCancel, onRemove, onRetr
     return (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || String(b.created_at || '').localeCompare(String(a.created_at || ''));
   }), [tasks]);
   useEffect(() => { if (view === 'logs') logEnd.current?.scrollIntoView({ block: 'nearest' }); }, [logs.length, view]);
+  async function copyLogs() {
+    try {
+      await writeClipboard(formatLogsForClipboard(logs));
+      notify(t('task.logsCopied', { count: logs.length }));
+    } catch (_) {
+      notify(t('task.copyLogsFailed'), 'error');
+    }
+  }
   return <section className="flow-workbench" id="workbench">
-    <header><div className="flow-workbench-tabs" role="tablist"><button role="tab" aria-selected={view === 'tasks'} className={view === 'tasks' ? 'active' : ''} onClick={() => onViewChange('tasks')}>{t('nav.tasks')} <span>{tasks.filter(task => ['running','queued','waiting_input'].includes(task.status)).length}</span></button><button role="tab" aria-selected={view === 'logs'} className={view === 'logs' ? 'active' : ''} onClick={() => onViewChange('logs')}>{t('nav.logs')}</button></div>{view === 'logs' && logs.length > 0 && <button className="flow-text-button" onClick={clearLogs}>{t('task.clearLogs')}</button>}</header>
+    <header><div className="flow-workbench-tabs" role="tablist"><button role="tab" aria-selected={view === 'tasks'} className={view === 'tasks' ? 'active' : ''} onClick={() => onViewChange('tasks')}>{t('nav.tasks')} <span>{tasks.filter(task => ['running','queued','waiting_input'].includes(task.status)).length}</span></button><button role="tab" aria-selected={view === 'logs'} className={view === 'logs' ? 'active' : ''} onClick={() => onViewChange('logs')}>{t('nav.logs')}</button></div>{view === 'logs' && logs.length > 0 && <div className="flow-log-actions"><button className="flow-text-button" onClick={copyLogs}><Icon name="copy" size={14}/><span>{t('task.copyLogs')}</span></button><button className="flow-text-button" onClick={clearLogs}>{t('task.clearLogs')}</button></div>}</header>
     {view === 'tasks' ? <div className="flow-task-list">{sortedTasks.length ? sortedTasks.map(task => <TaskRow key={task.id} task={task} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{t('task.emptyTitle')}</strong><span>{t('task.emptyHint')}</span></div>}</div> : <div className="flow-log-view">{logs.length ? logs.map((entry, index) => <div className={`flow-log-line ${String(entry.lvl || '').toLowerCase()}`} key={`${entry.t}-${index}`}><time>{entry.t}</time><b>{entry.src}</b><span>{entry.msg}</span></div>) : <div className="flow-workbench-empty"><Icon name="terminal" size={25}/><strong>{t('task.emptyLogs')}</strong></div>}<div ref={logEnd}/></div>}
   </section>;
 }
@@ -781,7 +844,7 @@ function FlowConsoleApp() {
       <header className="app-topbar"><div><h1>{t('app.workspace')}</h1><span className={connected ? 'connected' : ''}><i/>{connected ? t('app.connected') : t('app.reconnecting')}</span></div><span className="app-version">v{status.version || t('common.notAvailable')}</span></header>
       <div className="app-content">
         <QuickPublish images={images} scheduler={scheduler} onPublish={() => setDialog('publish')} onOpenFolder={openFolder}/>
-        <Workbench tasks={tasks} logs={logs} view={workbenchView} onViewChange={setWorkbenchView} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask} clearLogs={() => setLogs([])}/>
+        <Workbench tasks={tasks} logs={logs} view={workbenchView} onViewChange={setWorkbenchView} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask} clearLogs={() => setLogs([])} notify={notify}/>
       </div>
     </main>
     {dialog === 'publish' && <PublishDialog images={images} status={status} defaults={uploadDefaults} llmConfig={llmConfig} onReloadImages={reloadImages} onClose={() => setDialog('')} onRun={runTask} notify={notify}/>}

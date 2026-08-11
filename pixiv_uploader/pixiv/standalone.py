@@ -13,6 +13,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .tagger_settings import resolve_cl_model_dir, scan_cl_model_dir
+
 
 # ---------------------------------------------------------------------------
 # Metadata
@@ -291,18 +293,23 @@ _DEFAULT_THRESHOLD = 0.5
 class StandaloneTaggerBridge:
     """
     WD14 ONNX tagger using onnxruntime — no haintag required.
-    Reads model_dir from %APPDATA%\\HainTag\\settings.json (same key as HainTagTaggerBridge).
+    Resolves configured and project-local model directories before scanning.
     Compatible return schema with HainTagTaggerBridge.predict_tags().
     """
 
     _INPUT_SIZE = 448  # overridden after model load if shape differs
 
-    def __init__(self) -> None:
+    def __init__(self, model_dir: str | Path | None = None) -> None:
         self._session = None
         self._tags: list[dict] | None = None
         self._status = "uninitialized"
         self._channel_first = False
-        self._model_dir = self._load_model_dir()
+        if model_dir is None:
+            resolved = resolve_cl_model_dir()
+        else:
+            model_path, mapping_path = scan_cl_model_dir(model_dir)
+            resolved = model_path.parent.resolve() if model_path and mapping_path else None
+        self._model_dir = str(resolved) if resolved else ""
 
     # ------------------------------------------------------------------
     # public
@@ -320,19 +327,6 @@ class StandaloneTaggerBridge:
 
     # ------------------------------------------------------------------
     # internal
-
-    @staticmethod
-    def _load_model_dir() -> str:
-        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        cfg = Path(appdata) / "HainTag" / "settings.json"
-        if cfg.exists():
-            try:
-                payload = json.loads(cfg.read_text(encoding="utf-8"))
-                s = payload.get("settings", payload) if isinstance(payload, dict) else {}
-                return s.get("tagger_model_dir") or ""
-            except Exception:
-                pass
-        return ""
 
     def _ensure_loaded(self) -> bool:
         if self._session is not None:
