@@ -305,6 +305,10 @@ class ImageWatermarkApiTests(unittest.TestCase):
         remote = self.client.get("/api/watermark-image/anything.png", environ_overrides={"REMOTE_ADDR": "192.0.2.1"})
         self.assertEqual(remote.status_code, 403)
 
+        missing = self.client.post("/api/watermark-image")
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.get_json()["error_code"], "image_required")
+
         png_bytes = io.BytesIO()
         mark = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
         ImageDraw.Draw(mark).ellipse([2, 2, 37, 37], fill=(255, 0, 0, 255))

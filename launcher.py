@@ -168,7 +168,7 @@ def header():
     from version import __version__
     print()
     print(" " + "=" * 46)
-    print(f"  Civitai Post Splitter & Pixiv Uploader  v{__version__}")
+    print(f"  Pixiv Uploader  v{__version__}")
     print(" " + "=" * 46)
     if _update_banner:
         print()
@@ -466,10 +466,23 @@ def _sched_config() -> dict:
             cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return cfg.get("scheduler") or {
-        "enabled": False, "targets": "civitai,pixiv",
-        "count": 1, "min_hours": 1.0, "max_hours": 3.0, "next_fire_at": None,
+    defaults = {
+        "enabled": False,
+        "targets": "civitai,pixiv",
+        "count": 1,
+        "min_hours": 1.0,
+        "max_hours": 3.0,
+        "next_fire_at": None,
+        "llm_reverse": False,
+        "llm_persona": "",
+        "llm_content_mode": "",
     }
+    stored = cfg.get("scheduler") if isinstance(cfg.get("scheduler"), dict) else {}
+    sched = {key: stored.get(key, value) for key, value in defaults.items()}
+    requested = [item.strip().lower() for item in str(sched["targets"]).split(",")]
+    targets = [item for item in requested if item in {"civitai", "pixiv"}]
+    sched["targets"] = ",".join(dict.fromkeys(targets)) or defaults["targets"]
+    return sched
 
 
 def _save_sched_config(sched: dict) -> None:
@@ -533,9 +546,6 @@ def cmd_scheduler() -> None:
         raw = input(f"  LLM 人设 ID（留空保持 '{sched.get('llm_persona', '')}' ）: ").strip()
         if raw:
             sched["llm_persona"] = raw
-        raw = input(f"  LLM 账号 ID（留空保持 '{sched.get('llm_account', '')}' ）: ").strip()
-        if raw:
-            sched["llm_account"] = raw
         raw = input(f"  内容模式 sfw/nsfw（留空保持 '{sched.get('llm_content_mode', '')}' ）: ").strip().lower()
         if raw in ("sfw", "nsfw", ""):
             sched["llm_content_mode"] = raw
@@ -581,8 +591,6 @@ def cmd_scheduler() -> None:
                 cmd.append("--llm-reverse")
                 if sched.get("llm_persona"):
                     cmd += ["--llm-persona", sched["llm_persona"]]
-                if sched.get("llm_account"):
-                    cmd += ["--llm-account", sched["llm_account"]]
                 if sched.get("llm_content_mode"):
                     cmd += ["--llm-content-mode", sched["llm_content_mode"]]
             run(cmd)

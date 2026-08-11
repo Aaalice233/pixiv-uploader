@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **项目独立为 Pixiv Uploader**：仓库更名并迁移到 `Aaalice233/pixiv-uploader`，应用品牌、包元数据、启动提示和中英文文档同步更新；原项目保留为 `upstream`。
+- **Web UI 全面应用化重构**：用 `frontend/flow-app.jsx` + `flow.css` 重建发布工作台、任务、日志、设置和响应式交互；采用无边框边缘阴影设计，支持深浅主题。
+- **完整界面多语言**：新增简体中文 / English 语言包、系统语言检测、即时切换与持久化；任务元数据、日期数字、动态状态、可访问性文案和 API 错误均通过稳定翻译边界呈现，并在前端构建前自动校验语言包完整性。
+- **图文水印完整接入**：Pixiv 发布副本可选择文字或图片水印；支持透明 PNG、资源导入/预览/删除、位置、大小、透明度、边距、字体、字型和颜色设置，原图保持不变。
+- **平台范围收敛为 Civitai / Pixiv**：删除 X (Twitter) 与小红书的发布模块、浏览器 profile、路由、设置、模板、依赖和旧界面；CLI、Web API 与 Scheduler 对未知 target 统一显式拒绝。
+- **Pixiv 文案配置简化**：LLM 人设只服务 Pixiv，移除旧账号抽象与跨平台 `manifest.copy`，结果直接写入 `manifest.pixiv`。
+- **Web 任务状态完善**：任务支持明确的 queued/running/waiting_input/success/failed/canceled 状态、阶段文案、结构化错误和确认输入。
+
 ## 2026.05.19
 
 ### Added

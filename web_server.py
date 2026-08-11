@@ -29,8 +29,6 @@ from pixiv.llm_reverse import (
     validate_llm_reverse_config,
 )
 from pixiv.support import PIXIV_PROFILE_DIR
-from x.support   import X_DIR,   X_PROFILE_DIR
-from xhs.support import XHS_DIR, XHS_PROFILE_DIR
 from watermark import (
     MAX_FONT_UPLOAD_BYTES,
     MAX_IMAGE_UPLOAD_BYTES,
@@ -45,6 +43,42 @@ PORT = int(os.environ.get("WEB_PORT", "7788"))
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 
 
+def _find_chrome_executable() -> str | None:
+    for name in ("google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser"):
+        executable = shutil.which(name)
+        if executable:
+            return executable
+    for candidate in (
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _open_login_browser(profile_dir: Path, url: str) -> None:
+    chrome = _find_chrome_executable()
+    if chrome is None:
+        raise RuntimeError("Google Chrome was not found")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(
+        [
+            chrome,
+            f"--user-data-dir={profile_dir}",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            "--disable-sync",
+            "--no-first-run",
+            url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def _load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
@@ -55,7 +89,10 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG_FILE.with_suffix(f"{CONFIG_FILE.suffix}.tmp")
+    temporary.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(CONFIG_FILE)
 
 
 def _watermark_service() -> WatermarkService:
@@ -84,7 +121,7 @@ def _censor_deps_ok() -> bool:
 def _watermark_local_only():
     if request.remote_addr in {"127.0.0.1", "::1"}:
         return None
-    return jsonify({"error": "watermark settings are available only from localhost"}), 403
+    return _api_error("local_only", 403, detail="watermark settings are available only from localhost")
 
 
 # Apply saved config to env on startup
@@ -110,26 +147,60 @@ _pixai_tasks: dict[str, dict] = {}
 _pixai_tasks_lock = threading.Lock()
 
 CMD_LABELS = {
-    1: ("Split post",     "Local"),
-    2: ("Dual upload",    "Civitai + Pixiv"),
-    3: ("Pixiv only",     "Pixiv only"),
-    4: ("Setup R-18 mosaic", "Local"),
-    5: ("Check update",   "Local"),
-    6: ("LLM reverse",    "Local"),
+    1: ("拆分 Civitai 帖子", "本地处理"),
+    2: ("发布图片", "Civitai + Pixiv"),
+    3: ("发布到 Pixiv", "Pixiv"),
+    4: ("安装打码模型", "本地处理"),
+    5: ("检查更新", "本地处理"),
+    6: ("生成 Pixiv 文案", "本地处理"),
 }
 
 # ── Flask app ──────────────────────────────────────────────────
 app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
+
+
+def _api_error(code: str, status: int = 400, *, detail: str = "", **params):
+    if code == "generic" and "reason" not in params:
+        params["reason"] = detail
+    payload = {
+        "error": detail or code,
+        "error_code": code,
+        "error_params": params,
+    }
+    return jsonify(payload), status
+
+
+@app.errorhandler(413)
+def _handle_request_too_large(_error):
+    if request.path.startswith("/api/"):
+        return _api_error("request_too_large", 413, detail="上传内容超过 512 MB 限制")
+    return "request too large", 413
+
+
+@app.errorhandler(404)
+def _handle_not_found(_error):
+    if request.path.startswith("/api/"):
+        return _api_error("not_found", 404, detail="接口不存在")
+    return "not found", 404
+
+
+@app.errorhandler(405)
+def _handle_method_not_allowed(_error):
+    if request.path.startswith("/api/"):
+        return _api_error("method_not_allowed", 405, detail="请求方法不受支持")
+    return "method not allowed", 405
+
 
 def _has_active_tasks() -> bool:
     with TASKS_LOCK:
-        return any(t.get("status") in ("queued", "running") for t in TASKS.values())
+        return any(t.get("status") in ("queued", "running", "waiting_input") for t in TASKS.values())
 
 
 def _cancel_scheduler() -> dict:
     global _scheduler_timer
     cfg = _load_config()
-    sched = {**_sched_default(), **(cfg.get("scheduler") or {})}
+    sched = _scheduler_from_config(cfg)
     sched["enabled"] = False
     sched["next_fire_at"] = None
     cfg["scheduler"] = sched
@@ -206,11 +277,15 @@ def _push_log_line(task_id: str, lvl: str, src: str, msg: str) -> None:
             if m:
                 cur, total = int(m.group(1)), int(m.group(2))
                 TASKS[task_id]["progress"] = cur / total if total > 0 else 0
-                TASKS[task_id]["count"] = f"{cur} / {total} imgs"
+                TASKS[task_id]["current"] = cur
+                TASKS[task_id]["total"] = total
+                TASKS[task_id]["count"] = f"{cur} / {total} 张"
             # parse total from "upload/ 有 X 张图片"
             tm = _TOTAL_RE.search(msg)
             if tm and TASKS[task_id]["count"] == "—":
-                TASKS[task_id]["count"] = f"0 / {tm.group(1)} imgs"
+                TASKS[task_id]["current"] = 0
+                TASKS[task_id]["total"] = int(tm.group(1))
+                TASKS[task_id]["count"] = f"0 / {tm.group(1)} 张"
     _broadcast_sse("log", entry)
     # broadcast updated task snapshot if progress changed
     if _PROGRESS_RE.search(msg) or _TOTAL_RE.search(msg):
@@ -278,14 +353,16 @@ class _WebInput:
         with TASKS_LOCK:
             if self._task_id in TASKS:
                 TASKS[self._task_id]["pending_input"] = {"prompt": prompt, "event": ev, "result": result}
+        _set_task_status(self._task_id, "waiting_input")
         _broadcast_sse("input_required", {"task_id": self._task_id, "prompt": prompt})
-        ev.wait(timeout=300)
+        ev.wait()
         with TASKS_LOCK:
             task = TASKS.get(self._task_id)
             if task:
                 task.pop("pending_input", None)
                 if task.get("cancel_event") and task["cancel_event"].is_set():
                     return ""
+        _set_task_status(self._task_id, "running")
         return result[0]
 
 
@@ -312,11 +389,11 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
     sys.stderr  = _ThreadWriter(orig_stderr, task_id, "ERR")
     builtins.input = _WebInput(task_id)
 
-    cs_logger = logging.getLogger("civitai_splitter")
-    cs_logger.setLevel(logging.DEBUG)
+    app_logger = logging.getLogger("pixiv_uploader")
+    app_logger.setLevel(logging.DEBUG)
     sse_handler = _SseLogHandler(task_id)
     sse_handler.setFormatter(logging.Formatter('%(message)s'))
-    cs_logger.addHandler(sse_handler)
+    app_logger.addHandler(sse_handler)
 
     with TASKS_LOCK:
         cancel_event = TASKS[task_id].get("cancel_event")
@@ -342,32 +419,11 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                 return
 
         elif cmd in (2, 3):
-            # Both cmd=2 and cmd=3 now route through the same upload entrypoint;
-            # the difference (targets) is supplied by the frontend `targets`
-            # param. Legacy fallback: cmd=2 → "civitai,pixiv", cmd=3 → "pixiv".
-            legacy_default = "civitai,pixiv" if cmd == 2 else "pixiv"
+            default_targets = "civitai,pixiv" if cmd == 2 else "pixiv"
             from civitai_splitter import cmd_upload
-            _run_cfg = _load_config()
-            _xhs_manual = bool(_run_cfg.get("xhs_manual_mode"))
-
-            def _xhs_manual_cb(xhs_payload, manifest_path):
-                from urllib.parse import quote
-                raw_paths = xhs_payload.get("clean_copy_paths", [])
-                image_urls = []
-                for p in raw_paths:
-                    name = Path(p).name
-                    encoded = quote(name, safe="")
-                    image_urls.append(f"/xhs_out/{encoded}")
-                _broadcast_sse("xhs_manual", {
-                    "title": xhs_payload.get("title", ""),
-                    "body": xhs_payload.get("body", ""),
-                    "tags": xhs_payload.get("tags", []),
-                    "image_urls": image_urls,
-                    "manifest_path": manifest_path,
-                })
 
             args = argparse.Namespace(
-                targets=params.get("targets", legacy_default),
+                targets=params.get("targets", default_targets),
                 count=params.get("count", 0),
                 files=params.get("files", []),
                 sort=params.get("sort", "random"),
@@ -379,16 +435,8 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                 abort_after_failures=3,
                 llm_reverse=params.get("llm_reverse", False),
                 llm_persona=params.get("llm_persona", ""),
-                llm_account=params.get("llm_account", ""),
                 llm_content_mode=params.get("llm_content_mode", ""),
-                llm_mode=params.get("llm_mode", "unified"),
-                llm_personas_by_platform=params.get("llm_personas_by_platform") or {},
-                llm_content_modes_by_platform=params.get("llm_content_modes_by_platform") or {},
-                ai_tags_by_platform=params.get("ai_tags_by_platform") or {},
-                x_template=params.get("x_template", ""),
-                xhs_template=params.get("xhs_template", ""),
-                xhs_manual_mode=_xhs_manual,
-                xhs_manual_callback=_xhs_manual_cb if _xhs_manual else None,
+                ai_tags_by_platform={"pixiv": bool((params.get("ai_tags_by_platform") or {}).get("pixiv", True))},
                 cancel_event=cancel_event,
             )
             cmd_upload(args)
@@ -457,7 +505,6 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
                 image_url=image_url,
                 config=cfg,
                 persona_id=params.get("llm_persona", ""),
-                account_id=params.get("llm_account", ""),
                 content_mode=params.get("llm_content_mode", ""),
                 cancel_event=cancel_event,
             )
@@ -484,7 +531,7 @@ def _run_task_locked(task_id: str, cmd: int, params: dict) -> None:
         _set_task_status(task_id, "failed")
 
     finally:
-        cs_logger.removeHandler(sse_handler)
+        app_logger.removeHandler(sse_handler)
         sys.stdout    = orig_stdout
         sys.stderr    = orig_stderr
         builtins.input = orig_input
@@ -504,10 +551,41 @@ def frontend_static(filename):
 @app.route("/api/run/<int:cmd>", methods=["POST"])
 def api_run(cmd):
     if cmd not in CMD_LABELS:
-        return jsonify({"error": "invalid cmd"}), 400
+        return _api_error("invalid_command")
     params = request.get_json(silent=True) or {}
-    task_id = uuid.uuid4().hex[:8]
+    if not isinstance(params, dict):
+        return _api_error("invalid_task_params", detail="任务参数必须是对象")
+    params = dict(params)
     label, target = CMD_LABELS[cmd]
+    if cmd == 1:
+        posts = params.get("posts") or []
+        if not isinstance(posts, list) or not any(str(post).strip() for post in posts):
+            return _api_error("posts_required", detail="至少填写一个 Civitai Post ID 或 URL")
+        params["posts"] = [str(post).strip() for post in posts if str(post).strip()]
+    if cmd in (2, 3):
+        try:
+            targets = _validate_target_string(params.get("targets", "civitai,pixiv" if cmd == 2 else "pixiv"))
+        except ValueError as exc:
+            code = "target_required" if not str(params.get("targets", "")).strip() else "invalid_targets"
+            return _api_error(code, detail=str(exc))
+        files = params.get("files") or []
+        if not isinstance(files, list):
+            return _api_error("files_must_be_array", detail="files 必须是数组")
+        normalized_files = [Path(str(name)).name for name in files]
+        if any(Path(name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"} for name in normalized_files):
+            return _api_error("unsupported_file_in_list", detail="files 中包含不支持的图片格式")
+        params["targets"] = targets
+        params["files"] = normalized_files
+        target = _target_label(targets)
+        if params["files"]:
+            label = f"发布 {len(params['files'])} 张图片"
+    requested_total = len(params.get("files") or [])
+    if not requested_total:
+        try:
+            requested_total = max(0, int(params.get("count") or 0))
+        except (TypeError, ValueError):
+            requested_total = 0
+    task_id = uuid.uuid4().hex[:8]
     task = {
         "id":         task_id,
         "title":      label,
@@ -515,6 +593,8 @@ def api_run(cmd):
         "progress":   0.0,
         "target":     target,
         "count":      "—",
+        "current":    0,
+        "total":      requested_total,
         "eta":        "—",
         "cmd":        cmd,
         "params":     params,
@@ -550,7 +630,7 @@ def api_tasks():
 def api_cancel(task_id):
     with TASKS_LOCK:
         if task_id not in TASKS:
-            return jsonify({"error": "not found"}), 404
+            return _api_error("task_not_found", 404, detail="not found")
         TASKS[task_id]["cancel_flag"] = True
         ev = TASKS[task_id].get("cancel_event")
         pending = TASKS[task_id].get("pending_input")
@@ -569,7 +649,7 @@ def api_resume(task_id):
     with TASKS_LOCK:
         pending = TASKS.get(task_id, {}).get("pending_input")
     if not pending:
-        return jsonify({"error": "no pending input"}), 404
+        return _api_error("no_pending_input", 404, detail="no pending input")
     pending["result"][0] = answer
     pending["event"].set()
     return jsonify({"ok": True})
@@ -579,7 +659,9 @@ def api_resume(task_id):
 def api_remove(task_id):
     with TASKS_LOCK:
         if task_id not in TASKS:
-            return jsonify({"error": "not found"}), 404
+            return _api_error("task_not_found", 404, detail="not found")
+        if TASKS[task_id].get("status") in {"queued", "running", "waiting_input"}:
+            return _api_error("active_task", 409, detail="运行中的任务需要先取消")
         del TASKS[task_id]
     _broadcast_sse("task_remove", {"id": task_id})
     return jsonify({"ok": True})
@@ -587,13 +669,15 @@ def api_remove(task_id):
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _api_error("settings_must_be_object", detail="设置内容必须是对象")
     cfg = _load_config()
     if "api_key" in body:
+        if not isinstance(body["api_key"], str):
+            return _api_error("settings_must_be_object", detail="api_key must be a string")
         cfg["api_key"] = body["api_key"].strip()
         os.environ["CIVITAI_API_KEY"] = cfg["api_key"]
-    if "xhs_manual_mode" in body:
-        cfg["xhs_manual_mode"] = bool(body["xhs_manual_mode"])
     _save_config(cfg)
     return jsonify({"ok": True})
 
@@ -606,7 +690,7 @@ def api_watermark_config_get():
     try:
         return jsonify(_watermark_service().config_payload())
     except WatermarkError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _api_error("generic", detail=str(exc))
 
 
 @app.route("/api/watermark-config", methods=["POST"])
@@ -616,13 +700,13 @@ def api_watermark_config_set():
         return blocked
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
-        return jsonify({"error": "invalid watermark configuration"}), 400
+        return _api_error("invalid_watermark_config", detail="invalid watermark configuration")
     try:
         service = _watermark_service()
         service.save_config(body)
         return jsonify({"ok": True, **service.config_payload()})
     except WatermarkError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _api_error("generic", detail=str(exc))
 
 
 @app.route("/api/watermark-font", methods=["POST"])
@@ -632,14 +716,14 @@ def api_watermark_font_import():
         return blocked
     uploaded = request.files.get("font")
     if uploaded is None or not uploaded.filename:
-        return jsonify({"error": "font file is required"}), 400
+        return _api_error("font_required", detail="font file is required")
     try:
         data = uploaded.read(MAX_FONT_UPLOAD_BYTES + 1)
         service = _watermark_service()
         font = service.import_font(uploaded.filename, data)
         return jsonify({"ok": True, "font": font.to_dict(), **service.config_payload()})
     except WatermarkError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _api_error("generic", detail=str(exc))
     finally:
         uploaded.close()
 
@@ -652,10 +736,10 @@ def api_watermark_font_delete(file_name: str):
     try:
         service = _watermark_service()
         if not service.delete_font(file_name):
-            return jsonify({"error": "font not found"}), 404
+            return _api_error("font_not_found", 404, detail="font not found")
         return jsonify({"ok": True, **service.config_payload()})
     except WatermarkError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _api_error("generic", detail=str(exc))
 
 
 @app.route("/api/watermark-image", methods=["POST"])
@@ -665,17 +749,21 @@ def api_watermark_image_import():
         return blocked
     uploaded = request.files.get("image")
     if uploaded is None or not uploaded.filename:
-        return jsonify({"error": "image file is required"}), 400
+        return _api_error("image_required", detail="image file is required")
     try:
         data = uploaded.read(MAX_IMAGE_UPLOAD_BYTES + 1)
         if len(data) > MAX_IMAGE_UPLOAD_BYTES:
             maximum_mb = MAX_IMAGE_UPLOAD_BYTES // (1024 * 1024)
-            return jsonify({"error": f"Watermark images must be smaller than {maximum_mb} MB"}), 400
+            return _api_error(
+                "watermark_image_too_large",
+                detail=f"Watermark images must be smaller than {maximum_mb} MB",
+                maximum_mb=maximum_mb,
+            )
         service = _watermark_service()
         file_name = service.import_image(uploaded.filename, data)
         return jsonify({"ok": True, "file_name": file_name, **service.config_payload()})
     except WatermarkError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _api_error("generic", detail=str(exc))
     finally:
         uploaded.close()
 
@@ -688,10 +776,10 @@ def api_watermark_image_delete(file_name: str):
     try:
         service = _watermark_service()
         if not service.delete_image(file_name):
-            return jsonify({"error": "image not found"}), 404
+            return _api_error("image_not_found", 404, detail="image not found")
         return jsonify({"ok": True, **service.config_payload()})
     except WatermarkError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _api_error("generic", detail=str(exc))
 
 
 @app.route("/api/watermark-image/<path:file_name>")
@@ -703,9 +791,9 @@ def api_watermark_image_get(file_name: str):
     try:
         path = _watermark_service().image_store.path_for(file_name)
     except WatermarkError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return _api_error("generic", detail=str(exc))
     if not path.is_file():
-        return jsonify({"error": "image not found"}), 404
+        return _api_error("image_not_found", 404, detail="image not found")
     return send_from_directory(path.parent, path.name)
 
 
@@ -729,7 +817,7 @@ def api_censor_preset():
     body = request.get_json(silent=True) or {}
     preset = str(body.get("preset", "")).strip().lower()
     if preset not in _CENSOR_PRESETS:
-        return jsonify({"ok": False, "error": f"unknown preset: {preset}"}), 400
+        return _api_error("invalid_censor_preset", detail=f"unknown preset: {preset}")
     censor_path = SCRIPT_DIR / "pixiv" / "censor.json"
     try:
         existing = json.loads(censor_path.read_text(encoding="utf-8")) if censor_path.exists() else {}
@@ -828,7 +916,7 @@ def api_llm_reverse_models():
 
     if provider == "google_gemini":
         if not api_key:
-            return jsonify({"error": "需要先填写或保存 API key"}), 400
+            return _api_error("api_key_required", detail="需要先填写或保存 API key")
         # 支持用户自定义 base_url（本地代理），缺省走官方
         gemini_base = base_url or "https://generativelanguage.googleapis.com"
         url = f"{gemini_base}/v1beta/models?key={api_key}"
@@ -846,13 +934,13 @@ def api_llm_reverse_models():
                 models = sorted({str(m.get("id", "")) for m in data.get("data", []) if m.get("id")})
             return jsonify({"models": models})
         except _ue.HTTPError as e:
-            return jsonify({"error": f"上游返回 {e.code}（检查 API key 或代理是否可用）"}), 502
+            return _api_error("upstream_http", 502, detail=f"上游返回 {e.code}（检查 API key 或代理是否可用）", status=e.code)
         except Exception as e:
-            return jsonify({"error": f"无法连接：{e}"}), 502
+            return _api_error("connection_failed", 502, detail=f"无法连接：{e}", reason=str(e))
 
     # openai_compatible
     if not base_url:
-        return jsonify({"error": "需要填写 base URL"}), 400
+        return _api_error("base_url_required", detail="需要填写 base URL")
     try:
         req = _ur.Request(
             f"{base_url}/models",
@@ -863,28 +951,9 @@ def api_llm_reverse_models():
         ids = sorted(m["id"] for m in data.get("data", []) if "id" in m)
         return jsonify({"models": ids})
     except _ue.HTTPError as e:
-        return jsonify({"error": f"上游返回 {e.code}（检查 API key 或 base URL）"}), 502
+        return _api_error("upstream_http", 502, detail=f"上游返回 {e.code}（检查 API key 或 base URL）", status=e.code)
     except Exception as e:
-        return jsonify({"error": f"无法连接：{e}"}), 502
-
-
-@app.route("/api/templates", methods=["GET"])
-def api_templates():
-    try:
-        from x.support import load_x_templates, load_x_settings
-        x_keys = list(load_x_templates().keys())
-        x_default = load_x_settings().get("default_template", "en_sfw")
-    except Exception:
-        x_keys = ["jp_sfw", "en_sfw", "zh_sfw", "jp_nsfw", "en_nsfw", "zh_nsfw"]
-        x_default = "en_sfw"
-    try:
-        from xhs.support import load_xhs_templates, load_xhs_settings
-        xhs_keys = list(load_xhs_templates().keys())
-        xhs_default = load_xhs_settings().get("default_template", "default")
-    except Exception:
-        xhs_keys = ["default"]
-        xhs_default = "default"
-    return jsonify({"x": x_keys, "x_default": x_default, "xhs": xhs_keys, "xhs_default": xhs_default})
+        return _api_error("connection_failed", 502, detail=f"无法连接：{e}", reason=str(e))
 
 
 @app.route("/api/llm-reverse-config", methods=["GET"])
@@ -909,7 +978,8 @@ def api_llm_reverse_config_post():
     next_cfg = normalize_llm_reverse_config({**current, **body})
     errors = validate_llm_reverse_config(next_cfg)
     if errors:
-        return jsonify({"error": "; ".join(errors)}), 400
+        reason = "; ".join(errors)
+        return _api_error("generic", detail=reason, reason=reason)
     cfg["llm_reverse"] = next_cfg
     _save_config(cfg)
     return jsonify(mask_llm_config(next_cfg))
@@ -928,11 +998,7 @@ def _list_upload_dir(folder: Path, source: str) -> list:
 
 @app.route("/api/images")
 def api_images():
-    files = (
-        _list_upload_dir(SCRIPT_DIR / "upload", "upload")
-        + _list_upload_dir(SCRIPT_DIR / "xhs_upload", "xhs_upload")
-    )
-    return jsonify(files)
+    return jsonify(_list_upload_dir(SCRIPT_DIR / "upload", "upload"))
 
 
 @app.route("/upload/<path:filename>")
@@ -940,39 +1006,43 @@ def upload_file(filename):
     return send_from_directory(SCRIPT_DIR / "upload", filename)
 
 
-@app.route("/xhs_upload/<path:filename>")
-def xhs_upload_file(filename):
-    return send_from_directory(SCRIPT_DIR / "xhs_upload", filename)
-
-
 @app.route("/api/add-upload-files", methods=["POST"])
 def api_add_upload_files():
-    folder_name = request.form.get("folder", "upload")
-    if folder_name not in ("upload", "xhs_upload"):
-        folder_name = "upload"
-    upload_dir = SCRIPT_DIR / folder_name
-    upload_dir.mkdir(exist_ok=True)
-    saved = []
-    for f in request.files.getlist("files"):
-        if f.filename:
-            fname = Path(f.filename).name
-            dest = upload_dir / fname
-            f.save(str(dest))
-            saved.append(fname)
-    return jsonify({"saved": saved, "folder": folder_name})
+    upload_dir = SCRIPT_DIR / "upload"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    uploads = [uploaded for uploaded in request.files.getlist("files") if uploaded.filename]
+    rejected = [
+        Path(uploaded.filename).name or uploaded.filename
+        for uploaded in uploads
+        if Path(Path(uploaded.filename).name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
+    ]
+    if rejected:
+        names = ", ".join(rejected)
+        return _api_error("unsupported_uploads", detail=f"不支持的图片格式：{names}", files=names)
+    if not uploads:
+        return _api_error("no_usable_images", detail="没有收到可用图片")
+    saved: list[str] = []
+    for uploaded in uploads:
+        file_name = Path(uploaded.filename).name
+        destination = upload_dir / file_name
+        suffix_index = 2
+        while destination.exists():
+            destination = upload_dir / f"{Path(file_name).stem} ({suffix_index}){Path(file_name).suffix}"
+            suffix_index += 1
+        uploaded.save(str(destination))
+        saved.append(destination.name)
+    _broadcast_sse("images_changed", {})
+    return jsonify({"saved": saved})
 
 
 @app.route("/api/open-folder")
 def api_open_folder():
-    folder_name = request.args.get("folder", "upload")
-    if folder_name not in ("upload", "xhs_upload"):
-        folder_name = "upload"
-    upload_dir = SCRIPT_DIR / folder_name
+    upload_dir = SCRIPT_DIR / "upload"
     upload_dir.mkdir(exist_ok=True)
     try:
         os.startfile(str(upload_dir))
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return _api_error("generic", 500, detail=str(exc), reason=str(exc))
     return jsonify({"ok": True})
 
 
@@ -1050,12 +1120,13 @@ def api_status():
         "api_key_masked":    masked,
         "pixiv_logged_in":   PIXIV_PROFILE_DIR.exists(),
         "civitai_logged_in": CIVITAI_PROFILE_DIR.exists(),
-        "x_logged_in":       (X_DIR / "cookies.json").exists(),
-        "xhs_logged_in":     XHS_PROFILE_DIR.exists(),
-        "xhs_cdp_url":       cfg.get("xhs_cdp_url") or "",
-        "scheduler":         {**_sched_default(), **(cfg.get("scheduler") or {})},
+        "scheduler":         _scheduler_from_config(cfg),
         "llm_reverse_enabled": bool(llm_cfg.get("enabled")),
-        "llm_reverse_configured": bool(llm_cfg.get("base_url") and llm_cfg.get("api_key") and llm_cfg.get("model")),
+        "llm_reverse_configured": bool(
+            llm_cfg.get("api_key")
+            and llm_cfg.get("model")
+            and (llm_cfg.get("base_url") or llm_cfg.get("provider") in {"anthropic", "google_gemini"})
+        ),
         "llm_reverse_model": llm_cfg.get("model", ""),
         "llm_reverse_api_key_masked": llm_masked,
         "censor_preset":      censor_preset,
@@ -1071,8 +1142,7 @@ def api_status():
         "watermark_renderer":  watermark_renderer,
         "watermark_file":      watermark_file,
         "watermark_status":   watermark_status,
-        "upload_defaults":    cfg.get("upload_defaults") or {},
-        "xhs_manual_mode":   bool(cfg.get("xhs_manual_mode")),
+        "upload_defaults":    _upload_defaults_from_config(cfg),
     })
 
 
@@ -1101,6 +1171,8 @@ def _save_haintag_settings(settings: dict) -> None:
             pass
     if isinstance(existing, dict) and "settings" in existing:
         existing["settings"].update(settings)
+    elif isinstance(existing, dict):
+        existing.update(settings)
     else:
         existing = settings
     HAINTAG_SETTINGS_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1196,7 +1268,7 @@ def api_install_pixai_tagger():
                 from huggingface_hub import snapshot_download
             except ImportError:
                 with _pixai_tasks_lock:
-                    _pixai_tasks[task_id] = {"status": "error", "error": "huggingface_hub 未安装，请先 pip install huggingface_hub"}
+                    _pixai_tasks[task_id] = {"status": "error", "error": "huggingface_hub 未安装，请先 pip install huggingface_hub", "error_code": "dependency_missing", "error_params": {"dependency": "huggingface_hub"}}
                 return
             snapshot_download(
                 repo_id="deepghs/pixai-tagger-v0.9-onnx",
@@ -1222,7 +1294,7 @@ def api_install_pixai_tagger_status(task_id):
     with _pixai_tasks_lock:
         state = _pixai_tasks.get(task_id)
     if not state:
-        return jsonify({"error": "not found"}), 404
+        return _api_error("task_not_found", 404, detail="not found")
     return jsonify(state)
 
 
@@ -1241,7 +1313,7 @@ def api_install_cl_tagger():
                 from huggingface_hub import snapshot_download
             except ImportError:
                 with _pixai_tasks_lock:
-                    _pixai_tasks[task_id] = {"status": "error", "error": "huggingface_hub 未安装，请先 pip install huggingface_hub"}
+                    _pixai_tasks[task_id] = {"status": "error", "error": "huggingface_hub 未安装，请先 pip install huggingface_hub", "error_code": "dependency_missing", "error_params": {"dependency": "huggingface_hub"}}
                 return
             snapshot_download(
                 repo_id="SmilingWolf/wd-vit-tagger-v3",
@@ -1267,7 +1339,7 @@ def api_install_cl_tagger_status(task_id):
     with _pixai_tasks_lock:
         state = _pixai_tasks.get(task_id)
     if not state:
-        return jsonify({"error": "not found"}), 404
+        return _api_error("task_not_found", 404, detail="not found")
     return jsonify(state)
 
 
@@ -1275,11 +1347,11 @@ def api_install_cl_tagger_status(task_id):
 def api_pixiv_logout():
     with TASKS_LOCK:
         running_pixiv = any(
-            t.get("status") == "running" and t.get("cmd") in (2, 3)
+            t.get("status") in {"running", "waiting_input"} and t.get("cmd") in (2, 3)
             for t in TASKS.values()
         )
     if running_pixiv:
-        return jsonify({"error": "pixiv task is running"}), 400
+        return _api_error("profile_in_use", detail="pixiv task is running", platform="Pixiv")
     shutil.rmtree(PIXIV_PROFILE_DIR, ignore_errors=True)
     return jsonify({"ok": True})
 
@@ -1288,270 +1360,132 @@ def api_pixiv_logout():
 def api_civitai_logout():
     with TASKS_LOCK:
         running_civitai = any(
-            t.get("status") == "running" and t.get("cmd") in (1, 2)
+            t.get("status") in {"running", "waiting_input"} and t.get("cmd") in (1, 2)
             for t in TASKS.values()
         )
     if running_civitai:
-        return jsonify({"error": "civitai task is running"}), 400
+        return _api_error("profile_in_use", detail="civitai task is running", platform="Civitai")
     shutil.rmtree(CIVITAI_PROFILE_DIR, ignore_errors=True)
     return jsonify({"ok": True})
 
 
 @app.route("/api/pixiv-open-login", methods=["POST"])
 def api_pixiv_open_login():
-    def _launch():
-        try:
-            from patchright.sync_api import sync_playwright
-            with sync_playwright() as pw:
-                context = pw.chromium.launch_persistent_context(
-                    str(PIXIV_PROFILE_DIR),
-                    channel="chrome",
-                    headless=False,
-                    args=["--start-maximized", "--disable-sync", "--no-first-run"],
-                    ignore_default_args=["--enable-automation", "--no-sandbox"],
-                )
-                page = context.pages[0] if context.pages else context.new_page()
-                try:
-                    page.goto("https://www.pixiv.net/", wait_until="commit", timeout=30000)
-                except Exception:
-                    pass
-                deadline = time.time() + 600
-                try:
-                    while context.pages and time.time() < deadline:
-                        time.sleep(1)
-                except Exception:
-                    pass
-                _broadcast_sse("status_update", {"pixiv_logged_in": PIXIV_PROFILE_DIR.exists()})
-        except Exception as exc:
-            import logging as _log
-            _log.getLogger(__name__).warning(f"pixiv login browser: {exc}")
-
-    import threading as _th
-    _th.Thread(target=_launch, daemon=True).start()
+    try:
+        _open_login_browser(PIXIV_PROFILE_DIR, "https://accounts.pixiv.net/login?lang=zh")
+    except Exception as exc:
+        logging.getLogger(__name__).warning(f"pixiv login browser: {exc}")
+        return _api_error("generic", 500, detail=str(exc), reason=str(exc))
     return jsonify({"ok": True})
 
 
 @app.route("/api/civitai-open-login", methods=["POST"])
 def api_civitai_open_login():
-    def _launch():
-        try:
-            from patchright.sync_api import sync_playwright
-            with sync_playwright() as pw:
-                context = pw.chromium.launch_persistent_context(
-                    str(CIVITAI_PROFILE_DIR),
-                    channel="chrome",
-                    headless=False,
-                    args=["--start-maximized", "--disable-sync", "--no-first-run"],
-                    ignore_default_args=["--enable-automation", "--no-sandbox"],
-                )
-                page = context.pages[0] if context.pages else context.new_page()
-                try:
-                    page.goto("https://civitai.com/", wait_until="commit", timeout=30000)
-                except Exception:
-                    pass
-                deadline = time.time() + 600
-                try:
-                    while context.pages and time.time() < deadline:
-                        time.sleep(1)
-                except Exception:
-                    pass
-                _broadcast_sse("status_update", {"civitai_logged_in": CIVITAI_PROFILE_DIR.exists()})
-        except Exception as exc:
-            import logging as _log
-            _log.getLogger(__name__).warning(f"civitai login browser: {exc}")
-
-    import threading as _th
-    _th.Thread(target=_launch, daemon=True).start()
+    try:
+        _open_login_browser(CIVITAI_PROFILE_DIR, "https://civitai.com/login?returnUrl=/")
+    except Exception as exc:
+        logging.getLogger(__name__).warning(f"civitai login browser: {exc}")
+        return _api_error("generic", 500, detail=str(exc), reason=str(exc))
     return jsonify({"ok": True})
 
 
 @app.route("/api/upload-defaults", methods=["GET"])
 def api_upload_defaults_get():
-    return jsonify(_load_config().get("upload_defaults") or {})
+    return jsonify(_upload_defaults_from_config(_load_config()))
 
 
 @app.route("/api/upload-defaults", methods=["POST"])
 def api_upload_defaults_set():
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _api_error("settings_must_be_object", detail="设置内容必须是对象")
     cfg = _load_config()
-    cfg["upload_defaults"] = data
+    current = _upload_defaults_from_config(cfg)
+    merged = {**current, **data}
+    try:
+        if "targets" in data:
+            merged["targets"] = _validate_target_string(data["targets"])
+    except ValueError as exc:
+        return _api_error("invalid_targets", detail=str(exc))
+    cfg["upload_defaults"] = merged
+    cfg["upload_defaults"] = _upload_defaults_from_config(cfg)
     _save_config(cfg)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/x-save-cookies", methods=["POST"])
-def api_x_save_cookies():
-    data = request.get_json(force=True) or {}
-    raw  = data.get("cookies", "")
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            raise ValueError("not a list")
-    except Exception:
-        return jsonify({"error": "不是合法的 JSON 数组"}), 400
-    (X_DIR / "cookies.json").write_text(
-        json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return jsonify({"ok": True})
-
-
-@app.route("/api/x-logout", methods=["POST"])
-def api_x_logout():
-    (X_DIR / "cookies.json").unlink(missing_ok=True)
-    shutil.rmtree(X_PROFILE_DIR, ignore_errors=True)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/xhs-save-cookies", methods=["POST"])
-def api_xhs_save_cookies():
-    data = request.get_json(force=True) or {}
-    raw  = data.get("cookies", "")
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            raise ValueError("not a list")
-    except Exception:
-        return jsonify({"error": "不是合法的 JSON 数组"}), 400
-    (XHS_DIR / "cookies.json").write_text(
-        json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return jsonify({"ok": True})
-
-
-@app.route("/api/xhs-logout", methods=["POST"])
-def api_xhs_logout():
-    (XHS_DIR / "cookies.json").unlink(missing_ok=True)
-    shutil.rmtree(XHS_PROFILE_DIR, ignore_errors=True)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/xhs-open-login", methods=["POST"])
-def api_xhs_open_login():
-    def _launch():
-        try:
-            from patchright.sync_api import sync_playwright
-            from xhs.stealth_scripts import FINGERPRINT_INIT_SCRIPT
-            from xhs.support import (
-                _ensure_chrome_cdp_clean, _DEFAULT_CDP_URL,
-                XHS_PROFILE_DIR as _XHS_PROF,
-            )
-            from civitai_splitter import load_app_config
-            cdp_url = load_app_config().get("xhs_cdp_url") or _DEFAULT_CDP_URL
-            _ensure_chrome_cdp_clean(cdp_url, _XHS_PROF)
-            with sync_playwright() as pw:
-                browser = pw.chromium.connect_over_cdp(cdp_url)
-                context = browser.contexts[0] if browser.contexts else None
-                if not context:
-                    raise RuntimeError("CDP 连接成功但没有 context")
-                context.add_init_script(FINGERPRINT_INIT_SCRIPT)
-                page = context.new_page()
-                try:
-                    page.goto("https://www.xiaohongshu.com/", wait_until="commit", timeout=30000)
-                except Exception:
-                    pass
-                deadline = time.time() + 600
-                try:
-                    while not page.is_closed() and time.time() < deadline:
-                        time.sleep(1)
-                except Exception:
-                    pass
-                try:
-                    if not page.is_closed():
-                        page.close()
-                except Exception:
-                    pass
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-                _broadcast_sse("status_update", {"xhs_logged_in": True})
-        except Exception as exc:
-            import logging as _log
-            _log.getLogger(__name__).warning(f"xhs login browser: {exc}")
-
-    import threading as _th
-    _th.Thread(target=_launch, daemon=True).start()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/xhs-manual-done", methods=["POST"])
-def api_xhs_manual_done():
-    data = request.get_json(force=True) or {}
-    mp = data.get("manifest_path", "")
-    if not mp:
-        return jsonify({"error": "missing manifest_path"}), 400
-    mp = Path(mp)
-    if not mp.exists():
-        return jsonify({"error": "manifest not found"}), 404
-    try:
-        manifest = json.loads(mp.read_text(encoding="utf-8"))
-        manifest["status_by_target"]["xhs"] = "success"
-        mp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        all_done = all(
-            s in {"success", "skipped_already_done", "skipped_civitai_safety", "maybe_posted", "skipped_max_age"}
-            for s in manifest["status_by_target"].values()
-        )
-        for p in manifest.get("xhs", {}).get("clean_copy_paths", []):
-            try:
-                Path(p).unlink(missing_ok=True)
-            except Exception:
-                pass
-        moved = ""
-        if all_done:
-            src = Path(manifest.get("source_path", ""))
-            if src.exists():
-                from civitai_splitter import move_to_done
-                dest = move_to_done(src)
-                moved = str(dest)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-    log_msg = "xhs 手动发布已确认"
-    if moved:
-        log_msg += "，已移入 done/"
-    _broadcast_sse("log", {"t": datetime.now().strftime("%H:%M:%S.%f")[:12], "lvl": "OK", "src": "xhs", "msg": log_msg})
-    return jsonify({"ok": True, "moved_to_done": moved})
-
-
-@app.route("/xhs_out/<path:filename>")
-def serve_xhs_out(filename):
-    return send_from_directory(SCRIPT_DIR / "xhs_out", filename)
-
-
-@app.route("/api/pin-window", methods=["POST"])
-def api_pin_window():
-    title_sub = (request.get_json(force=True) or {}).get("title", "")
-    if not title_sub or sys.platform != "win32":
-        return jsonify({"ok": False, "error": "not supported"}), 400
-    try:
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        HWND_TOPMOST = wintypes.HWND(-1)
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        found = []
-        def _cb(hwnd, _lp):
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length:
-                buf = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buf, length + 1)
-                if title_sub in buf.value:
-                    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
-                    found.append(buf.value)
-            return True
-        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        user32.EnumWindows(WNDENUMPROC(_cb), 0)
-        return jsonify({"ok": bool(found), "pinned": found})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "upload_defaults": cfg["upload_defaults"]})
 
 
 def _sched_default() -> dict:
-    return {"enabled": False, "targets": "civitai,pixiv", "count": 1, "sort": "random",
-            "min_hours": 0.4, "max_hours": 0.8, "next_fire_at": None,
-            "llm_reverse": False, "llm_persona": "", "llm_account": "", "llm_content_mode": "",
-            "xhs_llm_persona": "", "xhs_llm_content_mode": "",
-            "ai_tags_by_platform": {"pixiv": True, "x": True, "xhs": True}}
+    return {
+        "enabled": False,
+        "targets": "civitai,pixiv",
+        "count": 1,
+        "sort": "random",
+        "min_hours": 0.4,
+        "max_hours": 0.8,
+        "next_fire_at": None,
+        "llm_reverse": False,
+        "llm_persona": "",
+        "llm_content_mode": "",
+        "ai_tags_by_platform": {"pixiv": True},
+    }
+
+
+def _target_ids(value: object) -> list[str]:
+    values = value if isinstance(value, (list, tuple, set)) else str(value or "").split(",")
+    requested = [str(item).strip().lower() for item in values if str(item).strip()]
+    return list(dict.fromkeys(requested))
+
+
+def _normalize_target_string(value: object) -> str:
+    targets = [item for item in _target_ids(value) if item in {"civitai", "pixiv"}]
+    return ",".join(targets) or "civitai,pixiv"
+
+
+def _validate_target_string(value: object) -> str:
+    requested = _target_ids(value)
+    unsupported = [item for item in requested if item not in {"civitai", "pixiv"}]
+    if unsupported:
+        raise ValueError(f"不支持的发布平台：{', '.join(unsupported)}")
+    if not requested:
+        raise ValueError("至少选择一个发布平台")
+    return ",".join(requested)
+
+
+def _target_label(value: object) -> str:
+    targets = _target_ids(value)
+    return " + ".join("Civitai" if item == "civitai" else "Pixiv" for item in targets)
+
+
+def _upload_defaults_from_config(cfg: dict) -> dict:
+    raw = cfg.get("upload_defaults") if isinstance(cfg.get("upload_defaults"), dict) else {}
+    sort_mode = str(raw.get("sort", raw.get("sort_mode", "time_desc")))
+    if sort_mode not in {"random", "manual", "name_asc", "name_desc", "time_asc", "time_desc"}:
+        sort_mode = "time_desc"
+    content_mode = str(raw.get("llm_content_mode", ""))
+    if content_mode not in {"", "sfw", "nsfw"}:
+        content_mode = ""
+    ai_tags = raw.get("ai_tags_by_platform")
+    return {
+        "targets": _normalize_target_string(raw.get("targets", "civitai,pixiv")),
+        "sort": sort_mode,
+        "llm_reverse": bool(raw.get("llm_reverse", False)),
+        "llm_persona": str(raw.get("llm_persona", "")),
+        "llm_content_mode": content_mode,
+        "ai_tags_by_platform": {
+            "pixiv": bool(ai_tags.get("pixiv", True)) if isinstance(ai_tags, dict) else True,
+        },
+    }
+
+
+def _scheduler_from_config(cfg: dict) -> dict:
+    defaults = _sched_default()
+    stored = cfg.get("scheduler") if isinstance(cfg.get("scheduler"), dict) else {}
+    sched = {key: stored.get(key, value) for key, value in defaults.items()}
+    sched["targets"] = _normalize_target_string(sched["targets"])
+    ai_tags = sched.get("ai_tags_by_platform")
+    sched["ai_tags_by_platform"] = {
+        "pixiv": bool(ai_tags.get("pixiv", True)) if isinstance(ai_tags, dict) else True
+    }
+    return sched
 
 
 def _broadcast_scheduler(sched: dict) -> None:
@@ -1560,7 +1494,7 @@ def _broadcast_scheduler(sched: dict) -> None:
 
 def _arm_scheduler(cfg: dict) -> None:
     global _scheduler_timer
-    sched = {**_sched_default(), **(cfg.get("scheduler") or {})}
+    sched = _scheduler_from_config(cfg)
     with _scheduler_lock:
         if _scheduler_timer is not None:
             _scheduler_timer.cancel()
@@ -1595,11 +1529,11 @@ def _scheduler_fire() -> None:
     with _scheduler_lock:
         _scheduler_timer = None
     cfg = _load_config()
-    sched = {**_sched_default(), **(cfg.get("scheduler") or {})}
+    sched = _scheduler_from_config(cfg)
     if not sched.get("enabled"):
         return
     with TASKS_LOCK:
-        any_running = any(t.get("status") in ("running", "queued") for t in TASKS.values())
+        any_running = any(t.get("status") in ("running", "queued", "waiting_input") for t in TASKS.values())
     upload_dir = SCRIPT_DIR / "upload"
     img_exts = {'.jpg', '.jpeg', '.png', '.webp'}
     has_images = upload_dir.exists() and any(
@@ -1618,30 +1552,14 @@ def _scheduler_fire() -> None:
             "count": count, "files": [], "targets": targets_str, "sort": sort_mode,
             "llm_reverse": bool(sched.get("llm_reverse")),
             "llm_persona": sched.get("llm_persona", ""),
-            "llm_account": sched.get("llm_account", ""),
             "llm_content_mode": sched.get("llm_content_mode", ""),
             "ai_tags_by_platform": sched.get("ai_tags_by_platform") or {},
         }
-        xhs_persona = sched.get("xhs_llm_persona", "")
-        xhs_mode = sched.get("xhs_llm_content_mode", "") or sched.get("llm_content_mode", "sfw")
-        if xhs_persona and "xhs" in targets_str.lower():
-            from civitai_splitter import PLATFORM_RULES
-            copy_platforms = [t.strip() for t in targets_str.split(",")
-                              if PLATFORM_RULES.get(t.strip(), {}).get("needs_copy")]
-            params["llm_personas_by_platform"] = {
-                t: (xhs_persona if t == "xhs" else sched.get("llm_persona", ""))
-                for t in copy_platforms
-            }
-            params["llm_content_modes_by_platform"] = {
-                t: (xhs_mode if t == "xhs" else sched.get("llm_content_mode", "sfw"))
-                for t in copy_platforms
-            }
         task_id = uuid.uuid4().hex[:8]
-        label, target = CMD_LABELS[cmd]
         task = {
-            "id": task_id, "title": f"{label} (auto)",
-            "status": "queued", "progress": 0.0, "target": target,
-            "count": "—", "eta": "—", "cmd": cmd,
+            "id": task_id, "title": f"自动发布 {count} 张图片",
+            "status": "queued", "progress": 0.0, "target": _target_label(targets_str),
+            "count": "—", "current": 0, "total": count, "eta": "—", "cmd": cmd, "params": params,
             "cancel_flag": False, "cancel_event": threading.Event(),
             "created_at": datetime.now().strftime("%H:%M:%S"),
             "log_lines": [], "pending_input": None, "thread": None,
@@ -1664,37 +1582,38 @@ def api_shutdown():
 
 @app.route("/api/scheduler", methods=["POST"])
 def api_scheduler():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _api_error("settings_must_be_object", detail="设置内容必须是对象")
     cfg = _load_config()
-    sched = {**_sched_default(), **(cfg.get("scheduler") or {})}
-    if "enabled" in body:
-        sched["enabled"] = bool(body["enabled"])
-    if "min_hours" in body:
-        sched["min_hours"] = max(0.001, float(body["min_hours"]))
-    if "max_hours" in body:
-        sched["max_hours"] = max(0.001, float(body["max_hours"]))
-    if "count" in body:
-        sched["count"] = max(1, int(body["count"]))
-    if "targets" in body:
-        sched["targets"] = body["targets"]
+    sched = _scheduler_from_config(cfg)
+    try:
+        if "enabled" in body:
+            sched["enabled"] = bool(body["enabled"])
+        if "min_hours" in body:
+            sched["min_hours"] = max(0.001, float(body["min_hours"]))
+        if "max_hours" in body:
+            sched["max_hours"] = max(0.001, float(body["max_hours"]))
+        if "count" in body:
+            sched["count"] = max(1, min(100, int(body["count"])))
+        if "targets" in body:
+            sched["targets"] = _validate_target_string(body["targets"])
+    except (TypeError, ValueError) as exc:
+        return _api_error("invalid_scheduler", detail=str(exc) or "定时发布参数无效")
     if "sort" in body:
         sched["sort"] = body["sort"] if body["sort"] in ("random", "name_asc", "name_desc", "time_asc", "time_desc") else "random"
     if "llm_reverse" in body:
         sched["llm_reverse"] = bool(body["llm_reverse"])
     if "llm_persona" in body:
         sched["llm_persona"] = str(body["llm_persona"])
-    if "llm_account" in body:
-        sched["llm_account"] = str(body["llm_account"])
     if "llm_content_mode" in body:
         sched["llm_content_mode"] = body["llm_content_mode"] if body["llm_content_mode"] in ("sfw", "nsfw", "") else ""
-    if "xhs_llm_persona" in body:
-        sched["xhs_llm_persona"] = str(body["xhs_llm_persona"])
-    if "xhs_llm_content_mode" in body:
-        sched["xhs_llm_content_mode"] = body["xhs_llm_content_mode"] if body["xhs_llm_content_mode"] in ("sfw", "nsfw", "") else ""
     if "ai_tags_by_platform" in body and isinstance(body["ai_tags_by_platform"], dict):
-        sched["ai_tags_by_platform"] = {k: bool(v) for k, v in body["ai_tags_by_platform"].items() if k in ("pixiv", "x", "xhs")}
+        sched["ai_tags_by_platform"] = {"pixiv": bool(body["ai_tags_by_platform"].get("pixiv", True))}
+    if "pixiv" not in _target_ids(sched["targets"]):
+        sched["llm_reverse"] = False
     if sched.get("min_hours", 1.0) > sched.get("max_hours", 3.0):
-        return jsonify({"error": "min_hours > max_hours"}), 400
+        return _api_error("invalid_interval", detail="min_hours > max_hours")
     if any(k in body for k in ("enabled", "min_hours", "max_hours")):
         sched["next_fire_at"] = None
     cfg["scheduler"] = sched
@@ -1739,7 +1658,7 @@ def api_stream():
 
         for snap in all_tasks:
             yield f"event: task_update\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
-        yield f"event: scheduler_update\ndata: {json.dumps({**_sched_default(), **(_load_config().get('scheduler') or {})}, ensure_ascii=False)}\n\n"
+        yield f"event: scheduler_update\ndata: {json.dumps(_scheduler_from_config(_load_config()), ensure_ascii=False)}\n\n"
         for entry in recent_logs[-50:]:
             yield f"event: log\ndata: {json.dumps(entry, ensure_ascii=False)}\n\n"
         for pi in pending_inputs:

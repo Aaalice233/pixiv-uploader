@@ -20,7 +20,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from PIL import Image
 
-log = logging.getLogger("civitai_splitter")
+log = logging.getLogger("pixiv_uploader")
 
 PIXIV_BASE = "https://www.pixiv.net"
 PIXIV_UPLOAD_URL = f"{PIXIV_BASE}/upload.php"
@@ -1686,7 +1686,7 @@ def _fetch_danbooru_jp_alias(tag: str, strict_kana: bool = False) -> str | None:
     try:
         with httpx.Client(
             timeout=10,
-            headers={"User-Agent": "civitai-post-splitter/1.0 (personal use)"},
+            headers={"User-Agent": "pixiv-uploader/1.0 (personal use)"},
         ) as client:
             url = f"{DANBOORU_BASE}/wiki_pages.json"
             resp = client.get(url, params={"search[title]": tag, "limit": 1})
@@ -1787,6 +1787,34 @@ def _fetch_pixiv_tag_canonical_via_page(page, tag: str) -> str | None:
     return _extract_canonical_from_pixpedia(body, tag)
 
 
+def _fetch_pixiv_tag_canonical_via_http(tag: str) -> str | None:
+    if not tag or not tag.strip():
+        return None
+    url = f"{PIXIV_BASE}/ajax/search/tags/{quote(tag, safe='')}?lang=ja"
+    try:
+        response = httpx.get(
+            url,
+            timeout=8.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": f"{PIXIV_BASE}/",
+                "Accept-Language": "ja,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("error"):
+        return None
+    body = payload.get("body") or {}
+    if not isinstance(body, dict):
+        return None
+    return _extract_canonical_from_pixpedia(body, tag)
+
+
 def lookup_jp_alias(
     tag: str,
     cache: dict[str, Any],
@@ -1847,6 +1875,10 @@ def lookup_jp_alias(
     found = None
     if page is not None:
         found = _fetch_pixiv_tag_canonical_via_page(page, key)
+    if not found:
+        # This endpoint is public. Keeping preprocessing independent from the
+        # visible browser lets the upload window open only when form work starts.
+        found = _fetch_pixiv_tag_canonical_via_http(key)
     if not found and wiki_strict_kana is not None:
         found = _fetch_danbooru_jp_alias(key, strict_kana=wiki_strict_kana)
     cache[key] = found if found else ""
@@ -2338,23 +2370,56 @@ def create_rule_fit_report_path(report_dir: Path, stem: str = "summary") -> Path
     return report_dir / f"{now_stamp()}_{safe_stem(stem)}.json"
 
 
+def _profile_cdp_endpoint(profile_dir: Path) -> str | None:
+    active_port_file = profile_dir / "DevToolsActivePort"
+    try:
+        port = int(active_port_file.read_text(encoding="utf-8").splitlines()[0])
+        endpoint = f"http://127.0.0.1:{port}"
+        response = httpx.get(f"{endpoint}/json/version", timeout=1.5)
+        if response.status_code == 200:
+            return endpoint
+    except (FileNotFoundError, IndexError, OSError, ValueError, httpx.HTTPError):
+        pass
+    return None
+
+
 def open_pixiv_browser(pw, profile_dir: Path | None = None):
     target_profile = profile_dir or PIXIV_PROFILE_DIR
-    context = pw.chromium.launch_persistent_context(
-        str(target_profile),
-        channel="chrome",
-        headless=False,
-        args=[
-            "--start-minimized",
-            "--disable-sync",
-            "--no-first-run",
-        ],
-        ignore_default_args=["--enable-automation", "--no-sandbox"],
-    )
-    page = context.pages[0] if context.pages else context.new_page()
-    page.set_viewport_size({"width": 1920, "height": 1080})
+    cdp_endpoint = _profile_cdp_endpoint(target_profile)
+    if cdp_endpoint:
+        # The account-login window owns the profile lock, so attach to that
+        # browser instead of starting a second Chrome process with the same profile.
+        browser = pw.chromium.connect_over_cdp(cdp_endpoint)
+        if not browser.contexts:
+            raise RuntimeError("Pixiv login browser has no usable context")
+        context = browser.contexts[0]
+        page = next(
+            (candidate for candidate in reversed(context.pages) if "pixiv.net" in candidate.url),
+            context.pages[0] if context.pages else context.new_page(),
+        )
+        log.info("Pixiv: 已接管现有登录浏览器")
+    else:
+        try:
+            context = pw.chromium.launch_persistent_context(
+                str(target_profile),
+                channel="chrome",
+                headless=False,
+                args=[
+                    "--start-minimized",
+                    "--disable-sync",
+                    "--no-first-run",
+                ],
+                ignore_default_args=["--enable-automation", "--no-sandbox"],
+            )
+        except Exception as exc:
+            if target_profile == PIXIV_PROFILE_DIR:
+                raise RuntimeError(
+                    "无法启动 Pixiv 自动化浏览器；请关闭占用该账号配置的 Chrome 窗口后重试"
+                ) from exc
+            raise
+        page = context.pages[0] if context.pages else context.new_page()
     try:
-        page.goto("https://www.pixiv.net/", wait_until="commit", timeout=15000)
+        page.set_viewport_size({"width": 1920, "height": 1080})
     except Exception:
         pass
     return context, page

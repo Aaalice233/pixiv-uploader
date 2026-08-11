@@ -1,14 +1,14 @@
-# civitai-post-splitter — 开发笔记
+# Pixiv Uploader — 开发笔记
 
 ## 项目是什么
 
-把 `upload/` 里的图片自动重发到 **Civitai / Pixiv / X (Twitter) / 小红书 (xhs)**。核心流程：
+把 `upload/` 里的图片发布到 **Civitai / Pixiv**。核心流程：
 
 1. 从 `upload/` 选图
 2. 读取图片 metadata（ComfyUI / A1111 prompt、LoRA token 等）
 3. 用 PixAI / WD14 tagger、metadata 实体提取和映射表构建 Pixiv 标题、说明、tag、年龄分级、原创/二创判断
-4. 各平台按 `PLATFORM_RULES` 表决定是否走 sanitize / censor / LLM 反推
-5. 按目标平台打开浏览器并提交（civitai/pixiv/x/xhs 各自独立 Playwright profile）
+4. 按 `PLATFORM_RULES` 判断是否走 Pixiv sanitize / censor / LLM 文案
+5. 通过各自独立的浏览器 profile 登录并提交 Civitai / Pixiv
 6. 写 manifest，成功后把图片移到 `done/`
 
 入口：
@@ -26,6 +26,8 @@
 
 `config.json` 是本机私有运行配置，可能包含 API key 和 scheduler 状态，不提交。
 
+修改 `frontend/flow-app.jsx` 后执行 `npm run check:frontend`：先校验中英文语言包键值、插值变量、静态引用和遗漏的中文 JSX，再更新 `frontend/dist/flow-app.js`。React 与 ReactDOM 会打进生产 bundle，Web UI 不依赖 CDN 脚本才能启动。用户可见固定文案必须写入 `frontend/locales.js`，组件通过 `frontend/i18n.jsx` 的 `useI18n()` 读取；不要在组件或 API 判断中硬编码中文。语言偏好使用 `flow-locale-v1` 持久化，浏览器首次打开时按系统语言自动选择。
+
 ---
 
 ## 主要文件
@@ -33,28 +35,20 @@
 ```
 civitai_splitter.py       主命令入口，拆图 / 上传 / rule-fit 命令
 web_server.py             Web UI 后端、SSE、任务队列、scheduler
-watermark.py              文字水印配置、字体格式注册、字体文件存储、渲染服务
+watermark.py              图文水印配置、资源存储、格式注册与渲染服务
 launcher.py               CLI 菜单、账号切换、scheduler 配置
 civitai_safety.json       Civitai 安全跳过规则
 CHANGELOG.md              变更记录
 
 frontend/
-  mono-single.jsx         Web UI 源文件
-  standalone.html         打包后的单文件 Web UI
-
-x/
-  support.py              X (Twitter) 发布：build_x_payload, create_x_post (Playwright)
-  x_templates.json        模板（jp/en/zh × sfw/nsfw 6 套），每个含 core + social tag
-  x_settings.json         tag_limit=2, default_template=en_sfw, 其他超时/重编码
-  cookies.json            Cookie-Editor JSON 导入（auth_token + ct0）；.gitignore
-
-xhs/
-  support.py              小红书发布：build_xhs_payload, create_xhs_post (Playwright)
-                          - 话题输入走 dropdown 选取（手打纯文本 # 不进算法）
-                          - 自动勾 AI 合成声明 checkbox（GB45438-2025 强制）
-  xhs_templates.json      默认模板（core=#AI绘画, social=#治愈系插画）
-  xhs_settings.json       tag_limit=5, AI 标签 #AI创作 自动追加
-  cookies.json            同 X，.gitignore
+  flow-app.jsx            Web UI React 源码
+  flow.css                应用布局、主题和响应式样式
+  i18n.jsx                locale 检测、持久化、翻译与格式化运行时
+  locales.js              简体中文 / English 语言包与完整性校验
+  index.html              Web UI 入口
+  dist/flow-app.js        esbuild 生产构建产物
+scripts/
+  check-i18n.mjs          语言包与组件静态文案检查
 
 pixiv/
   support.py              Pixiv 核心函数：tag 构建、浏览器操作、rule-fit
@@ -176,55 +170,42 @@ metadata reader（读 prompt / LoRA 信息）走独立路径：haintag 存在用
 
 ## 平台规则表 (PLATFORM_RULES)
 
-`civitai_splitter.py` 模块级常量。每个 target 声明四个属性：
+`civitai_splitter.py` 模块级常量。发布目标只允许 `civitai` 和 `pixiv`：
 
-| 平台 | needs_sanitize | needs_censor | needs_copy | max_age |
-|------|:-:|:-:|:-:|:-:|
-| civitai | ✗ | ✗ | ✗ | r18g |
-| pixiv   | ✓ | ✓ | ✓ | r18g |
-| x       | ✓ | ✓ | ✓ | r18g |
-| xhs     | ✓ | ✓ | ✓ | **all_ages** |
+| 平台 | needs_sanitize | needs_censor | needs_copy |
+|------|:-:|:-:|:-:|
+| civitai | ✗ | ✗ | ✗ |
+| pixiv   | ✓ | ✓ | ✓ |
 
-- `needs_sanitize`: PIL re-encode 去除 EXIF / PNG text chunks（a1111 prompt 等）
+- `needs_sanitize`: PIL re-encode 去除 EXIF / PNG text chunks（A1111 prompt 等）
 - `needs_censor`: 跑 auto_censor 自动打码模型
-- `needs_copy`: 消费 LLM 反推产出的标题/简介（驱动 `_targets_need_copy`）
-- `max_age`: 该平台允许的最高 NSFW 等级。`xhs.max_age = all_ages` 意味着 r18/r18g 图自动从 targets 剔除并标 `skipped_max_age`，**用户即使在 UI 勾选也不发**
+- `needs_copy`: 消费 LLM 反推产出的 Pixiv 标题/简介
 
-`needs_sanitize` / `needs_censor` 由 `any(rule for t in targets)` 聚合——只要有一个平台需要就跑，结果共享。`sanitized_artifact` 路径作为 X/xhs 的图源（继承打码）。
+CLI、Web API、Scheduler 和配置归一化共用同一双平台边界；未知目标会在任务启动前返回明确错误，不做静默兼容。
 
 ---
 
-## manifest.copy 通用文案区
+## Pixiv manifest 文案
 
-LLM 反推产出存进 `manifest.copy`，分两层：
+LLM 结果直接投影到 `manifest.pixiv`，不再保留跨站点通用文案层：
 
-**通用区**（pixiv / x 读这里）：
 ```jsonc
-"copy": {
-  "title":   {"ja": "", "en": "", "zh": ""},
-  "caption": {"ja": "", "en": "", "zh": ""},
-  "xhs":     {"title": "", "body": "", "tags": []},   // xhs 细分区
+"pixiv": {
+  "title_ja": "...",
+  "caption_ja": "...",
+  "title_zh": "...",
+  "caption_zh": "...",
   "llm_reverse": {
-    "status": "ok|skipped_no_target_needs|skipped_nsfw_exceeds_account|disabled|failed",
-    "persona_id": "...", "account_id": "...",
-    "platform": "pixiv,xhs",   // 逗号分隔，记录所有生成了文案的平台
+    "status": "ok|disabled|failed|skipped_no_target_needs|skipped_content_mode",
+    "persona_id": "...",
+    "platform": "pixiv",
     "content_mode": "sfw|nsfw",
     "error": ""
   }
 }
 ```
 
-**读取优先级**：
-- pixiv → `copy.title.ja/zh`, `copy.caption.ja/zh`
-- x → `copy.caption.en`
-- xhs → 优先 `copy.xhs.title/body`，为空再回落 `copy.title.zh/caption.zh`
-
-Pixiv 模块同时保留 `manifest.pixiv.title_ja` 等老字段作快照，向后兼容现有 pixiv-only 工具链。
-
-`apply_llm_result_to_copy_block(copy, result, platform, account_id)` 按 platform（字符串或列表）把 LLM fields 映射到 copy 区：
-- pixiv: `title_ja/zh + caption_ja/zh` → 通用区
-- x: `tweet` → `copy.caption.en`
-- xhs: `xhs_title + xhs_body + xhs_tags` → `copy.xhs`（细分区，不覆盖 pixiv 的 zh 内容）
+`apply_llm_result_to_pixiv_payload()` 只接受 Pixiv 文案字段，并在成功时覆盖规则生成的标题与简介。
 
 ---
 
@@ -235,19 +216,18 @@ LLM reverse 是文案增强层。它只生成 `title_*`、`caption_*`，不接�
 配置保存在本地私有 `config.json.llm_reverse`：
 
 - `base_url` / `api_key` / `model`：OpenAI 兼容视觉接口。
-- `personas`：控制语言、标题风格、简介风格、SFW/NSFW prompt。
-  - `platform`：字符串数组（如 `["pixiv", "xhs"]`），决定模型输出哪些字段。多选时一次 LLM 调用生成所有平台的文案，结果写入对应 copy 区。旧格式单字符串在读取时自动迁移为单元素数组。
-- `accounts`：绑定平台、默认 persona、默认 `content_mode`、允许的内容模式、**`max_nsfw_level`** (sfw/r18/r18g)。
-- `content_mode=sfw`：给只能发 SFW 的平台或账号用。
+- `personas`：Pixiv 文案人设，控制标题风格、简介风格和 SFW/NSFW prompt；`platform` 固定为 `pixiv`。
+- `default_persona_id`：上传时未显式指定人设时使用。
+- `default_content_mode`：默认内容模式。
+- `content_mode=sfw`：只生成全年龄文案；R-18/R-18G 图片会跳过反推并记录 `skipped_content_mode`。
 - `content_mode=nsfw`：允许成人向文案；实际能否生成取决于接入的 LLM 服务。
-- **NSFW 能力门禁**：图的 `age_restriction` 超过 account 的 `max_nsfw_level` → 跳过反推，写 `status=skipped_nsfw_exceeds_account`。避免让 sfw-only provider 处理 NSFW 图触发拒答或编造。
 
 硬规则：LLM 文案不写政治、国家政治、政府、政党、意识形态、战争、领土争议、现实国家冲突等内容。命中时 manifest 记录 `political_blocked`，上传继续走原有 fallback。
 
 Manifest 的 `pixiv.llm_reverse` 会记录：
 
-- `status`: `ok` / `disabled` / `failed` / `political_blocked`
-- `persona_id` / `account_id` / `content_mode`
+- `status`: `ok` / `disabled` / `failed` / `political_blocked` / `skipped_content_mode`
+- `persona_id` / `content_mode`
 - 生成的标题、简介、keywords
 - 不含 API key 的错误摘要
 
@@ -255,11 +235,11 @@ Manifest 的 `pixiv.llm_reverse` 会记录：
 
 ```powershell
 python -m py_compile civitai_splitter.py web_server.py pixiv/support.py pixiv/llm_reverse.py
-python civitai_splitter.py upload --targets pixiv --count 1 --dry-run --llm-reverse --llm-persona pixiv_soft --llm-account pixiv_main --llm-content-mode sfw
-python civitai_splitter.py upload --targets pixiv --count 1 --dry-run --llm-reverse --llm-persona pixiv_soft --llm-account pixiv_main --llm-content-mode nsfw
+python civitai_splitter.py upload --targets pixiv --count 1 --dry-run --llm-reverse --llm-persona pixiv_soft --llm-content-mode sfw
+python civitai_splitter.py upload --targets pixiv --count 1 --dry-run --llm-reverse --llm-persona pixiv_soft --llm-content-mode nsfw
 ```
 
-Web UI 入口：Settings → `LLM reverse` Configure；上传弹窗里勾选 `LLM 标题/简介`。
+Web UI 入口：设置 → `LLM 文案`；创建发布任务时可切换 `生成标题与简介`。
 
 ---
 
@@ -321,22 +301,23 @@ Web UI 打开 `/api/stream` 建立 SSE 连接。页面关闭时前端会用 `nav
 
 Web UI Settings 区有下拉切换；切换走 `/api/censor-preset`，写入 censor.json 时同时改 `preset` 字段和 `enabled_classes` 列表。`cmd_upload` 读 `enabled_classes`（向后兼容），所以无需重启 Web 服务即可生效。
 
-默认 `japan`（Pixiv 标准），对齐 X 算法对 NSFW 内容的"打码版进推荐流概率显著高于不打码"的实测（参见 CHANGELOG）。Preset ID `japan` 是历史名（最初按日本刑法 175 条命名），实际语义就是 Pixiv 平台合规线，UI 显示已校正。
+默认 `japan`（Pixiv 标准）。Preset ID `japan` 来自日本刑法 175 条语境，实际语义就是 Pixiv 平台合规线。
 
 ---
 
-## 文字水印
+## 图文水印
 
-水印只作用于 `sanitize_image_for_pixiv` 生成的无 metadata 副本：打码和 LLM 图片分析完成后，写入该副本，再由 Pixiv / X / 小红书继续使用。`upload/` 原图、Civitai 保留 metadata 的副本和 `split` 流程不经过水印服务。
+水印只作用于 `sanitize_image_for_pixiv` 生成的无 metadata 副本：打码和 LLM 图片分析完成后写入该副本，再由 Pixiv 使用。`upload/` 原图、Civitai 保留 metadata 的副本和 `split` 流程不经过水印服务。
 
-配置在根目录 `watermark.json`，导入字体在 `watermark_fonts/`；两者都是本机状态，不提交。
+配置在根目录 `watermark.json`，导入字体与图片分别在 `watermark_fonts/`、`watermark_images/`；三者都是本机状态，不提交。删除正在引用的资源时，服务会清理引用并禁用无效配置。
 
 接口分层：
 
-- `WatermarkService`：读取/校验配置、管理字体文件、调用渲染器；上传主流程只依赖这个接口。
-- `WatermarkRendererRegistry`：按 `renderer` 字段分派渲染器；当前注册 `text`，新增二维码或图像水印时在这里注册新渲染器。
+- `WatermarkService`：读取/校验配置、管理字体和图片资源、调用渲染器；上传主流程只依赖这个接口。
+- `WatermarkRendererRegistry`：按 `renderer` 字段分派渲染器；当前注册 `text` 和 `image`，新增二维码等类型时继续通过注册表扩展。
 - `FontFormatRegistry`：按字体扩展名分派加载器；当前由 Pillow 处理 `.ttf`、`.otf`、`.ttc`、`.otc`，新增格式时增加处理器，不改上传管线。
-- `TextWatermarkRenderer`：只重写像素，不复制 PNG text / EXIF 等 metadata。
+- `TextWatermarkRenderer`：处理文字、字体、颜色和描边；只重写像素，不复制 PNG text / EXIF 等 metadata。
+- `WatermarkImageStore` / `ImageWatermarkRenderer`：校验并存储 PNG、JPEG、WebP，合成时保留图片 alpha 通道。
 
 ---
 
@@ -386,18 +367,13 @@ rule-fit 是给 Pixiv tag 规则调参用的对照流程。
 | `_select_by_sort` | `civitai_splitter.py` | 按排序规则从 upload/ 取前 N 张 |
 | `PixAITaggerBridge` | `pixiv/pixai_tagger.py` | PixAI v0.9 ONNX tagger bridge |
 | `_make_bridges` | `civitai_splitter.py` | metadata reader + tagger bridge 工厂，PixAI→CL→None 优先链 |
-| `build_x_payload` | `x/support.py` | 构 X 推文 payload（tag/text/sensitive 标记） |
-| `create_x_post` | `x/support.py` | Playwright 发 X 推（Ctrl+Enter 快捷键 + force-click fallback） |
-| `pick_x_tags` | `x/support.py` | X tag 选择器（entity + template.core 或 template.core + template.social） |
-| `build_xhs_payload` | `xhs/support.py` | 构小红书笔记 payload |
-| `create_xhs_post` | `xhs/support.py` | Playwright 发小红书（话题走 dropdown，AI 声明 checkbox） |
-| `apply_llm_result_to_copy_block` | `pixiv/llm_reverse.py` | LLM 反推 → manifest.copy 通用区 |
-| `account_can_handle_age` | `pixiv/llm_reverse.py` | LLM account NSFW 能力 vs 图分级比对 |
-| `WatermarkService` | `watermark.py` | 水印配置、字体库存储和渲染入口 |
+| `apply_llm_result_to_pixiv_payload` | `pixiv/llm_reverse.py` | LLM 结果写入 Pixiv payload |
+| `content_mode_can_handle_age` | `pixiv/llm_reverse.py` | 文案模式与图片分级门禁 |
+| `WatermarkService` | `watermark.py` | 图文水印配置、资源存储和渲染入口 |
 | `WatermarkRendererRegistry` | `watermark.py` | 水印渲染器注册表；按 renderer 分派 |
+| `WatermarkImageStore` | `watermark.py` | 图片水印校验、容量限制与本地存储 |
 | `FontFormatRegistry` | `watermark.py` | 字体格式加载器注册表；按扩展名分派 |
-| `_platform_accepts_age` | `civitai_splitter.py` | 平台 max_age 硬规则（小红书 NSFW 拦截）|
-| `_targets_need_copy` | `civitai_splitter.py` | 任一 target 需要文案则触发 LLM |
+| `_targets_need_copy` | `civitai_splitter.py` | Pixiv target 存在时触发 LLM |
 
 ---
 
@@ -423,11 +399,9 @@ rule-fit 是给 Pixiv tag 规则调参用的对照流程。
 
 - Pixiv profile：`~/.civitai_splitter_pixiv_chrome`
 - Civitai profile：`~/.civitai_splitter_chrome`
-- X profile：`~/.civitai_splitter_x_chrome`
-- 小红书 profile：`~/.civitai_splitter_xhs_chrome`
 - Pixiv rule-fit profile：`~/.civitai_splitter_pixiv_rule_fit_chrome`
 
-X 和小红书额外支持 `cookies.json` 导入：从普通 Chrome 用 Cookie-Editor 扩展导出 JSON 数组放在 `x/cookies.json` 或 `xhs/cookies.json`，启动时自动注入到 Playwright context（绕过 Google 登录被自动化浏览器拒的问题）。两个 cookies.json 都在 `.gitignore` 里——auth_token + ct0 等于账号完全访问权，绝不能 commit。
+Web UI 的设置页可登录或清除 Civitai / Pixiv profile；状态以 profile 目录是否存在为准。
 
 launcher 菜单 `[7]` 会清除 Pixiv profile 并立即打开登录页。`[8]` 同理处理 Civitai。
 

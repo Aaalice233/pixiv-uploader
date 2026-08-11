@@ -6,11 +6,11 @@ __pycache__/
 # Personal upload history & queues
 done/
 upload/
-xhs_upload/
 manifests/
 progress/
 pixiv/rule_fit/
 .tmp/
+.playwright-cli/
 
 # Logs (auto-archived, capped to 100/10 days each group)
 logs/
@@ -24,13 +24,6 @@ pixiv_censor.json
 watermark.json
 watermark_fonts/
 watermark_images/
-
-# X / xhs credentials — NEVER commit. auth_token + ct0 == full account access.
-x/cookies*.json
-xhs/cookies*.json
-# Persistent browser profiles (if they land inside the repo)
-.civitai_splitter_x_chrome/
-.civitai_splitter_xhs_chrome/
 
 # Anything that looks like a credential dump
 *.cookie
@@ -50,15 +43,17 @@ models/
 # Local media dropped beside the tool
 *.mp3
 
+# Frontend build dependencies
+node_modules/
+
 # IDE / editor
 .vscode/
 .idea/
 *.swp
 
-# Update check timestamp (per-machine)
+# Update check timestamp and agent artifacts (per-machine)
 .last_update_check
 .gstack/
-
-# Pi agent session/task artifacts (local)
+.superpowers/
 .pi/
 .pi-subagents/

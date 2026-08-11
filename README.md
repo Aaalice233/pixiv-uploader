@@ -1,364 +1,219 @@
-# Civitai Post Splitter & Pixiv Uploader
+# Pixiv Uploader
 
-[简体中文](#中文) · [English](#english)
+[简体中文](README.md) · [English](README_EN.md)
 
-把图片自动同步到 **Civitai / Pixiv / X (Twitter) / 小红书**。支持 Web UI 和 CLI 两种操作方式。
+以 **Pixiv** 为核心的本地作品发布工作台。目前支持 Pixiv 与 Civitai，可完成图片整理、标签识别、文案生成、内容处理、定时发布和任务追踪。
 
----
+> 本项目 fork 自 [1756141021/civitai-post-splitter](https://github.com/1756141021/civitai-post-splitter)，现由 [Aaalice233](https://github.com/Aaalice233) 独立维护。
 
-## 中文
+## 功能概览
 
-### 功能
+- **发布工作台**：集中管理待发布图片、平台状态、任务进度和运行日志
+- **Pixiv 发布**：自动填写标题、说明、标签、年龄分级和原创/二创选项
+- **Civitai 发布**：支持发布图片，也可把已有多图帖子拆成单图帖子
+- **智能标签**：支持 PixAI tagger，以及 CL / WD14 tagger 回退链
+- **LLM 文案**：通过 OpenAI 兼容接口生成 Pixiv 日文标题与说明
+- **R-18 内容处理**：支持 mosaic、Gaussian blur 和 black bar 三种打码方式
+- **图文水印**：支持自定义文字与透明图片水印，可调整位置、大小、透明度和边距
+- **定时发布**：按随机时间间隔自动处理发布队列
+- **断点与去重**：按图片和平台记录发布结果，失败后可安全重试
+- **双语界面**：内置简体中文和 English，支持系统语言检测与即时切换
+- **深浅主题**：支持 Dark / Light 主题以及桌面端、移动端布局
 
-- **拆帖**：把 Civitai 一帖多图拆成多帖单图
-- **多平台发布**：Civitai / Pixiv / X (Twitter) / 小红书，任意组合同时发布
-- **自动 tag**：PixAI tagger（优先）或 WD14/CL tagger + Danbooru/Pixiv 翻译，自动转日文，角色/版权识别
-- **LLM 文案反推**：接入 OpenAI 兼容 API，自动生成 Pixiv 标题简介 / X 推文 / 小红书笔记正文
-- **R-18 自动打码**：YOLOv8 检测露出区域，mosaic / blur / bar / heart 四种遮挡方式，off / japan / strict 三档合规线
-- **Web UI**：浏览器操作，图片拖拽选取/排序，实时任务状态，Scheduler 配置
-- **定时自动发布**：配置间隔范围后自动循环上传，Web UI 和 CLI 都支持
-- **同图去重**：已成功发到某端的图，下次自动跳过该端
-- **稳定性**：失败重试、连续失败中断、log 自动归档
+## 当前支持的平台
 
-### 环境要求
+| 平台 | 发布方式 | 自动标签 | LLM 文案 | R-18 打码 | 图文水印 |
+|---|---|---:|---:|---:|---:|
+| Pixiv | 浏览器自动化 | ✓ | ✓ | ✓ | ✓ |
+| Civitai | API + 浏览器 | — | — | — | — |
 
+当前发布目标仅允许 `pixiv` 和 `civitai`。平台能力已按独立边界组织，后续可以继续扩展新的发布目标。
+
+## 环境要求
+
+- Windows 10 / 11
 - Python 3.10+
-- Chrome 浏览器（各平台发布由 Playwright 驱动）
+- Chrome
+- Git
+- Node.js 18+（仅修改前端时需要）
 
-### 安装
+## 安装
 
-```bash
-pip install -r requirements.txt
-patchright install chromium
+```powershell
+git clone https://github.com/Aaalice233/pixiv-uploader.git
+cd pixiv-uploader
+
+py -3 -m venv .venv
+.venv/Scripts/python.exe -m pip install --upgrade pip
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+.venv/Scripts/patchright.exe install chromium
 ```
 
-R-18 打码（可选）：
+R-18 自动打码为可选功能：
 
-```bash
-pip install ultralytics opencv-python
+```powershell
+.venv/Scripts/python.exe -m pip install ultralytics opencv-python
 ```
 
-YOLO 模型：双击 `run.bat` 选 [4] 自动下载，或手动从 [civitai.com/models/1736285](https://civitai.com/models/1736285?modelVersionId=1965032) 下载，放到 `models/auto_censor.pt`。
+随后运行 `run.bat`，选择 **[4] 安装 / 检查 R-18 自动打码**，程序会检查并引导安装模型。
 
-### 用法
+## 快速开始
 
-#### CLI 菜单
+### Web UI
 
-双击 `run.bat` 或 `python launcher.py`：
+双击：
 
+```text
+run_web.bat
 ```
-[1] 拆分 Civitai 帖子（一帖多图 -> 多帖单图）
-[2] 上传到双端 (Civitai + Pixiv)
+
+或手动启动：
+
+```powershell
+.venv/Scripts/python.exe web_server.py
+```
+
+浏览器打开 [http://localhost:7788](http://localhost:7788)。
+
+首次使用建议按以下顺序操作：
+
+1. 打开 **设置 → 账号**，完成 Pixiv / Civitai 登录或 API key 配置
+2. 在 **设置 → Pixiv 处理** 中选择打码和水印策略
+3. 如需自动文案，在 **设置 → LLM 文案** 中填写服务商、Base URL、API key 与模型
+4. 把图片放入 `upload/`，或直接拖进发布窗口
+5. 选择发布平台并创建任务
+6. 在任务区查看实时阶段、进度、错误和运行日志
+
+登录与发布期间不要关闭程序打开的浏览器窗口。账号信息保存在本机浏览器 profile 中，不会上传到本项目的服务器。
+
+### CLI 菜单
+
+双击 `run.bat`，或执行：
+
+```powershell
+.venv/Scripts/python.exe launcher.py
+```
+
+菜单提供：
+
+```text
+[1] 拆分 Civitai 帖子
+[2] 上传到 Civitai + Pixiv
 [3] 仅上传到 Pixiv
 [4] 安装 / 检查 R-18 自动打码
 [5] 检查 / 拉取更新
-[6] 配置 / 下载 Tagger 模型 (PixAI / CL)
-[7] 切换 Pixiv 账号（清除 + 重新登录）
-[8] 切换 Civitai 账号（清除 + 重新登录）
-[9] 定时自动发布（配置 / 启动）
+[6] 配置 / 下载 Tagger 模型
+[7] 切换 Pixiv 账号
+[8] 切换 Civitai 账号
+[9] 配置 / 启动定时发布
 [Q] 退出
 ```
 
-#### Web UI
+### 直接命令行
 
-```bash
-python web_server.py
-# 浏览器打开 http://localhost:7788
+```powershell
+# 同时发布到 Civitai 与 Pixiv
+.venv/Scripts/python.exe civitai_splitter.py upload --targets civitai,pixiv --count 2
+
+# 仅发布到 Pixiv，并按文件名排序
+.venv/Scripts/python.exe civitai_splitter.py upload --targets pixiv --sort name_asc
+
+# 拆分一个或多个 Civitai 帖子
+.venv/Scripts/python.exe civitai_splitter.py split 123456
 ```
 
-Web UI 支持：图片拖拽上传/手动排序、多平台勾选、LLM 反推配置、打码预设切换、Scheduler 实时状态。
+`--sort` 支持：`random`、`name_asc`、`name_desc`、`time_asc`、`time_desc`。
 
-#### 直接命令行
+## 图片生命周期
 
-```bash
-python civitai_splitter.py upload --targets civitai,pixiv,x,xhs --count 2
-python civitai_splitter.py upload --targets pixiv --sort name_asc
-python civitai_splitter.py split 1234567          # 拆分指定 post（多个 ID 用空格隔开）
+```text
+upload/  →  发布准备与平台处理  →  done/
+                  │
+                  ├─ manifests/   发布清单与平台状态
+                  ├─ progress/    去重和断点记录
+                  ├─ pixiv_out/   Pixiv 清洗 / 打码产物
+                  └─ logs/        运行日志
 ```
 
-`upload` 常用参数：
+- 成功完成全部目标后，原图会移动到 `done/`
+- 某个平台失败时，图片会保留在待处理状态，重试时跳过已经成功的平台
+- `manifest` 会记录每个平台的准备结果与发布状态，便于定位问题
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--targets` | `civitai` | 发布目标，逗号分隔：`civitai` / `pixiv` / `x` / `xhs` |
-| `--count` | `0` | 本次发几张，`0` = 随机 1–5 |
-| `--sort` | `random` | 选图排序：`random` / `name_asc` / `name_desc` / `time_asc` / `time_desc` |
-| `--dry-run` | 关 | 只生成 manifest 和清洗副本，不实际发布 |
-| `--x-template` | `en_sfw` | X 模板：`jp/en/zh` × `sfw/nsfw`；r18/r18g 自动切到 `*_nsfw` |
-| `--x-group` | `1` | X 多图组队（1=每图单推；2–4=按文件名相邻组队，一条推挂多图） |
-| `--xhs-template` | `default` | 小红书模板 |
-| `--xhs-manual` | 关 | 小红书手动模式：只生成内容，不启动浏览器 |
-| `--no-ai-tags` | 关 | 不打 AI 标签；不带值=全部平台，带值=指定平台（如 `pixiv,x`） |
-| `--pixiv-privacy` | `public` | `public` / `logged_in` / `mypixiv` / `private` |
-| `--abort-after-failures` | `3` | 连续失败 N 张后中断批次，避免风控 |
-| `--delay` | `10` | 每个 post 间隔秒数 |
-| `--llm-reverse` | 关 | 用 LLM 生成文案；配 `--llm-persona` / `--llm-account` / `--llm-content-mode` |
+## Tagger
 
-### 工作流
+优先级为：
 
-1. 把要发的图丢到 `upload/`
-2. 用 Web UI 或 CLI 选择平台、发布
-3. 成功的图移到 `done/`，失败的留在 `upload/` 等下次重发
+```text
+PixAI tagger → CL / WD14 tagger → metadata / 文件名候选
+```
 
-### 平台说明
+通过 CLI 菜单 **[6]** 或 Web UI 设置页配置模型。PixAI 自动下载需要：
 
-| 平台 | 发布方式 | 文案 | 打码 | NSFW |
-|------|---------|------|------|------|
-| Civitai | API + 浏览器 | — | — | ✓ |
-| Pixiv | 浏览器（Playwright） | LLM 日文标题/说明 | ✓ | ✓ |
-| X (Twitter) | 浏览器（Playwright） | LLM 英文推文 | ✓ | ✓ |
-| 小红书 | 浏览器（Playwright） | LLM 中文标题/正文 | ✓ | **仅 SFW** |
+```powershell
+.venv/Scripts/python.exe -m pip install huggingface_hub
+```
 
-小红书硬规则：r18/r18g 图自动跳过，不会发布。
+PixAI v0.9 模型约 1.27 GB，请预留磁盘空间。
 
-### R-18 打码
+## LLM 文案
 
-两个独立旋钮，配在 `pixiv/censor.json`，Web UI Settings 也能切：
+Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Gemini 配置。每个人设可独立配置提示词、内容模式和默认行为。
 
-**遮挡方式**（`mode`）：
+敏感配置保存在本机 `config.json`。该文件已被 Git 忽略，请不要主动提交 API key、Cookie 或其他凭据。
 
-| mode | 效果 |
+## 水印
+
+在 **设置 → Pixiv → 水印** 中可以选择文字或图片水印。水印只写入 Pixiv 清洗后的发布副本，不修改 `upload/` 中的原图：
+
+- 文字水印支持字体导入、字型、颜色、描边、位置、大小、透明度和边距
+- 图片水印支持 PNG、JPEG 与 WebP；透明 PNG 会保留 alpha 通道
+- 导入的字体与图片分别保存在本机 `watermark_fonts/` 和 `watermark_images/`
+- 删除当前正在使用的水印资源时，应用会同步回退到安全的禁用状态
+
+## 主要配置与数据
+
+| 路径 | 作用 |
 |---|---|
-| `mosaic`（默认） | 马赛克 |
-| `blur` | 高斯模糊 |
-| `bar` | 黑条（`bar_count` 控制条数） |
-| `heart` | 爱心遮挡 |
+| `config.json` | 本机设置、API key、Scheduler 和 LLM 配置 |
+| `civitai_safety.json` | Civitai 内容安全跳过规则 |
+| `pixiv/censor.json` | Pixiv 打码预设与检测类别 |
+| `watermark.json` | 当前文字或图片水印配置 |
+| `watermark_fonts/` | 本机导入的字体文件 |
+| `watermark_images/` | 本机导入的水印图片 |
+| `pixiv/age_rules.json` | 文件名规则与年龄分级 |
+| `pixiv/tag_aliases.json` | 自定义标签映射与过滤规则 |
+| `pixiv/jp_aliases.json` | Danbooru → 日文标签缓存 |
+| `pixiv/general_jp.json` | Pixiv 标签规则与同义词 |
 
-**合规档位**（`preset` / `enabled_classes`）：决定遮哪些部位。
+## 前端开发
 
-| preset | 遮挡范围 | 含义 |
-|---|---|---|
-| `off` | 无 | 不打码 |
-| `japan`（默认） | `dick / vagina / anus / cum` | Pixiv 平台合规线（生殖区域 + 体液，不含乳头） |
-| `strict` | 再加 `tits` | 加乳头 |
-
-`conf_threshold` 控制检测灵敏度，推荐 0.5–0.6。切换 preset 无需重启 Web 服务即时生效。
-
-### Tagger 配置
-
-`run.bat` 选 [6] 进入 Tagger 配置菜单：
-
-- **PixAI tagger v0.9**（推荐）：角色覆盖更广，能识别较新角色。需下载 `deepghs/pixai-tagger-v0.9-onnx`（约 1.27 GB）
-- **CL / WD14 tagger**：轻量 fallback，兼容现有 WD14 ONNX 模型
-
-优先级：PixAI > CL/WD14 > 仅 prompt/文件名候选
-
-自动下载（需 `huggingface_hub`）：
-
-```bash
-pip install huggingface_hub
+```powershell
+npm ci
+npm run check:frontend
 ```
 
-然后选菜单 [6] → [2] 自动下载。
+`check:frontend` 会依次执行：
 
-### LLM 文案反推
+1. 中英文语言包键值与插值变量校验
+2. JSX 固定文案和遗漏中文检查
+3. i18n 单元测试
+4. esbuild 生产构建
 
-连接 OpenAI 兼容 API（Claude / Gemini / GPT 等），为各平台生成文案：
-- Pixiv：日文标题 + 简介
-- X：英文推文（带 hashtag）
-- 小红书：中文标题 + 正文
+Python 测试：
 
-配置在 Web UI Settings 区或 `config.json.llm_reverse`。
-
-### 登录与账号
-
-每个平台独立 Chrome profile，互不干扰：
-
-- Pixiv：`~/.civitai_splitter_pixiv_chrome`
-- Civitai：`~/.civitai_splitter_chrome`（登录走 `civitai.red`，发布后 URL 可能显示 `civitai.com`，正常）
-- X：`~/.civitai_splitter_x_chrome`
-- 小红书：`~/.civitai_splitter_xhs_chrome`
-
-X 和小红书还支持 **cookie 导入**：自动化浏览器会被 Google 登录拦，所以从普通 Chrome 用 Cookie-Editor 扩展导出 JSON，放到 `x/cookies.json` 或 `xhs/cookies.json`，启动时自动注入。两个文件都在 `.gitignore` 里——`auth_token` + `ct0` 等于账号完全访问权，绝不能提交。
-
-launcher 菜单 `[7]` / `[8]` 清除 Pixiv / Civitai profile 并重新登录。
-
-### 配置文件
-
-| 文件 | 作用 |
-|---|---|
-| `config.json` | 全局配置（API key、scheduler、LLM 反推、haintag_root）；本机私有，不提交 |
-| `pixiv/censor.json` | 打码参数（preset: off / japan / strict，enabled_classes） |
-| `pixiv/tag_aliases.json` | 自定义 tag 映射、drop_tags、语义组 |
-| `pixiv/age_rules.json` | 文件名模式 → 年龄分级规则 |
-| `pixiv/jp_aliases.json` | Danbooru→日文翻译缓存（自动累积） |
-| `pixiv/general_jp.json` | Pixiv 规则表（mappings / selling_points / synonym_tags） |
-| `x/x_templates.json` | X 发布模板（jp/en/zh × sfw/nsfw） |
-| `x/cookies.json` | X 登录 cookie（Cookie-Editor 导出）；不提交 |
-| `xhs/xhs_templates.json` | 小红书发布模板 |
-| `xhs/cookies.json` | 小红书登录 cookie；不提交 |
-
-### 许可
-
-MIT
-
----
-
-## English
-
-### Features
-
-- **Split**: turn multi-image Civitai posts into single-image reposts
-- **Multi-platform publishing**: Civitai / Pixiv / X (Twitter) / Xiaohongshu (xhs), any combination
-- **Auto-tagging**: PixAI tagger (preferred) or WD14/CL tagger + Danbooru/Pixiv translation; character/copyright tags auto-converted to Japanese
-- **LLM copy generation**: OpenAI-compatible API generates Pixiv titles/captions, X tweets, xhs notes
-- **R-18 auto-censor**: YOLOv8 detects exposed regions; mosaic / blur / bar / heart masking; off / japan / strict compliance presets
-- **Web UI**: browser-based operation, drag-and-drop image selection/sorting, live task status, scheduler config
-- **Scheduled publishing**: auto upload loop with configurable interval range
-- **Per-image dedup**: already-published target is skipped on retry
-- **Reliability**: auto-retry, consecutive-failure abort, log auto-archive
-
-### Requirements
-
-- Python 3.10+
-- Chrome (platform publishing runs via Playwright)
-
-### Install
-
-```bash
-pip install -r requirements.txt
-patchright install chromium
+```powershell
+.venv/Scripts/python.exe -m unittest discover -s tests -v
 ```
 
-Censoring (optional):
+更多模块约定与维护说明见 [DEV_NOTES.md](DEV_NOTES.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
-```bash
-pip install ultralytics opencv-python
-```
+## 注意事项
 
-YOLO model: launch `run.bat` and pick [4] for auto-download, or manually fetch from [civitai.com/models/1736285](https://civitai.com/models/1736285?modelVersionId=1965032) to `models/auto_censor.pt`.
+- 本项目使用浏览器自动化完成 Pixiv / Civitai 操作，站点页面更新后可能需要同步适配
+- 发布前请自行确认作品版权、平台规则、AI 生成内容标记和年龄分级
+- 请合理控制发布频率，不要使用本项目进行垃圾信息、批量骚扰或规避平台限制
+- 本项目与 Pixiv、Civitai 及其运营方没有隶属或官方合作关系
 
-### Usage
+## 许可证
 
-#### CLI menu
-
-Double-click `run.bat` or `python launcher.py`:
-
-```
-[1] Split a Civitai post (multi-image -> single-image posts)
-[2] Upload to both (Civitai + Pixiv)
-[3] Upload to Pixiv only
-[4] Install / verify R-18 auto-censor
-[5] Check / pull updates
-[6] Configure / download Tagger model (PixAI / CL)
-[7] Switch Pixiv account (clear + re-login)
-[8] Switch Civitai account (clear + re-login)
-[9] Scheduled auto-publish (configure / start)
-[Q] Quit
-```
-
-#### Web UI
-
-```bash
-python web_server.py
-# open http://localhost:7788 in browser
-```
-
-#### Direct CLI
-
-```bash
-python civitai_splitter.py upload --targets civitai,pixiv,x,xhs --count 2
-python civitai_splitter.py upload --targets pixiv --sort name_asc
-python civitai_splitter.py split 1234567          # split a specific post (space-separate multiple IDs)
-```
-
-Common `upload` flags:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--targets` | `civitai` | Publish targets, comma-separated: `civitai` / `pixiv` / `x` / `xhs` |
-| `--count` | `0` | How many to publish; `0` = random 1–5 |
-| `--sort` | `random` | Pick order: `random` / `name_asc` / `name_desc` / `time_asc` / `time_desc` |
-| `--dry-run` | off | Build manifest + sanitized copies only, don't publish |
-| `--x-template` | `en_sfw` | X template: `jp/en/zh` × `sfw/nsfw`; r18/r18g auto-switches to `*_nsfw` |
-| `--x-group` | `1` | X multi-image grouping (1=one post per image; 2–4=group adjacent files into one post) |
-| `--xhs-template` | `default` | Xiaohongshu template |
-| `--xhs-manual` | off | xhs manual mode: generate content only, don't launch browser |
-| `--no-ai-tags` | off | Skip AI tags; no value=all platforms, value=specific platforms (e.g. `pixiv,x`) |
-| `--pixiv-privacy` | `public` | `public` / `logged_in` / `mypixiv` / `private` |
-| `--abort-after-failures` | `3` | Abort the batch after N consecutive failures (anti rate-limit) |
-| `--delay` | `10` | Seconds between posts |
-| `--llm-reverse` | off | Generate copy via LLM; pair with `--llm-persona` / `--llm-account` / `--llm-content-mode` |
-
-### Workflow
-
-1. Drop images into `upload/`
-2. Select platforms and publish via Web UI or CLI
-3. Successful images move to `done/`; failed ones stay in `upload/` for retry
-
-### Platform notes
-
-| Platform | Method | Copy | Censor | NSFW |
-|----------|--------|------|--------|------|
-| Civitai | API + browser | — | — | ✓ |
-| Pixiv | Playwright | LLM JP title/caption | ✓ | ✓ |
-| X (Twitter) | Playwright | LLM EN tweet | ✓ | ✓ |
-| Xiaohongshu | Playwright | LLM ZH title/body | ✓ | **SFW only** |
-
-xhs hard rule: r18/r18g images are automatically skipped.
-
-### R-18 censoring
-
-Two independent knobs in `pixiv/censor.json` (also switchable from Web UI Settings):
-
-**Masking method** (`mode`):
-
-| mode | Effect |
-|---|---|
-| `mosaic` (default) | Mosaic |
-| `blur` | Gaussian blur |
-| `bar` | Black bars (`bar_count` controls how many) |
-| `heart` | Heart overlay |
-
-**Compliance preset** (`preset` / `enabled_classes`) — which regions get covered:
-
-| preset | Coverage | Meaning |
-|---|---|---|
-| `off` | none | No censoring |
-| `japan` (default) | `dick / vagina / anus / cum` | Pixiv compliance line (genitals + fluids, nipples excluded) |
-| `strict` | adds `tits` | Adds nipples |
-
-`conf_threshold` tunes detection sensitivity (0.5–0.6 recommended). Switching preset takes effect without restarting the web server.
-
-### Tagger setup
-
-Run `[6]` from the launcher menu:
-
-- **PixAI tagger v0.9** (recommended): broader character coverage including newer characters. Requires `deepghs/pixai-tagger-v0.9-onnx` (~1.27 GB)
-- **CL / WD14 tagger**: lighter fallback, compatible with existing WD14 ONNX models
-
-Priority: PixAI > CL/WD14 > prompt/filename candidates only
-
-Auto-download (requires `huggingface_hub`):
-
-```bash
-pip install huggingface_hub
-```
-
-Then pick menu `[6]` → `[2]`.
-
-### LLM copy generation
-
-Connects to an OpenAI-compatible API to generate:
-- Pixiv: Japanese title + caption
-- X: English tweet with hashtags
-- xhs: Chinese title + body
-
-Configure in Web UI Settings or `config.json.llm_reverse`.
-
-### Login & accounts
-
-Each platform gets its own isolated Chrome profile:
-
-- Pixiv: `~/.civitai_splitter_pixiv_chrome`
-- Civitai: `~/.civitai_splitter_chrome` (login via `civitai.red`; published URLs may show `civitai.com` — normal)
-- X: `~/.civitai_splitter_x_chrome`
-- Xiaohongshu: `~/.civitai_splitter_xhs_chrome`
-
-X and xhs also support **cookie import**: automated browsers get blocked at Google login, so export JSON from a normal Chrome with the Cookie-Editor extension into `x/cookies.json` or `xhs/cookies.json` — injected automatically on launch. Both are `.gitignore`d — `auth_token` + `ct0` equals full account access, never commit them.
-
-Launcher menu `[7]` / `[8]` clears the Pixiv / Civitai profile and re-logs in.
-
-### License
-
-MIT
+本项目基于 [MIT License](LICENSE) 发布，并保留上游项目的版权与许可声明。

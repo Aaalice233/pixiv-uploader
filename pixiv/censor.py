@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger("civitai_splitter")
+log = logging.getLogger("pixiv_uploader")
 
 CENSOR_CLASS_NAMES = {0: "anus", 1: "cum", 2: "dick", 3: "tits", 4: "vagina"}
 CENSOR_CLASS_BY_NAME = {v: k for k, v in CENSOR_CLASS_NAMES.items()}

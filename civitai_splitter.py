@@ -25,30 +25,19 @@ from watermark import (
 )
 from pixiv.censor import CENSOR_CLASS_BY_NAME, CensorEngine, DEFAULT_CENSOR_CLASSES, DeepghsDetector, parse_class_set
 from pixiv.llm_reverse import (
-    account_can_handle_age,
-    apply_llm_result_to_copy_block,
     apply_llm_result_to_pixiv_payload,
     content_mode_can_handle_age,
     default_llm_reverse_config,
-    empty_copy_block,
     infer_image_copy,
     normalize_llm_reverse_config,
-    resolve_account,
     resolve_persona,
 )
 
-# Per-platform behaviour table. Drives:
-#   needs_sanitize: PIL-reencode to strip metadata (PNG text chunks, EXIF)
-#   needs_censor:   run auto_censor model on the sanitized image
-#   needs_copy:     consumes LLM-reversed title/caption (triggers LLM call)
-#   max_age:        highest age_restriction this platform will accept
-#                   ("all_ages" means NSFW gets silently dropped from targets)
-_NSFW_TIER_PLAT = {"all_ages": 0, "sfw": 0, "r18": 1, "r18g": 2}
+# Per-platform processing requirements. Civitai keeps generation metadata;
+# Pixiv receives a sanitized, policy-checked copy with generated Japanese copy.
 PLATFORM_RULES: dict[str, dict] = {
-    "civitai": {"needs_sanitize": False, "needs_censor": False, "needs_copy": False, "max_age": "r18g"},
-    "pixiv":   {"needs_sanitize": True,  "needs_censor": True,  "needs_copy": True,  "max_age": "r18g"},
-    "x":       {"needs_sanitize": True,  "needs_censor": True,  "needs_copy": True,  "max_age": "r18g"},
-    "xhs":     {"needs_sanitize": True,  "needs_censor": True,  "needs_copy": True,  "max_age": "r18g"},
+    "civitai": {"needs_sanitize": False, "needs_censor": False, "needs_copy": False},
+    "pixiv":   {"needs_sanitize": True,  "needs_censor": True,  "needs_copy": True},
 }
 
 
@@ -102,11 +91,6 @@ def _build_llm_extra_context(
     return "; ".join(parts)
 
 
-def _platform_accepts_age(platform: str, image_age: str) -> bool:
-    """Whether `platform` accepts an image at `image_age`. Hard rule, no override."""
-    rule = PLATFORM_RULES.get(platform, {})
-    max_age = rule.get("max_age", "r18g")
-    return _NSFW_TIER_PLAT.get(image_age, 0) <= _NSFW_TIER_PLAT.get(max_age, 2)
 from pixiv.standalone import StandaloneMetadataReader, StandaloneTaggerBridge
 from pixiv.pixai_tagger import PixAITaggerBridge
 from pixiv.support import (
@@ -139,7 +123,6 @@ from pixiv.support import (
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 UPLOAD_DIR = SCRIPT_DIR / "upload"
-XHS_UPLOAD_DIR = SCRIPT_DIR / "xhs_upload"
 DONE_DIR = SCRIPT_DIR / "done"
 LOG_DIR = SCRIPT_DIR / "logs"
 PROGRESS_DIR = SCRIPT_DIR / "progress"
@@ -150,7 +133,7 @@ CIVITAI_BASE = "https://civitai.red"
 CIVITAI_API = "https://civitai.red/api/v1"
 DONE_DAYS = 7
 _LORA_RE = re.compile(r"<lora:([^:>]+):([^>]+)>")
-TARGETS = {"civitai", "pixiv", "x", "xhs"}
+TARGETS = {"civitai", "pixiv"}
 
 
 def _raise_if_canceled(cancel_event) -> None:
@@ -302,7 +285,7 @@ def setup_logging():
     LOG_DIR.mkdir(exist_ok=True)
     log_file = LOG_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-    logger = logging.getLogger("civitai_splitter")
+    logger = logging.getLogger("pixiv_uploader")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
@@ -319,7 +302,7 @@ def setup_logging():
     return logger
 
 
-log = logging.getLogger("civitai_splitter")
+log = logging.getLogger("pixiv_uploader")
 
 
 def parse_post_id(value: str) -> int:
@@ -746,18 +729,7 @@ def create_upload_manifest(
     civitai_safety_cfg: dict | None = None,
     llm_reverse_config: dict | None = None,
     llm_persona_id: str = "",
-    llm_account_id: str = "",
     llm_content_mode: str = "",
-    llm_personas_by_platform: dict | None = None,
-    llm_content_modes_by_platform: dict | None = None,
-    x_dir: Path | None = None,
-    x_settings: dict | None = None,
-    x_templates: dict | None = None,
-    x_base_template: str = "en_sfw",
-    xhs_dir: Path | None = None,
-    xhs_settings: dict | None = None,
-    xhs_templates: dict | None = None,
-    xhs_base_template: str = "default",
     ai_tags_by_platform: dict | None = None,
     watermark_service: WatermarkService | None = None,
     watermark_spec: TextWatermarkSpec | ImageWatermarkSpec | None = None,
@@ -787,6 +759,7 @@ def create_upload_manifest(
     # Run auto-censor on the sanitized pixiv copy if engine present.
     censor_result = None
     if pixiv_clean is not None and censor_engine is not None:
+        log.info("    Pixiv 准备: 正在执行内容安全检查")
         _raise_if_canceled(cancel_event)
         censor_result = censor_engine.detect_and_censor(
             Path(pixiv_clean.output_path),
@@ -807,6 +780,7 @@ def create_upload_manifest(
     )
     _raise_if_canceled(cancel_event)
     if needs_pixiv_payload and tagger_bridge is not None:
+        log.info("    Pixiv 准备: 正在识别图片标签")
         tagger_result = tagger_bridge.predict_tags(image_path)
         if tagger_result.get("status") not in ("ok", "disabled") and not tagger_result.get("available"):
             log.info(f"    tagger: {tagger_result.get('status')} — 仅用 prompt/文件名候选")
@@ -818,6 +792,8 @@ def create_upload_manifest(
         extra_candidates = list(tagger_result.get("flat_tags", []))
         for category, entries in (tagger_result.get("groups") or {}).items():
             extra_groups[category] = [(tag, float(score)) for tag, score in entries]
+    if needs_pixiv_payload:
+        log.info("    Pixiv 准备: 正在整理标签与分级")
     pixiv_payload = (
         build_pixiv_payload(
             image_path=image_path,
@@ -838,20 +814,7 @@ def create_upload_manifest(
     )
     _raise_if_canceled(cancel_event)
 
-    # Per-platform max_age hard rule: xhs refuses r18/r18g, drop those targets.
-    image_age_for_rule = (pixiv_payload or {}).get("age_restriction", "all_ages")
-    nsfw_blocked_targets = {
-        t for t in targets
-        if not _platform_accepts_age(t, image_age_for_rule)
-    }
-    if nsfw_blocked_targets:
-        log.info(
-            f"    NSFW 硬规则拦截 (age={image_age_for_rule}): "
-            f"{sorted(nsfw_blocked_targets)} 不接受该分级，自动跳过"
-        )
-
     llm_reverse_result = {"enabled": False, "status": "disabled", "error": ""}
-    copy_block = empty_copy_block()
     if pixiv_payload is not None:
         pixiv_payload["privacy"] = pixiv_privacy
         pixiv_payload["allow_tag_edits"] = pixiv_allow_tag_edits
@@ -867,17 +830,6 @@ def create_upload_manifest(
                 if pixiv_payload.get("age_restriction") not in ("r18", "r18g"):
                     log.info(f"    tagger rating: {_best_rating}={_best_score:.2f}，升级 age_restriction → r18")
                     force_pixiv_age_restriction(pixiv_payload, "r18")
-        _updated_age = pixiv_payload.get("age_restriction", "all_ages")
-        if _updated_age != image_age_for_rule:
-            nsfw_blocked_targets = {
-                t for t in targets
-                if not _platform_accepts_age(t, _updated_age)
-            }
-            if nsfw_blocked_targets:
-                log.info(
-                    f"    NSFW 硬规则拦截 (age={_updated_age}, 升级后): "
-                    f"{sorted(nsfw_blocked_targets)} 不接受该分级，自动跳过"
-                )
         if llm_reverse_config and llm_reverse_config.get("enabled"):
             # Skip LLM if no target consumes copy (e.g. --targets civitai)
             if not _targets_need_copy(targets):
@@ -885,56 +837,13 @@ def create_upload_manifest(
                     "enabled": True,
                     "status": "skipped_no_target_needs",
                     "persona_id": llm_persona_id,
-                    "account_id": llm_account_id,
                     "platform": "",
                     "content_mode": "",
                     "fields": {},
                     "error": "no target requires copy (civitai-only or similar)",
                 }
                 log.info("    LLM 反推: 跳过（当前 targets 都不需要文案）")
-            elif llm_personas_by_platform:
-                # Per-platform mode: independent LLM call per copy platform
-                image_path_for_llm = Path(pixiv_clean.output_path) if pixiv_clean else image_path
-                image_age = (pixiv_payload or {}).get("age_restriction", "all_ages")
-                _llm_extra_ctx = _build_llm_extra_context(pixiv_payload, source_meta=source_meta)
-                copy_targets = [t for t in targets if PLATFORM_RULES.get(t, {}).get("needs_copy")]
-                for plat in copy_targets:
-                    per_persona_id = llm_personas_by_platform.get(plat, "")
-                    if not per_persona_id:
-                        log.info(f"    LLM 反推 [{plat}]: 未指定人设，跳过")
-                        continue
-                    per_content_mode = (llm_content_modes_by_platform or {}).get(plat, "") or llm_content_mode or "sfw"
-                    if not content_mode_can_handle_age(per_content_mode, image_age):
-                        log.info(f"    LLM 反推 [{plat}]: content_mode={per_content_mode}，跳过 {image_age} 图")
-                        continue
-                    _raise_if_canceled(cancel_event)
-                    per_result = infer_image_copy(
-                        image_path=image_path_for_llm,
-                        config=llm_reverse_config,
-                        persona_id=per_persona_id,
-                        account_id=llm_account_id,
-                        content_mode=per_content_mode,
-                        extra_context=_llm_extra_ctx,
-                        cancel_event=cancel_event,
-                    )
-                    if per_result.get("status") == "ok":
-                        if plat == "pixiv":
-                            apply_llm_result_to_pixiv_payload(pixiv_payload, per_result)
-                        apply_llm_result_to_copy_block(
-                            copy_block,
-                            per_result,
-                            platform=plat,
-                            account_id=llm_account_id,
-                        )
-                        log.info(f"    LLM 反推 [{plat}]: 生成文案 ({per_content_mode})")
-                    else:
-                        log.warning(
-                            f"    LLM 反推 [{plat}]: {per_result.get('status')} — {per_result.get('error', '')}"
-                        )
-                llm_reverse_result["enabled"] = True
-                llm_reverse_result["status"] = "per_platform"
             else:
-                # Unified mode
                 _, effective_mode = resolve_persona(llm_reverse_config, llm_persona_id, llm_content_mode)
                 image_age = (pixiv_payload or {}).get("age_restriction", "all_ages")
                 if not content_mode_can_handle_age(effective_mode, image_age):
@@ -953,11 +862,11 @@ def create_upload_manifest(
                     _raise_if_canceled(cancel_event)
                     _ctx = _build_llm_extra_context(pixiv_payload, source_meta=source_meta)
                     log.info(f"    LLM 反推: extra_context={_ctx!r}")
+                    log.info("    LLM 反推: 正在生成文案")
                     llm_reverse_result = infer_image_copy(
                         image_path=Path(pixiv_clean.output_path) if pixiv_clean else image_path,
                         config=llm_reverse_config,
                         persona_id=llm_persona_id,
-                        account_id=llm_account_id,
                         content_mode=llm_content_mode,
                         extra_context=_ctx,
                         cancel_event=cancel_event,
@@ -972,15 +881,6 @@ def create_upload_manifest(
                             f"    LLM 反推: {llm_reverse_result.get('status')} — {llm_reverse_result.get('error', '')}"
                         )
             _raise_if_canceled(cancel_event)
-
-    # Apply unified-mode LLM result to copy_block (per-platform mode writes directly).
-    if llm_reverse_result.get("status") != "per_platform":
-        apply_llm_result_to_copy_block(
-            copy_block,
-            llm_reverse_result,
-            platform=llm_reverse_result.get("platform", ""),
-            account_id=llm_account_id,
-        )
 
     watermark_failed = False
     watermark_error = ""
@@ -1015,53 +915,6 @@ def create_upload_manifest(
             log.error(f"    {label}失败: {watermark_error}")
     _raise_if_canceled(cancel_event)
 
-    x_payload = None
-    if "x" in targets and not watermark_failed:
-        try:
-            from x.support import build_x_payload as _build_x_payload
-            x_source = Path(pixiv_clean.output_path) if pixiv_clean else image_path
-            x_payload = _build_x_payload(
-                pixiv_payload=pixiv_payload,
-                image_path=x_source,
-                x_dir=x_dir or (image_path.parent.parent / "x_out"),
-                settings=x_settings or {},
-                templates=x_templates or {},
-                base_template=x_base_template,
-                age_restriction=(pixiv_payload or {}).get("age_restriction", "all_ages"),
-                copy=copy_block,
-                ai_tags_enabled=(ai_tags_by_platform or {}).get("x", True),
-            )
-        except Exception as exc:
-            log.error(f"    X payload 构建失败: {exc}")
-            log.debug(traceback.format_exc())
-            x_payload = None
-        _raise_if_canceled(cancel_event)
-
-    xhs_payload = None
-    if "xhs" in targets and "xhs" not in nsfw_blocked_targets and not watermark_failed:
-        try:
-            from xhs.support import build_xhs_payload as _build_xhs_payload
-            xhs_source = Path(pixiv_clean.output_path) if pixiv_clean else image_path
-            _xhs_settings = xhs_settings or {}
-            if not (ai_tags_by_platform or {}).get("xhs", True):
-                _xhs_settings = dict(_xhs_settings)
-                _xhs_settings["auto_append_ai_tag"] = False
-            xhs_payload = _build_xhs_payload(
-                pixiv_payload=pixiv_payload,
-                image_path=xhs_source,
-                xhs_dir=xhs_dir or (image_path.parent.parent / "xhs_out"),
-                settings=_xhs_settings,
-                templates=xhs_templates or {},
-                base_template=xhs_base_template,
-                age_restriction=(pixiv_payload or {}).get("age_restriction", "all_ages"),
-                copy=copy_block,
-            )
-        except Exception as exc:
-            log.error(f"    xhs payload 构建失败: {exc}")
-            log.debug(traceback.format_exc())
-            xhs_payload = None
-        _raise_if_canceled(cancel_event)
-
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_path": str(image_path),
@@ -1069,14 +922,13 @@ def create_upload_manifest(
         "dry_run": False,
         "status_by_target": {
             target: (
-                "skipped_max_age" if target in nsfw_blocked_targets
-                else "failed" if watermark_failed and PLATFORM_RULES.get(target, {}).get("needs_sanitize")
+                "failed"
+                if watermark_failed and PLATFORM_RULES.get(target, {}).get("needs_sanitize")
                 else "pending"
             )
             for target in targets
         },
         "errors": [f"Watermark failed: {watermark_error}"] if watermark_failed else [],
-        "copy": copy_block,
         "watermark": watermark_result,
         "civitai": {
             "clean_copy_path": str(civitai_copy) if civitai_copy else "",
@@ -1115,27 +967,6 @@ def create_upload_manifest(
                 "details": tagger_result.get("details", []),
             },
             "censor": censor_result.to_dict() if censor_result is not None else {"status": "disabled", "applied": False},
-        },
-        "x": x_payload if x_payload else {
-            "clean_copy_paths": [],
-            "text": "",
-            "tags": [],
-            "tag_sources": {},
-            "template": "",
-            "sensitive": False,
-            "alt_text": "",
-            "group_id": None,
-            "post_url": "",
-        },
-        "xhs": xhs_payload if xhs_payload else {
-            "clean_copy_paths": [],
-            "title": "",
-            "body": "",
-            "tags": [],
-            "tag_sources": {},
-            "template": "",
-            "group_id": None,
-            "post_url": "",
         },
         "source_metadata": {
             "status": source_meta.get("status", "unknown"),
@@ -1289,15 +1120,13 @@ def cmd_upload(args):
         log.warning("LLM 反推: 已请求但未启用或配置不完整，将跳过")
 
     no_ai_tags = getattr(args, "no_ai_tags", None) or ""
-    if not getattr(args, "ai_tags_by_platform", None) and no_ai_tags:
-        if no_ai_tags == "all":
-            args.ai_tags_by_platform = {"pixiv": False, "x": False, "xhs": False}
-        else:
-            skip = {p.strip().lower() for p in no_ai_tags.split(",") if p.strip()}
-            args.ai_tags_by_platform = {p: p not in skip for p in ("pixiv", "x", "xhs")}
+    requested_ai_tags = getattr(args, "ai_tags_by_platform", None) or {}
+    if no_ai_tags:
+        skip = {part.strip().lower() for part in no_ai_tags.split(",") if part.strip()}
+        requested_ai_tags["pixiv"] = not ({"all", "pixiv"} & skip)
+    args.ai_tags_by_platform = {"pixiv": bool(requested_ai_tags.get("pixiv", True))}
 
     UPLOAD_DIR.mkdir(exist_ok=True)
-    XHS_UPLOAD_DIR.mkdir(exist_ok=True)
     DONE_DIR.mkdir(exist_ok=True)
 
     targets = parse_targets(args.targets)
@@ -1307,24 +1136,16 @@ def cmd_upload(args):
         file for file in UPLOAD_DIR.iterdir()
         if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS
     )
-    xhs_only = sorted(
-        f for f in XHS_UPLOAD_DIR.iterdir()
-        if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
-    ) if "xhs" in targets else []
-    if not all_images and not xhs_only:
-        log.info(f"upload/ 和 xhs_upload/ 目录都没有图片。\n  {UPLOAD_DIR}\n  {XHS_UPLOAD_DIR}")
+    if not all_images:
+        log.info(f"upload/ 目录没有图片。\n  {UPLOAD_DIR}")
         return
 
-    needs_xhs = "xhs" in targets or bool(xhs_only)
-    xhs_manual_mode = bool(getattr(args, "xhs_manual_mode", False))
-
-    # Auto-censor: model file at models/auto_censor.pt opts in. Config tunables
-    # live in pixiv_censor.json (auto-created on first run with defaults).
-    # X target reuses the pixiv-cleaned image, so censor follows the same toggle.
+    # Auto-censor is opt-in through models/auto_censor.pt. Tunables live in
+    # pixiv_censor.json and only affect Pixiv's sanitized publishing copy.
     censor_engine = None
     censor_secondary = None
     censor_classes = DEFAULT_CENSOR_CLASSES
-    needs_pixiv_pipeline = any(PLATFORM_RULES.get(t, {}).get("needs_sanitize") for t in targets) or needs_xhs
+    needs_pixiv_pipeline = any(PLATFORM_RULES.get(t, {}).get("needs_sanitize") for t in targets)
     if needs_pixiv_pipeline:
         model_path = SCRIPT_DIR / "models" / "auto_censor.pt"
         if model_path.exists():
@@ -1377,68 +1198,28 @@ def cmd_upload(args):
     sort_mode = getattr(args, "sort", "random")
     selected_names = getattr(args, "files", None) or []
     if selected_names:
-        up_map = {f.name.lower(): f for f in all_images}
-        xhs_map = {f.name.lower(): f for f in xhs_only}
-        image_files = [up_map[n.lower()] for n in selected_names if n.lower() in up_map]
-        xhs_files = [xhs_map[n.lower()] for n in selected_names if n.lower() in xhs_map]
-        if not image_files and not xhs_files:
-            log.warning("指定的文件不在 upload/ 或 xhs_upload/ 目录，改用排序规则")
+        upload_by_name = {file.name.lower(): file for file in all_images}
+        image_files = [upload_by_name[name.lower()] for name in selected_names if name.lower() in upload_by_name]
+        if not image_files:
+            log.warning("指定的文件不在 upload/ 目录，改用排序规则")
             image_files = _select_by_sort(all_images, sort_mode, 1)
-            xhs_files = _select_by_sort(xhs_only, sort_mode, 1) if xhs_only else []
-        mode_desc = f"指定顺序 {len(image_files)}+{len(xhs_files)} 张"
     else:
         requested = max(0, int(getattr(args, "count", 0) or 0))
-        if requested > 0:
-            count = min(requested, len(all_images)) if all_images else 0
-            xhs_count = min(requested, len(xhs_only)) if xhs_only else 0
-            mode_desc = f"按 {sort_mode} 选 {count}+{xhs_count} 张"
-        else:
-            count = min(random.randint(1, 5), len(all_images)) if all_images else 0
-            xhs_count = min(random.randint(1, 5), len(xhs_only)) if xhs_only else 0
-            mode_desc = f"随机选 {count}+{xhs_count} 张"
-        image_files = _select_by_sort(all_images, sort_mode, count) if count else []
-        xhs_files = _select_by_sort(xhs_only, sort_mode, xhs_count) if xhs_count else []
-    upload_targets = [t for t in targets if t != "xhs"] if xhs_files else targets
-    image_queue = [(img, upload_targets) for img in image_files]
-    image_queue += [(img, ["xhs"]) for img in xhs_files]
-    all_processed_targets = list(dict.fromkeys(t for _, et in image_queue for t in et))
-    log.info(
-        f"upload/ {len(all_images)} 张本次选 {len(image_files)}；"
-        f"xhs_upload/ {len(xhs_only)} 张本次选 {len(xhs_files)}。"
-        f"目标：{all_processed_targets}\n"
-    )
+        count = min(requested, len(all_images)) if requested else min(random.randint(1, 5), len(all_images))
+        image_files = _select_by_sort(all_images, sort_mode, count)
+
+    image_queue = [(image, targets) for image in image_files]
+    all_processed_targets = list(targets)
+    log.info(f"upload/ {len(all_images)} 张，本次处理 {len(image_files)} 张；目标：{targets}\n")
 
     temp_dir = make_temp_dir("civitai_upload_")
     civitai_dir = temp_dir / "civitai"
     pixiv_dir = temp_dir / "pixiv"
-    x_dir = temp_dir / "x"
-    xhs_dir = (SCRIPT_DIR / "xhs_out") if xhs_manual_mode else (temp_dir / "xhs")
     civitai_dir.mkdir(exist_ok=True)
     pixiv_dir.mkdir(exist_ok=True)
-    if "x" in targets:
-        x_dir.mkdir(exist_ok=True)
-    if needs_xhs:
-        xhs_dir.mkdir(exist_ok=True)
 
-    x_settings = x_templates = None
-    x_base_template = "en_sfw"
-    if "x" in targets:
-        from x.support import load_x_settings, load_x_templates
-        x_settings = load_x_settings()
-        x_templates = load_x_templates()
-        x_base_template = getattr(args, "x_template", None) or x_settings.get("default_template", "en_sfw")
-
-    xhs_settings = xhs_templates = None
-    xhs_base_template = "default"
-    if needs_xhs:
-        from xhs.support import load_xhs_settings, load_xhs_templates
-        xhs_settings = load_xhs_settings()
-        xhs_templates = load_xhs_templates()
-        xhs_base_template = getattr(args, "xhs_template", None) or xhs_settings.get("default_template", "default")
-
-    civitai_context = pixiv_context = x_context = xhs_context = None
-    civitai_page = pixiv_page = x_page = xhs_page = None
-    xhs_browser = None
+    civitai_context = pixiv_context = None
+    civitai_page = pixiv_page = None
     success_count = 0
     fail_count = 0
     consecutive_failures = 0
@@ -1448,25 +1229,10 @@ def cmd_upload(args):
     target_fail_counts = {target: 0 for target in all_processed_targets}
 
     try:
-        needs_browser = [t for t in ("civitai", "pixiv", "x") if t in targets]
-        if needs_xhs and not xhs_manual_mode:
-            needs_browser.append("xhs")
-        if not args.dry_run and needs_browser:
+        if not args.dry_run and targets:
             playwright = sync_playwright().start()
         if playwright is not None and "civitai" in targets:
             civitai_context, civitai_page = open_civitai_browser(playwright)
-        if playwright is not None and "pixiv" in targets:
-            pixiv_context, pixiv_page = open_pixiv_browser(playwright)
-        if playwright is not None and "x" in targets:
-            from x.support import open_x_browser
-            x_context, x_page = open_x_browser(playwright)
-        if playwright is not None and needs_xhs and not xhs_manual_mode:
-            from xhs.support import open_xhs_browser
-            try:
-                xhs_context, xhs_page, xhs_browser = open_xhs_browser(playwright)
-            except Exception as exc:
-                log.warning(f"XHS 浏览器启动失败，跳过小红书: {exc}")
-                log.debug(traceback.format_exc())
 
         _cancel_ev = getattr(args, "cancel_event", None)
         for index, (orig_path, effective_targets) in enumerate(image_queue, 1):
@@ -1474,6 +1240,8 @@ def cmd_upload(args):
                 log.info("收到取消信号，停止上传")
                 break
             log.info(f"[{index}/{len(image_queue)}] {orig_path.name}")
+            if "pixiv" in effective_targets:
+                log.info("    Pixiv 准备: 正在处理图片、标签和文案，完成后自动打开投稿页")
             prior_successes = find_target_successes(files["manifests"], orig_path)
             skip_targets = {t for t in effective_targets if t in prior_successes}
             if skip_targets:
@@ -1496,25 +1264,14 @@ def cmd_upload(args):
                 tagger_bridge=tagger_bridge,
                 jp_alias_cache=jp_alias_cache,
                 general_jp_data=general_jp_data,
-                pixiv_page=pixiv_page,
+                pixiv_page=None,
                 censor_engine=censor_engine,
                 censor_secondary=censor_secondary,
                 censor_classes=censor_classes,
                 civitai_safety_cfg=civitai_safety_cfg,
                 llm_reverse_config=llm_reverse_config if llm_reverse_enabled else None,
                 llm_persona_id=getattr(args, "llm_persona", ""),
-                llm_account_id=getattr(args, "llm_account", ""),
                 llm_content_mode=getattr(args, "llm_content_mode", ""),
-                llm_personas_by_platform=getattr(args, "llm_personas_by_platform", None),
-                llm_content_modes_by_platform=getattr(args, "llm_content_modes_by_platform", None),
-                x_dir=x_dir if "x" in effective_targets else None,
-                x_settings=x_settings,
-                x_templates=x_templates,
-                x_base_template=x_base_template,
-                xhs_dir=xhs_dir if "xhs" in effective_targets else None,
-                xhs_settings=xhs_settings,
-                xhs_templates=xhs_templates,
-                xhs_base_template=xhs_base_template,
                 ai_tags_by_platform=getattr(args, "ai_tags_by_platform", None),
                 watermark_service=watermark_service,
                 watermark_spec=watermark_spec,
@@ -1577,6 +1334,21 @@ def cmd_upload(args):
                         all_succeeded = False
 
             if "pixiv" in effective_targets:
+                pixiv_browser_error = ""
+                if (
+                    "pixiv" not in skip_targets
+                    and pixiv_ready
+                    and not cancel_requested
+                    and pixiv_page is None
+                ):
+                    log.info("    Pixiv 准备完成: 正在打开浏览器并填写投稿表单")
+                    try:
+                        pixiv_context, pixiv_page = open_pixiv_browser(playwright)
+                    except Exception as exc:
+                        pixiv_browser_error = str(exc)
+                        log.error(f"    Pixiv 浏览器启动失败: {pixiv_browser_error}")
+                        log.debug(traceback.format_exc())
+
                 if "pixiv" in skip_targets:
                     inherited_url = prior_successes["pixiv"]
                     manifest["pixiv"]["post_url"] = inherited_url
@@ -1587,6 +1359,10 @@ def cmd_upload(args):
                 elif cancel_requested:
                     manifest["status_by_target"]["pixiv"] = "canceled"
                     manifest["errors"].append("Pixiv upload canceled")
+                    all_succeeded = False
+                elif pixiv_browser_error:
+                    manifest["status_by_target"]["pixiv"] = "failed"
+                    manifest["errors"].append(f"Pixiv browser unavailable: {pixiv_browser_error}")
                     all_succeeded = False
                 else:
                     pixiv_copy = Path(manifest["pixiv"]["clean_copy_path"])
@@ -1675,121 +1451,6 @@ def cmd_upload(args):
                                 manifest["errors"].append(error_msg)
                             all_succeeded = False
 
-            if "x" in effective_targets:
-                if "x" in skip_targets:
-                    inherited_url = prior_successes["x"]
-                    manifest["x"]["post_url"] = inherited_url
-                    manifest["status_by_target"]["x"] = "skipped_already_done"
-                    log.info(f"    X 已发过，跳过: {inherited_url}")
-                elif manifest["status_by_target"].get("x") == "failed":
-                    all_succeeded = False
-                elif manifest["status_by_target"].get("x") == "skipped_max_age":
-                    log.info("    X 已因 NSFW 硬规则跳过")
-                elif cancel_requested:
-                    manifest["status_by_target"]["x"] = "canceled"
-                    manifest["errors"].append("X upload canceled")
-                    all_succeeded = False
-                elif not manifest["x"]["clean_copy_paths"]:
-                    manifest["status_by_target"]["x"] = "failed"
-                    manifest["errors"].append("X payload missing (build failed)")
-                    all_succeeded = False
-                else:
-                    from x.support import create_x_post as _create_x_post
-                    x_image_paths = [Path(p) for p in manifest["x"]["clean_copy_paths"]]
-                    x_url = None
-                    try:
-                        x_url = _create_x_post(
-                            x_page,
-                            manifest["x"],
-                            x_image_paths,
-                            args.delay,
-                            settings=x_settings,
-                            log_dir=LOG_DIR,
-                            cancel_event=_cancel_ev,
-                        )
-                    except InterruptedError:
-                        cancel_requested = True
-                        x_url = None
-                    except Exception as exc:
-                        log.error(f"    X 发布异常: {exc}")
-                        log.debug(traceback.format_exc())
-                        x_url = None
-                    if x_url:
-                        manifest["x"]["post_url"] = x_url
-                        manifest["status_by_target"]["x"] = "success"
-                        log.info(f"    X 发布成功: {x_url}")
-                    elif cancel_requested and manifest["status_by_target"].get("x") == "pending":
-                        manifest["status_by_target"]["x"] = "canceled"
-                        manifest["errors"].append("X upload canceled")
-                        all_succeeded = False
-                    else:
-                        manifest["status_by_target"]["x"] = "failed"
-                        manifest["errors"].append("X upload failed")
-                        all_succeeded = False
-
-            if "xhs" in effective_targets:
-                if "xhs" in skip_targets:
-                    inherited_url = prior_successes["xhs"]
-                    manifest["xhs"]["post_url"] = inherited_url
-                    manifest["status_by_target"]["xhs"] = "skipped_already_done"
-                    log.info(f"    xhs 已发过，跳过: {inherited_url}")
-                elif manifest["status_by_target"].get("xhs") == "failed":
-                    all_succeeded = False
-                elif manifest["status_by_target"].get("xhs") == "skipped_max_age":
-                    log.info("    xhs 已因 NSFW 硬规则跳过（小红书不接受 r18/r18g）")
-                elif cancel_requested:
-                    manifest["status_by_target"]["xhs"] = "canceled"
-                    manifest["errors"].append("xhs upload canceled")
-                    all_succeeded = False
-                elif not manifest["xhs"]["clean_copy_paths"]:
-                    manifest["status_by_target"]["xhs"] = "failed"
-                    manifest["errors"].append("xhs payload missing (build failed)")
-                    all_succeeded = False
-                elif xhs_manual_mode:
-                    manifest["status_by_target"]["xhs"] = "manual_ready"
-                    log.info("    xhs 手动模式：内容已准备好，请手动发布")
-                    all_succeeded = False
-                    _xhs_manual_cb = getattr(args, "xhs_manual_callback", None)
-                    if _xhs_manual_cb:
-                        _xhs_manual_cb(manifest["xhs"], str(manifest_path))
-                elif xhs_page is None:
-                    manifest["status_by_target"]["xhs"] = "failed"
-                    manifest["errors"].append("xhs browser not available")
-                    all_succeeded = False
-                else:
-                    from xhs.support import create_xhs_post as _create_xhs_post
-                    xhs_image_paths = [Path(p) for p in manifest["xhs"]["clean_copy_paths"]]
-                    xhs_url = None
-                    try:
-                        xhs_url = _create_xhs_post(
-                            xhs_page,
-                            manifest["xhs"],
-                            xhs_image_paths,
-                            args.delay,
-                            settings=xhs_settings,
-                            log_dir=LOG_DIR,
-                            cancel_event=_cancel_ev,
-                        )
-                    except InterruptedError:
-                        cancel_requested = True
-                        xhs_url = None
-                    except Exception as exc:
-                        log.error(f"    xhs 发布异常: {exc}")
-                        log.debug(traceback.format_exc())
-                        xhs_url = None
-                    if xhs_url:
-                        manifest["xhs"]["post_url"] = xhs_url
-                        manifest["status_by_target"]["xhs"] = "success"
-                        log.info(f"    xhs 发布成功: {xhs_url}")
-                    elif cancel_requested and manifest["status_by_target"].get("xhs") == "pending":
-                        manifest["status_by_target"]["xhs"] = "canceled"
-                        manifest["errors"].append("xhs upload canceled")
-                        all_succeeded = False
-                    else:
-                        manifest["status_by_target"]["xhs"] = "failed"
-                        manifest["errors"].append("xhs upload failed")
-                        all_succeeded = False
-
             write_manifest(manifest_path, manifest)
 
             for target in effective_targets:
@@ -1799,18 +1460,9 @@ def cmd_upload(args):
                 elif status == "failed":
                     target_fail_counts[target] += 1
 
-            _ok_or_manual = {"success", "skipped_already_done", "skipped_civitai_safety", "maybe_posted", "skipped_max_age", "manual_ready"}
-            only_manual_pending = (
-                not all_succeeded
-                and all(manifest["status_by_target"].get(t) in _ok_or_manual for t in effective_targets)
-            )
-
             if all_succeeded:
                 dest = move_to_done(orig_path)
                 log.info(f"    已移动到: {dest.name}")
-                success_count += 1
-                consecutive_failures = 0
-            elif only_manual_pending:
                 success_count += 1
                 consecutive_failures = 0
             else:
@@ -1823,18 +1475,15 @@ def cmd_upload(args):
                         target_summaries.append(f"{target} 已发过")
                     elif status == "skipped_civitai_safety":
                         target_summaries.append(f"{target} 安全过滤跳过")
-                    elif status == "manual_ready":
-                        target_summaries.append(f"{target} 待手动发布")
                     elif status == "failed":
                         target_summaries.append(f"{target} 失败")
                     else:
                         target_summaries.append(f"{target} {status}")
                 log.error(f"    {'，'.join(target_summaries)}，文件保留在 upload/")
                 fail_count += 1
-                _ok_statuses = {"success", "skipped_already_done", "skipped_civitai_safety", "maybe_posted", "skipped_max_age", "manual_ready"}
-                core_targets = [t for t in effective_targets if t != "xhs"]
-                core_any_ok = any(manifest["status_by_target"].get(t) in _ok_statuses for t in core_targets) if core_targets else False
-                if core_any_ok:
+                ok_statuses = {"success", "skipped_already_done", "skipped_civitai_safety", "maybe_posted"}
+                any_target_ok = any(manifest["status_by_target"].get(target) in ok_statuses for target in effective_targets)
+                if any_target_ok:
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
@@ -1860,21 +1509,6 @@ def cmd_upload(args):
         if pixiv_context is not None:
             try:
                 pixiv_context.close()
-            except Exception:
-                pass
-        if x_context is not None:
-            try:
-                x_context.close()
-            except Exception:
-                pass
-        if xhs_browser is not None:
-            try:
-                xhs_browser.close()
-            except Exception:
-                pass
-        elif xhs_context is not None:
-            try:
-                xhs_context.close()
             except Exception:
                 pass
         if playwright is not None:
@@ -1975,13 +1609,13 @@ def cmd_pixiv_fit_report(args):
 
 def main():
     setup_logging()
-    log.info(f"=== 启动 civitai_splitter {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+    log.info(f"=== 启动 Pixiv Uploader CLI {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
     prune_logs()
     cleanup_done_dir()
     migrate_progress_files()
 
-    parser = argparse.ArgumentParser(description="Civitai Post Splitter & Uploader")
+    parser = argparse.ArgumentParser(description="Pixiv Uploader CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     sp_split = subparsers.add_parser("split", help="拆分已发布的多图 post")
@@ -1991,7 +1625,7 @@ def main():
 
     sp_upload = subparsers.add_parser("upload", help="批量上传 upload/ 目录的图片")
     sp_upload.add_argument("--delay", type=float, default=10, help="每个 post 间隔秒数（默认10）")
-    sp_upload.add_argument("--targets", default="civitai", help="发布目标，逗号分隔：civitai,pixiv,x,xhs")
+    sp_upload.add_argument("--targets", default="civitai", help="发布目标，逗号分隔：civitai,pixiv")
     sp_upload.add_argument("--dry-run", action="store_true", help="只生成 manifest 和清洗副本，不实际发布")
     sp_upload.add_argument("--pixiv-privacy", default="public", choices=["public", "logged_in", "mypixiv", "private"])
     sp_upload.add_argument("--pixiv-allow-tag-edits", default="false", help="Pixiv 是否允许他人编辑标签（true/false）")
@@ -1999,15 +1633,9 @@ def main():
     sp_upload.add_argument("--abort-after-failures", type=int, default=3, help="连续失败 N 张后中断批次，避免触发风控（默认 3）")
     sp_upload.add_argument("--llm-reverse", action="store_true", help="用 LLM 为 Pixiv 生成标题和简介")
     sp_upload.add_argument("--llm-persona", default="", help="LLM 人设 ID")
-    sp_upload.add_argument("--llm-account", default="", help="LLM 账号 ID")
     sp_upload.add_argument("--llm-content-mode", default="", choices=["", "sfw", "nsfw"], help="LLM 文案模式")
-    sp_upload.add_argument("--x-template", default="", choices=["", "jp_sfw", "en_sfw", "zh_sfw", "jp_nsfw", "en_nsfw", "zh_nsfw"], help="X 模板（默认 en_sfw；r18/r18g 自动切到 *_nsfw）")
-    sp_upload.add_argument("--x-group", type=int, default=1, choices=[1, 2, 3, 4], help="X 多图组队大小（1=每图单推；2-4=按文件名相邻组队，一条推挂多图）")
-    sp_upload.add_argument("--xhs-template", default="", help="小红书模板（默认 default）")
-    sp_upload.add_argument("--xhs-manual", action="store_true", default=False, dest="xhs_manual_mode",
-                           help="小红书手动模式：只生成内容，不启动浏览器")
     sp_upload.add_argument("--no-ai-tags", default="", nargs="?", const="all",
-                           help="不打 AI 标签。不带值=全部平台；带值=指定平台（逗号分隔，如 pixiv,x）")
+                           help="不为 Pixiv 添加 AI 标签")
     sp_upload.add_argument("--count", type=int, default=0, help="本次发几张（默认 0 = 随机 1-5）")
     sp_upload.add_argument(
         "--sort", default="random",

@@ -95,7 +95,7 @@ def download_model_civitai(api_key: str | None) -> bool:
     print("（模型 ~50MB，进度条不动是正常的，等到底）\n")
     tmp_path = MODEL_PATH.with_suffix(".pt.partial")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "civitai-post-splitter-setup/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "pixiv-uploader-setup/1.0"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             total = resp.headers.get("Content-Length")
             total_mb = f"{int(total) / 1024 / 1024:.1f}MB" if total else "未知大小"

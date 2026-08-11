@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import re
 from copy import deepcopy
@@ -17,9 +18,7 @@ from .llm_platforms import (
     all_field_keys,
     empty_sample_fields,
     get_merged_spec,
-    get_platform_spec,
     list_platform_ids,
-    normalize_platform_id,
     normalize_platform_ids,
     required_field_keys,
 )
@@ -32,6 +31,7 @@ POLITICAL_RE = re.compile(
 )
 
 MAX_FEW_SHOT_SAMPLES = 4
+log = logging.getLogger(__name__)
 
 
 def default_llm_reverse_config() -> dict[str, Any]:
@@ -43,7 +43,6 @@ def default_llm_reverse_config() -> dict[str, Any]:
         "model": "",
         "timeout_seconds": 45,
         "default_persona_id": "pixiv_soft",
-        "default_account_id": "pixiv_main",
         "default_content_mode": "sfw",
         "personas": [
             {
@@ -59,50 +58,49 @@ def default_llm_reverse_config() -> dict[str, Any]:
                 "samples": [],
             }
         ],
-        "accounts": [
-            {
-                "id": "pixiv_main",
-                "label": "Pixiv main",
-                "platform": "pixiv",
-                "persona_id": "pixiv_soft",
-                "default_content_mode": "sfw",
-                "allowed_content_modes": ["sfw", "nsfw"],
-                "notes": "默认账号（后端回退用，UI 不再暴露）。",
-            }
-        ],
     }
 
 
 def normalize_llm_reverse_config(config: dict[str, Any] | None) -> dict[str, Any]:
-    merged = default_llm_reverse_config()
+    normalized = default_llm_reverse_config()
     if isinstance(config, dict):
-        for key, value in config.items():
-            if key in {"personas", "accounts"}:
-                if isinstance(value, list) and value:
-                    merged[key] = value
-            elif key in {"has_api_key", "api_key_masked"}:
-                continue  # mask 输出字段，不持久化
-            else:
-                merged[key] = value
-    merged["personas"] = [_migrate_persona(p) for p in merged.get("personas", []) if isinstance(p, dict)]
-    merged["accounts"] = [_clean_account(a) for a in merged.get("accounts", []) if isinstance(a, dict)]
-    merged["default_content_mode"] = _normalize_content_mode(merged.get("default_content_mode", "sfw"))
-    return merged
+        for key in (
+            "enabled", "provider", "base_url", "api_key", "model",
+            "timeout_seconds", "default_persona_id", "default_content_mode",
+        ):
+            if key in config:
+                normalized[key] = config[key]
+
+        requested_personas = config.get("personas")
+        if isinstance(requested_personas, list):
+            valid_personas = [
+                _normalize_persona(persona)
+                for persona in requested_personas
+                if isinstance(persona, dict) and _persona_has_supported_platform(persona)
+            ]
+            if valid_personas:
+                normalized["personas"] = valid_personas
+
+    normalized["default_content_mode"] = _normalize_content_mode(normalized.get("default_content_mode", "sfw"))
+    persona_ids = {persona["id"] for persona in normalized["personas"]}
+    if normalized.get("default_persona_id") not in persona_ids:
+        normalized["default_persona_id"] = normalized["personas"][0]["id"]
+    return normalized
 
 
-def _migrate_persona(persona: dict[str, Any]) -> dict[str, Any]:
+def _persona_has_supported_platform(persona: dict[str, Any]) -> bool:
+    raw = persona.get("platform", DEFAULT_PLATFORM_ID)
+    platform_ids = raw if isinstance(raw, list) else [raw]
+    return any(str(platform or "").strip().lower() in PLATFORM_SPECS for platform in platform_ids)
+
+
+def _normalize_persona(persona: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     out["id"] = str(persona.get("id") or "").strip() or _gen_persona_id()
     out["label"] = str(persona.get("label") or out["id"]).strip()
     out["platform"] = normalize_platform_ids(persona.get("platform"))
     out["default_content_mode"] = _normalize_content_mode(persona.get("default_content_mode", "sfw"))
-    voice = str(persona.get("voice") or "").strip()
-    if not voice:
-        # Migrate legacy title_style + caption_style into a single voice description.
-        ts = str(persona.get("title_style") or "").strip()
-        cs = str(persona.get("caption_style") or "").strip()
-        voice = " / ".join(part for part in (ts, cs) if part)
-    out["voice"] = voice
+    out["voice"] = str(persona.get("voice") or "").strip()
     out["sfw_prompt"] = str(persona.get("sfw_prompt") or "").strip()
     out["nsfw_prompt"] = str(persona.get("nsfw_prompt") or "").strip()
     out["extra_prompt"] = str(persona.get("extra_prompt") or "").strip()
@@ -113,13 +111,14 @@ def _migrate_persona(persona: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _clean_sample(sample: dict[str, Any], platform_id: str) -> dict[str, Any]:
+def _clean_sample(sample: dict[str, Any], platform_ids: list[str]) -> dict[str, Any]:
     fields_raw = sample.get("fields") or {}
     fields: dict[str, Any] = {}
+    allowed_keys = {key for platform_id in platform_ids for key in all_field_keys(platform_id)}
     if isinstance(fields_raw, dict):
-        # Preserve any keys (even from other platforms), so switching platforms
-        # back doesn't lose data. Validation will warn on unknown keys.
         for key, value in fields_raw.items():
+            if key not in allowed_keys:
+                continue
             if isinstance(value, list):
                 fields[str(key)] = [str(v).strip() for v in value if str(v).strip()]
             else:
@@ -134,68 +133,15 @@ def _clean_sample(sample: dict[str, Any], platform_id: str) -> dict[str, Any]:
 _NSFW_TIER = {"all_ages": 0, "sfw": 0, "r18": 1, "r18g": 2}
 
 
-def _normalize_max_nsfw_level(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    if raw in {"r18g", "r-18g", "r18_g"}:
-        return "r18g"
-    if raw in {"r18", "r-18"}:
-        return "r18"
-    return "sfw"
-
-
-def _clean_account(account: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": str(account.get("id") or "").strip(),
-        "label": str(account.get("label") or "").strip(),
-        "platform": normalize_platform_id(account.get("platform")),
-        "persona_id": str(account.get("persona_id") or "").strip(),
-        "default_content_mode": _normalize_content_mode(account.get("default_content_mode", "sfw")),
-        "allowed_content_modes": _normalize_allowed_modes(account.get("allowed_content_modes")),
-        "max_nsfw_level": _normalize_max_nsfw_level(account.get("max_nsfw_level", "sfw")),
-        "notes": str(account.get("notes") or ""),
-    }
-
-
-def account_can_handle_age(account: dict[str, Any] | None, image_age: str) -> bool:
-    """Check if an account's max_nsfw_level can ingest an image at image_age.
-
-    Tiers: all_ages/sfw = 0, r18 = 1, r18g = 2. Account must have a tier >=
-    the image's tier. Used to skip LLM reverse when a SFW-only provider
-    would otherwise be asked to look at NSFW content (usually refuses or hallucinates).
-    """
-    if not account:
-        return True
-    image_tier = _NSFW_TIER.get(image_age, 0)
-    account_tier = _NSFW_TIER.get(account.get("max_nsfw_level", "sfw"), 0)
-    return account_tier >= image_tier
-
-
 def content_mode_can_handle_age(content_mode: str, image_age: str) -> bool:
     """Check if the requested content_mode covers the image's age level.
 
     nsfw → handles all ages. sfw → only handles sfw/all_ages (tier 0).
-    This is the user-facing gate: what the user asked to generate determines
-    which images get LLM inference, not the account's backend capability.
+    This user-facing gate determines which images receive LLM inference.
     """
     if _normalize_content_mode(content_mode) == "nsfw":
         return True
     return _NSFW_TIER.get(image_age, 0) == 0
-
-
-def resolve_account(
-    config: dict[str, Any] | None,
-    account_id: str = "",
-) -> dict[str, Any]:
-    """Resolve which account dict to use, falling back to default_account_id
-    then to the first account. Returns empty dict if no accounts configured.
-    """
-    cfg = normalize_llm_reverse_config(config)
-    accounts = {str(item.get("id", "")): item for item in cfg.get("accounts", []) if item.get("id")}
-    return (
-        accounts.get(account_id)
-        or accounts.get(str(cfg.get("default_account_id", "")))
-        or next(iter(accounts.values()), {})
-    )
 
 
 def mask_llm_config(config: dict[str, Any] | None) -> dict[str, Any]:
@@ -211,9 +157,7 @@ def validate_llm_reverse_config(config: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     cfg = normalize_llm_reverse_config(config)
     personas = cfg.get("personas", [])
-    accounts = cfg.get("accounts", [])
     persona_ids = _unique_ids(personas, "persona", errors)
-    account_ids = _unique_ids(accounts, "account", errors)
     valid_platforms = set(list_platform_ids())
     for persona in personas:
         platforms = persona.get("platform") if isinstance(persona.get("platform"), list) else [persona.get("platform")]
@@ -225,16 +169,6 @@ def validate_llm_reverse_config(config: dict[str, Any]) -> list[str]:
                 errors.append(f"persona {persona.get('id', '')} sample mode invalid")
     if cfg.get("default_persona_id") and cfg["default_persona_id"] not in persona_ids:
         errors.append("default_persona_id not found")
-    if cfg.get("default_account_id") and cfg["default_account_id"] not in account_ids:
-        errors.append("default_account_id not found")
-    for account in accounts:
-        persona_id = account.get("persona_id")
-        if persona_id and persona_id not in persona_ids:
-            errors.append(f"account {account.get('id', '')} references missing persona {persona_id}")
-        modes = _normalize_allowed_modes(account.get("allowed_content_modes"))
-        default_mode = _normalize_content_mode(account.get("default_content_mode", cfg.get("default_content_mode", "sfw")))
-        if default_mode not in modes:
-            errors.append(f"account {account.get('id', '')} default_content_mode not allowed")
     if cfg.get("enabled"):
         provider = str(cfg.get("provider") or "openai_compatible").strip().lower()
         # anthropic/gemini allow empty base_url (each has its own official endpoint fallback)
@@ -275,7 +209,6 @@ def infer_image_copy(
     image_url: str | None = None,
     config: dict[str, Any] | None = None,
     persona_id: str = "",
-    account_id: str = "",  # accepted for backward compat; ignored now
     content_mode: str = "",
     extra_context: str = "",
     cancel_event=None,
@@ -292,7 +225,7 @@ def infer_image_copy(
         result["error"] = "llm reverse disabled"
         return result
     provider = str(cfg.get("provider") or "openai_compatible").strip().lower()
-    _required = ("api_key", "model") if provider == "anthropic" else ("base_url", "api_key", "model")
+    _required = ("api_key", "model") if provider in {"anthropic", "google_gemini"} else ("base_url", "api_key", "model")
     missing = [key for key in _required if not str(cfg.get(key, "")).strip()]
     if missing:
         result["status"] = "failed"
@@ -334,12 +267,6 @@ def infer_image_copy(
         if _has_political_content(combined):
             log.warning("LLM output contains political keywords (persona should prevent this) — passing through")
         result["fields"] = normalized
-        # Backward-compat top-level keys for pixiv consumers.
-        for key in ("title_ja", "title_zh", "caption_ja", "caption_zh", "description"):
-            if key in normalized:
-                result[key] = normalized[key]
-        if "keywords" in normalized:
-            result["keywords"] = normalized["keywords"]
         result["status"] = "ok"
         return result
     except InterruptedError:
@@ -353,111 +280,11 @@ def infer_image_copy(
 def apply_llm_result_to_pixiv_payload(payload: dict[str, Any], result: dict[str, Any]) -> None:
     if result.get("status") != "ok":
         return
-    fields = result.get("fields") or {k: result.get(k) for k in ("title_ja", "title_zh", "caption_ja", "caption_zh")}
+    fields = result.get("fields") or {}
     for key in ("title_ja", "title_zh", "caption_ja", "caption_zh"):
         value = str(fields.get(key, "") or "").strip()
         if value:
             payload[key] = value
-
-
-def empty_copy_block() -> dict[str, Any]:
-    """Empty `manifest.copy` block — the universal cross-platform copy area.
-
-    Fields:
-      - title.{ja,en,zh}   localized title strings
-      - caption.{ja,en,zh} localized caption/body strings
-      - llm_reverse        status/persona/account/platform metadata
-    """
-    return {
-        "title": {"ja": "", "en": "", "zh": ""},
-        "caption": {"ja": "", "en": "", "zh": ""},
-        "xhs": {"title": "", "body": "", "tags": []},
-        "llm_reverse": {
-            "status": "",
-            "persona_id": "",
-            "account_id": "",
-            "platform": "",
-            "content_mode": "",
-            "error": "",
-        },
-    }
-
-
-def apply_llm_result_to_copy_block(
-    copy: dict[str, Any],
-    result: dict[str, Any],
-    platform: str = "",
-    account_id: str = "",
-) -> None:
-    """In-place merge of LLM reverse result into a copy block (see empty_copy_block).
-
-    Use this when you already have a copy block to populate (e.g. before the
-    full manifest is assembled). For convenience, `apply_llm_result_to_manifest_copy`
-    wraps this for the manifest case.
-    """
-    plat = platform or result.get("platform", "") or ""
-    platform_ids: list[str]
-    if isinstance(plat, list):
-        platform_ids = plat
-    else:
-        platform_ids = [str(plat).strip().lower()] if plat else []
-
-    copy["llm_reverse"] = {
-        "status": str(result.get("status", "") or ""),
-        "persona_id": str(result.get("persona_id", "") or ""),
-        "account_id": str(account_id or ""),
-        "platform": ",".join(platform_ids) if platform_ids else "",
-        "content_mode": str(result.get("content_mode", "") or ""),
-        "error": str(result.get("error", "") or ""),
-    }
-    if result.get("status") != "ok":
-        return
-
-    fields = result.get("fields") or {}
-
-    def _set(bucket: str, lang: str, value: Any) -> None:
-        v = str(value or "").strip()
-        if v:
-            copy[bucket][lang] = v
-
-    for pid in platform_ids:
-        if pid == "pixiv":
-            _set("title",   "ja", fields.get("title_ja"))
-            _set("title",   "zh", fields.get("title_zh"))
-            _set("caption", "ja", fields.get("caption_ja"))
-            _set("caption", "zh", fields.get("caption_zh"))
-        elif pid == "x":
-            _set("caption", "en", fields.get("tweet"))
-        elif pid == "xhs":
-            xhs_block = copy.setdefault("xhs", {"title": "", "body": "", "tags": []})
-            xhs_title = str(fields.get("xhs_title") or "").strip()
-            xhs_body = str(fields.get("xhs_body") or "").strip()
-            xhs_tags_raw = fields.get("xhs_tags") or []
-            xhs_tags = [str(t).strip() for t in xhs_tags_raw if str(t).strip()] if isinstance(xhs_tags_raw, list) else []
-            if xhs_title:
-                xhs_block["title"] = xhs_title
-            if xhs_body:
-                xhs_block["body"] = xhs_body
-            if xhs_tags:
-                xhs_block["tags"] = xhs_tags
-        else:
-            for k in ("title_ja", "title_zh", "title_en"):
-                if k in fields:
-                    _set("title", k.rsplit("_", 1)[-1], fields[k])
-            for k in ("caption_ja", "caption_zh", "caption_en"):
-                if k in fields:
-                    _set("caption", k.rsplit("_", 1)[-1], fields[k])
-
-
-def apply_llm_result_to_manifest_copy(
-    manifest: dict[str, Any],
-    result: dict[str, Any],
-    platform: str = "",
-    account_id: str = "",
-) -> None:
-    """Project a LLM reverse result onto the universal `manifest.copy` area."""
-    copy = manifest.setdefault("copy", empty_copy_block())
-    apply_llm_result_to_copy_block(copy, result, platform, account_id)
 
 
 def _base_result(cfg: dict[str, Any], persona: dict[str, Any], mode: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -798,17 +625,6 @@ def _has_political_content(text: str) -> bool:
 def _normalize_content_mode(value: Any) -> str:
     mode = str(value or "sfw").strip().lower()
     return mode if mode in {"sfw", "nsfw"} else "sfw"
-
-
-def _normalize_allowed_modes(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return ["sfw", "nsfw"]
-    modes = []
-    for item in value:
-        mode = _normalize_content_mode(item)
-        if mode not in modes:
-            modes.append(mode)
-    return modes or ["sfw"]
 
 
 def _unique_ids(items: list[Any], label: str, errors: list[str]) -> set[str]:

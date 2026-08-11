@@ -209,13 +209,18 @@ FONT_FORMATS.register(PillowFontFormatHandler())
 class WatermarkRenderer(Protocol):
     renderer_id: str
 
-    def parse_spec(self, raw: dict[str, Any], font_store: "FontStore", image_store: "WatermarkImageStore") -> TextWatermarkSpec:
+    def parse_spec(
+        self,
+        raw: dict[str, Any],
+        font_store: "FontStore",
+        image_store: "WatermarkImageStore",
+    ) -> TextWatermarkSpec | ImageWatermarkSpec:
         ...
 
     def render(
         self,
         image_path: Path,
-        spec: TextWatermarkSpec,
+        spec: TextWatermarkSpec | ImageWatermarkSpec,
         font_store: "FontStore",
         image_store: "WatermarkImageStore",
     ) -> WatermarkRenderResult:
@@ -412,7 +417,7 @@ class TextWatermarkRenderer:
     renderer_id = "text"
     _positions = {"top_left", "top_right", "bottom_left", "bottom_right", "center"}
 
-    def parse_spec(self, raw: dict[str, Any], font_store: FontStore, image_store: WatermarkImageStore = None) -> TextWatermarkSpec:
+    def parse_spec(self, raw: dict[str, Any], font_store: FontStore, image_store: WatermarkImageStore | None = None) -> TextWatermarkSpec:
         enabled = _as_bool(raw.get("enabled", False))
         text = str(raw.get("text", "")).replace("\r\n", "\n").replace("\r", "\n").strip()
         if len(text) > MAX_TEXT_LENGTH:
@@ -453,7 +458,7 @@ class TextWatermarkRenderer:
         image_path: Path,
         spec: TextWatermarkSpec,
         font_store: FontStore,
-        image_store: WatermarkImageStore = None,
+        image_store: WatermarkImageStore | None = None,
     ) -> WatermarkRenderResult:
         if not spec.enabled:
             return WatermarkRenderResult(self.renderer_id, False, str(image_path), spec.font.file_name, spec.font.face_index)
@@ -686,8 +691,8 @@ class ImageWatermarkRenderer:
         self,
         image_path: Path,
         spec: ImageWatermarkSpec,
+        font_store: FontStore | None,
         image_store: WatermarkImageStore,
-        font_store: FontStore = None,
     ) -> WatermarkRenderResult:
         if not spec.enabled:
             return WatermarkRenderResult(self.renderer_id, False, str(image_path), "", 0)
