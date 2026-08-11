@@ -9,12 +9,12 @@ from unittest.mock import patch
 
 class SupportedPlatformTests(unittest.TestCase):
     def test_backend_platform_registry_contains_only_pixiv_copy_schema(self) -> None:
-        from pixiv.llm_platforms import PLATFORM_SPECS
+        from pixiv_uploader.pixiv.llm_platforms import PLATFORM_SPECS
 
         self.assertEqual(set(PLATFORM_SPECS), {"pixiv"})
 
     def test_upload_target_parser_accepts_only_civitai_and_pixiv(self) -> None:
-        import civitai_splitter
+        import pixiv_uploader.publishing as civitai_splitter
 
         self.assertEqual(civitai_splitter.parse_targets("civitai,pixiv"), ["civitai", "pixiv"])
         self.assertEqual(civitai_splitter.parse_targets("pixiv,pixiv"), ["pixiv"])
@@ -24,7 +24,7 @@ class SupportedPlatformTests(unittest.TestCase):
             civitai_splitter.parse_targets("civitai,xhs")
 
     def test_llm_normalization_drops_unsupported_personas_and_retired_keys(self) -> None:
-        from pixiv.llm_reverse import normalize_llm_reverse_config
+        from pixiv_uploader.pixiv.llm_reverse import normalize_llm_reverse_config
 
         normalized = normalize_llm_reverse_config({
             "accounts": [{"id": "old"}],
@@ -44,7 +44,7 @@ class SupportedPlatformTests(unittest.TestCase):
 
 class PlatformApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        import web_server
+        import pixiv_uploader.web as web_server
 
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)

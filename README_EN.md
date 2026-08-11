@@ -49,6 +49,8 @@ py -3 -m venv .venv
 .venv/Scripts/patchright.exe install chromium
 ```
 
+The base dependency set excludes the large Tagger and censor runtimes; their setup wizards install them only when requested.
+
 R-18 auto-censoring is optional:
 
 ```powershell
@@ -129,10 +131,11 @@ The menu provides:
 ```text
 upload/  →  preparation and platform processing  →  done/
                          │
-                         ├─ manifests/   publishing manifests and platform state
-                         ├─ progress/    deduplication and resume records
-                         ├─ pixiv_out/   sanitized / censored Pixiv artifacts
-                         └─ logs/        runtime logs
+                         └─ runtime/
+                            ├─ manifests/   publishing manifests and platform state
+                            ├─ progress/    deduplication and resume records
+                            ├─ tmp/         temporary sanitized / censored artifacts
+                            └─ logs/        runtime logs
 ```
 
 - The source moves to `done/` after all selected targets succeed
@@ -167,7 +170,7 @@ Choose a text or image watermark under **Settings → Pixiv → Watermark**. Wat
 
 - Text watermarks support imported fonts, font faces, colors, strokes, position, size, opacity, and margin
 - Image watermarks support PNG, JPEG, and WebP, preserving alpha from transparent PNG files
-- Imported fonts and images stay locally in `watermark_fonts/` and `watermark_images/`
+- Imported fonts and images stay locally in `runtime/watermark/fonts/` and `runtime/watermark/images/`
 - Removing an active watermark asset safely disables that configuration
 
 ## ⚙️ Configuration and data
@@ -175,15 +178,16 @@ Choose a text or image watermark under **Settings → Pixiv → Watermark**. Wat
 | Path | Purpose |
 |---|---|
 | `config.json` | Local settings, API keys, scheduler, and LLM configuration |
-| `civitai_safety.json` | Civitai safety skip rules |
-| `pixiv/censor.json` | Pixiv censor presets and detection classes |
-| `watermark.json` | Active text or image watermark configuration |
-| `watermark_fonts/` | Locally imported fonts |
-| `watermark_images/` | Locally imported watermark images |
-| `pixiv/age_rules.json` | Filename rules and age ratings |
-| `pixiv/tag_aliases.json` | Custom tag mappings and filters |
-| `pixiv/jp_aliases.json` | Danbooru-to-Japanese tag cache |
-| `pixiv/general_jp.json` | Pixiv tag rules and synonyms |
+| `runtime/civitai/safety.json` | Local Civitai safety rules |
+| `runtime/pixiv/censor.json` | Local Pixiv censor presets and detection classes |
+| `runtime/pixiv/*.json` | Local tag overrides, age rules, popularity cache, and validation data |
+| `runtime/watermark/config.json` | Active text or image watermark configuration |
+| `runtime/watermark/fonts/` | Locally imported fonts |
+| `runtime/watermark/images/` | Locally imported watermark images |
+| `pixiv_uploader/resources/pixiv/` | Versioned read-only Pixiv defaults and compressed dictionary |
+| `pixiv_uploader/resources/civitai/` | Versioned read-only Civitai defaults |
+
+Legacy runtime data from the repository root and `pixiv/` is migrated into `runtime/` on first launch without overwriting existing destination files.
 
 ## 🛠️ Frontend development
 
@@ -205,7 +209,7 @@ Run the Python test suite with:
 .venv/Scripts/python.exe -m unittest discover -s tests -v
 ```
 
-See [DEV_NOTES.md](DEV_NOTES.md) for architecture and maintenance notes, and [CHANGELOG.md](CHANGELOG.md) for version history.
+See [docs/development.md](docs/development.md) for architecture and maintenance notes, and [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## ⚠️ Important notes
 

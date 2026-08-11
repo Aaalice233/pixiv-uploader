@@ -11,8 +11,8 @@ from PIL import Image, ImageChops, ImageDraw, PngImagePlugin
 from werkzeug.datastructures import FileStorage
 from werkzeug.test import EnvironBuilder, stream_encode_multipart
 
-from pixiv.support import sanitize_image_for_pixiv
-from watermark import (
+from pixiv_uploader.pixiv.support import sanitize_image_for_pixiv
+from pixiv_uploader.watermark import (
     FontFormatRegistry,
     FontStore,
     PillowFontFormatHandler,
@@ -94,7 +94,7 @@ class WatermarkRegistryTests(unittest.TestCase):
     def test_invalid_saved_font_config_returns_recoverable_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / "watermark.json").write_text(
+            (root / "config.json").write_text(
                 '{"version":1,"renderer":"text","enabled":true,"text":"x",'
                 '"font":{"file_name":"missing.ttf","face_index":0},"style":{}}',
                 encoding="utf-8",
@@ -106,7 +106,7 @@ class WatermarkRegistryTests(unittest.TestCase):
 
 class WatermarkPipelineIsolationTests(unittest.TestCase):
     def test_civitai_only_upload_does_not_load_watermark_configuration(self) -> None:
-        import civitai_splitter
+        import pixiv_uploader.publishing as civitai_splitter
 
         with patch.object(civitai_splitter, "WatermarkService", side_effect=AssertionError("must not load")):
             service, spec = civitai_splitter._load_watermark_for_targets(["civitai"])
@@ -114,7 +114,7 @@ class WatermarkPipelineIsolationTests(unittest.TestCase):
         self.assertIsNone(spec)
 
     def test_watermark_failure_keeps_civitai_pending_and_blocks_pixiv(self) -> None:
-        import civitai_splitter
+        import pixiv_uploader.publishing as civitai_splitter
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -157,7 +157,7 @@ class WatermarkPipelineIsolationTests(unittest.TestCase):
 
 class WatermarkApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        import web_server
+        import pixiv_uploader.web as web_server
 
         self._temp_dir = tempfile.TemporaryDirectory()
         self._web_server = web_server
@@ -289,7 +289,7 @@ class ImageWatermarkRenderingTests(unittest.TestCase):
 
 class ImageWatermarkApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        import web_server
+        import pixiv_uploader.web as web_server
 
         self._temp_dir = tempfile.TemporaryDirectory()
         self._web_server = web_server

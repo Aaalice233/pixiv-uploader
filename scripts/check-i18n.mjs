@@ -1,13 +1,13 @@
 import { readFile } from 'node:fs/promises';
-import { messages, validateCatalogs } from '../frontend/locales.js';
+import { messages, validateCatalogs } from '../frontend/src/locales.js';
 
 const errors = validateCatalogs();
-const source = await readFile(new URL('../frontend/flow-app.jsx', import.meta.url), 'utf8');
+const source = await readFile(new URL('../frontend/src/flow-app.jsx', import.meta.url), 'utf8');
 
 const cjkMatches = [...source.matchAll(/[\u3400-\u9fff]/g)];
 if (cjkMatches.length) {
   const lines = [...new Set(cjkMatches.map(match => source.slice(0, match.index).split('\n').length))];
-  errors.push(`frontend/flow-app.jsx contains untranslated CJK text on line(s): ${lines.join(', ')}`);
+  errors.push(`frontend/src/flow-app.jsx contains untranslated CJK text on line(s): ${lines.join(', ')}`);
 }
 
 const staticKeys = [...source.matchAll(/\bt\(\s*['"]([^'"]+)['"]/g)].map(match => match[1]);

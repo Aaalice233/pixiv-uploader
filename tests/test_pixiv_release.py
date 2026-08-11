@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import pixiv.support as support
+import pixiv_uploader.pixiv.support as support
 
 
 class PixivCanonicalLookupTests(unittest.TestCase):
@@ -75,7 +75,7 @@ class PixivBrowserReuseTests(unittest.TestCase):
 
 class PixivUploadStartupTests(unittest.TestCase):
     def test_pixiv_browser_opens_after_manifest_preparation(self) -> None:
-        import civitai_splitter as splitter
+        import pixiv_uploader.publishing as splitter
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -170,7 +170,7 @@ class PixivUploadStartupTests(unittest.TestCase):
 
 class LoginBrowserLaunchTests(unittest.TestCase):
     def test_login_browser_exposes_local_cdp_endpoint(self) -> None:
-        import web_server
+        import pixiv_uploader.web as web_server
 
         with tempfile.TemporaryDirectory() as temp_dir, \
              patch.object(web_server, "_find_chrome_executable", return_value="chrome"), \

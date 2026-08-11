@@ -6,7 +6,7 @@ import {
   normalizeLocale,
   translate,
   validateCatalogs,
-} from '../frontend/locales.js';
+} from '../frontend/src/locales.js';
 
 test('uses the Pixiv Uploader product name in every locale', () => {
   assert.equal(translate('zh-CN', 'app.name'), 'Pixiv Uploader');

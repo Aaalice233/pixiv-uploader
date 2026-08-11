@@ -49,6 +49,8 @@ py -3 -m venv .venv
 .venv/Scripts/patchright.exe install chromium
 ```
 
+基础依赖不包含体积较大的 Tagger 和打码运行库；需要时由菜单向导按需安装。
+
 R-18 自动打码为可选功能：
 
 ```powershell
@@ -129,10 +131,11 @@ run_web.bat
 ```text
 upload/  →  发布准备与平台处理  →  done/
                   │
-                  ├─ manifests/   发布清单与平台状态
-                  ├─ progress/    去重和断点记录
-                  ├─ pixiv_out/   Pixiv 清洗 / 打码产物
-                  └─ logs/        运行日志
+                  └─ runtime/
+                     ├─ manifests/   发布清单与平台状态
+                     ├─ progress/    去重和断点记录
+                     ├─ tmp/         Pixiv 清洗 / 打码临时产物
+                     └─ logs/        运行日志
 ```
 
 - 成功完成全部目标后，原图会移动到 `done/`
@@ -167,7 +170,7 @@ Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Ge
 
 - 文字水印支持字体导入、字型、颜色、描边、位置、大小、透明度和边距
 - 图片水印支持 PNG、JPEG 与 WebP；透明 PNG 会保留 alpha 通道
-- 导入的字体与图片分别保存在本机 `watermark_fonts/` 和 `watermark_images/`
+- 导入的字体与图片分别保存在本机 `runtime/watermark/fonts/` 和 `runtime/watermark/images/`
 - 删除当前正在使用的水印资源时，应用会同步回退到安全的禁用状态
 
 ## ⚙️ 主要配置与数据
@@ -175,15 +178,16 @@ Pixiv 文案生成支持 OpenAI 兼容接口，也支持 Anthropic 和 Google Ge
 | 路径 | 作用 |
 |---|---|
 | `config.json` | 本机设置、API key、Scheduler 和 LLM 配置 |
-| `civitai_safety.json` | Civitai 内容安全跳过规则 |
-| `pixiv/censor.json` | Pixiv 打码预设与检测类别 |
-| `watermark.json` | 当前文字或图片水印配置 |
-| `watermark_fonts/` | 本机导入的字体文件 |
-| `watermark_images/` | 本机导入的水印图片 |
-| `pixiv/age_rules.json` | 文件名规则与年龄分级 |
-| `pixiv/tag_aliases.json` | 自定义标签映射与过滤规则 |
-| `pixiv/jp_aliases.json` | Danbooru → 日文标签缓存 |
-| `pixiv/general_jp.json` | Pixiv 标签规则与同义词 |
+| `runtime/civitai/safety.json` | 本机 Civitai 内容安全规则 |
+| `runtime/pixiv/censor.json` | 本机 Pixiv 打码预设与检测类别 |
+| `runtime/pixiv/*.json` | 本机标签覆盖、年龄规则、流量缓存与回归数据 |
+| `runtime/watermark/config.json` | 当前文字或图片水印配置 |
+| `runtime/watermark/fonts/` | 本机导入的字体文件 |
+| `runtime/watermark/images/` | 本机导入的水印图片 |
+| `pixiv_uploader/resources/pixiv/` | 随版本发布的只读 Pixiv 默认规则和压缩词典 |
+| `pixiv_uploader/resources/civitai/` | 随版本发布的只读 Civitai 默认规则 |
+
+旧版散落在根目录和 `pixiv/` 下的运行数据会在首次启动时自动迁移到 `runtime/`，不会覆盖已存在的新数据。
 
 ## 🛠️ 前端开发
 
@@ -205,7 +209,7 @@ Python 测试：
 .venv/Scripts/python.exe -m unittest discover -s tests -v
 ```
 
-更多模块约定与维护说明见 [DEV_NOTES.md](DEV_NOTES.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。
+更多模块约定与维护说明见 [docs/development.md](docs/development.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## ⚠️ 注意事项
 

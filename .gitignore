@@ -3,29 +3,42 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Personal upload history & queues
+# Local application state
+runtime/
 done/
 upload/
-manifests/
-progress/
-pixiv/rule_fit/
-.tmp/
 .playwright-cli/
 
-# Logs (auto-archived, capped to 100/10 days each group)
+# Legacy runtime paths kept ignored until automatic migration completes
+manifests/
+progress/
 logs/
-
-# Personal upload history (huge, contains post URLs)
-pixiv_validation_cases.json
-
-# User-tunable config (auto-generated with defaults; private once tuned)
-config.json
-pixiv_censor.json
+pixiv/rule_fit/
+pixiv/logs/
+pixiv/censor.json
+pixiv/age_rules.json
+pixiv/general_jp.json
+pixiv/jp_aliases.json
+pixiv/tag_aliases.json
+pixiv/tag_popularity.json
+pixiv/validation_cases.json
+*_progress.json
+.tmp/
 watermark.json
 watermark_fonts/
 watermark_images/
+civitai_safety.json
+pixiv_censor.json
+pixiv_age_rules.json
+pixiv_general_jp.json
+pixiv_jp_aliases.json
+pixiv_tag_aliases.json
+pixiv_tag_popularity.json
+pixiv_validation_cases.json
+pixiv/danbooru_jp.json
 
-# Anything that looks like a credential dump
+# Local settings and credentials
+config.json
 *.cookie
 *.cookies
 *.token
@@ -34,14 +47,12 @@ watermark_images/
 secrets.json
 credentials.json
 
-# Big Danbooru dictionary (~150MB, fetched via setup script — too big for GitHub)
-pixiv/danbooru_jp.json
-
-# Model files (50+ MB, fetched via setup_censor.py)
+# Downloaded model files
 models/
 
 # Local media dropped beside the tool
 *.mp3
+*.wav
 
 # Frontend build dependencies
 node_modules/
