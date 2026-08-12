@@ -366,26 +366,32 @@ def cmd_tagger_menu() -> None:
 def cmd_pixiv_logout() -> None:
     import shutil
     from patchright.sync_api import sync_playwright
-    from .pixiv.support import PIXIV_PROFILE_DIR
-    shutil.rmtree(PIXIV_PROFILE_DIR, ignore_errors=True)
+    from .pixiv.session import PIXIV_PROFILE_DIR, PIXIV_SESSION, PixivFlowError
+    from .pixiv.support import run_pixiv_login_flow
+
+    try:
+        lease = PIXIV_SESSION.acquire("logout:cli")
+    except PixivFlowError as exc:
+        print(f"Pixiv Profile 正在使用中 [{exc.code}]：{exc}")
+        return
+    try:
+        if PIXIV_PROFILE_DIR.exists():
+            shutil.rmtree(PIXIV_PROFILE_DIR)
+        PIXIV_SESSION.clear()
+    except OSError as exc:
+        print(f"无法清除 Pixiv Profile；请关闭占用它的 Chrome 后重试：{exc}")
+        return
+    finally:
+        PIXIV_SESSION.release(lease)
     print(f"已清除旧登录状态（{PIXIV_PROFILE_DIR}）。")
-    print("正在打开浏览器，请登录 Pixiv 后回到此窗口按 Enter...")
-    with sync_playwright() as pw:
-        context = pw.chromium.launch_persistent_context(
-            str(PIXIV_PROFILE_DIR),
-            channel="chrome",
-            headless=False,
-            args=["--disable-sync", "--no-first-run"],
-            ignore_default_args=["--enable-automation", "--no-sandbox"],
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-        try:
-            page.goto("https://accounts.pixiv.net/login", wait_until="commit", timeout=15000)
-        except Exception:
-            pass
-        input("\n>>> 登录完成后按 Enter 关闭浏览器并保存登录状态... ")
-        context.close()
-    print("浏览器已关闭，登录状态已保存。")
+    print("正在打开 Pixiv。请直接在网页中登录，验证成功后窗口会自动关闭。")
+    try:
+        with sync_playwright() as pw:
+            run_pixiv_login_flow(pw, owner="login:cli")
+    except PixivFlowError as exc:
+        print(f"Pixiv 登录未完成 [{exc.code}]：{exc}")
+        return
+    print("Pixiv 投稿会话验证成功，浏览器已自动关闭。")
 
 
 def cmd_civitai_login() -> None:

@@ -88,6 +88,17 @@ Recommended first-time setup:
 
 Do not close browser windows opened by the application while login or publishing is in progress. Account sessions stay in local browser profiles and are not uploaded to a project-owned server.
 
+### Pixiv sign-in, challenges, and automatic resume
+
+- **First sign-in** — click Pixiv sign-in under **Settings → General → Publishing accounts**, then complete the flow only on Pixiv. The app verifies the real submission page and file input; once verified, the browser closes automatically. No terminal Enter key or Web “Continue” button is required. A Profile that exists but has never passed this check is shown as “Verification pending,” not signed in.
+- **Long-lived session** — sign-in and publishing both use system Chrome with one stable persistent Profile. Each Pixiv batch launches one browser Context and reuses it across images. Keep the device, Profile, and network egress stable, and do not open that Profile in an external Chrome instance at the same time.
+- **Expired session** — the task moves to “Action needed” and opens Pixiv sign-in. After you sign in on Pixiv, the app verifies the submission page again and automatically resumes the current image. The wait limit is 15 minutes and remains cancelable from Task center.
+- **CAPTCHA** — for a challenge before submission, the app performs exactly one automatic submit after you solve it. If the challenge appears after Submit was already clicked, complete it on Pixiv and click Submit once only when Pixiv explicitly asks. The app never submits a second time automatically. The CAPTCHA limit is 10 minutes, and the whole Pixiv queue pauses while waiting.
+- **Adaptive cooldown** — normal success adds `0.8–1.4×` jitter around `--delay` (about 8–14 seconds by default). CAPTCHA or HTTP 429 raises the next cooldown to 2–5, 5–10, or 15–30 minutes and honors a longer `Retry-After` when provided. Three risk-free successes or 24 hours without a new risk signal lower the level. Risk and pending cooldown survive application restarts.
+- **Safe archival and termination** — an image counts as complete only after every selected target is confirmed and the source has moved into `done/`; confirmed uploads do not remain in `upload/`, and an archival failure is reported explicitly. Closing the browser, timing out, or canceling stops the Pixiv batch and keeps unconfirmed images. If Submit was clicked but success cannot be confirmed, the manifest records `maybe_posted` and automatic retry is forbidden until you check the Pixiv artworks page.
+
+The account card reports “Not set up / Verification pending / Verifying / Signed in / Sign-in required / In use / Verification failed,” along with last verification, risk level, and cooldown. Task center shows the current sign-in, CAPTCHA, or cooldown reason and remaining time in real time.
+
 ### CLI menu
 
 Double-click `run.bat`, or run:
@@ -140,7 +151,8 @@ upload/  →  preparation and platform processing  →  done/
 
 - The source moves to `done/` after all selected targets succeed
 - If one platform fails, the image remains available for retry and completed targets are skipped
-- The manifest records preparation and publishing results for each platform to aid diagnosis
+- If Pixiv accepted a Submit click but the outcome is uncertain, the image stays in place with `maybe_posted` and is never resubmitted automatically
+- The manifest records preparation results, publishing status, and actionable error codes for each platform
 
 ## 🏷️ Taggers
 
@@ -187,6 +199,8 @@ Choose a text or image watermark under **Settings → Pixiv processing → Water
 | `config.json` | Local settings, API keys, scheduler, and LLM configuration |
 | `runtime/civitai/safety.json` | Local Civitai safety rules |
 | `runtime/pixiv/censor.json` | Local Pixiv censor presets and detection classes |
+| `runtime/pixiv/session.json` | Last verified Pixiv session result and timestamp |
+| `runtime/pixiv/risk_state.json` | Pixiv risk level, safe-success count, and restart-safe cooldown |
 | `runtime/pixiv/*.json` | Local tag overrides, age rules, popularity cache, and validation data |
 | `runtime/watermark/config.json` | Active text or image watermark configuration |
 | `runtime/watermark/fonts/` | Locally imported fonts |

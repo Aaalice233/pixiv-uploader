@@ -154,7 +154,14 @@ def find_target_successes(manifest_dir: Path, source_path: Path) -> dict[str, st
         if manifest.get("dry_run"):
             continue
         for target, status in (manifest.get("status_by_target") or {}).items():
-            if status not in {"success", "maybe_posted"}:
+            # Uncertain submissions intentionally block automatic retries. They may
+            # have reached Pixiv even when no artwork URL was returned.
+            if status == "maybe_posted":
+                current = latest.get(target)
+                if current is None or path.name > current[0]:
+                    latest[target] = (path.name, "")
+                continue
+            if status != "success":
                 continue
             target_block = manifest.get(target) or {}
             url = target_block.get("post_url") if isinstance(target_block, dict) else ""

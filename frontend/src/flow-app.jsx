@@ -449,9 +449,38 @@ function taskStageLabel(task, t) {
   return translated === stageKey ? (task?.stage_label || t(`task.status.${task?.status || 'queued'}`)) : translated;
 }
 
+function taskRemainingLabel(rawSeconds, t, formatNumber) {
+  const total = Math.max(0, Math.ceil(Number(rawSeconds || 0)));
+  if (total < 60) return t('task.remaining.seconds', { seconds: formatNumber(total) });
+  return t('task.remaining.minutesSeconds', {
+    minutes: formatNumber(Math.floor(total / 60)),
+    seconds: String(total % 60).padStart(2, '0'),
+  });
+}
+
 function taskActivityLabel(task, t, formatNumber) {
   const activity = task?.activity;
-  if (activity?.kind !== 'llm_retry') return '';
+  if (!activity?.kind) return '';
+  if (activity.kind === 'pixiv_interaction') {
+    const key = {
+      pixiv_login: 'task.pixivInteraction.login',
+      pixiv_profile_wait: 'task.pixivInteraction.profileWait',
+      pixiv_captcha_before_submit: 'task.pixivInteraction.captchaBefore',
+      pixiv_captcha_after_submit: 'task.pixivInteraction.captchaAfter',
+    }[activity.interaction_type];
+    if (!key) return '';
+    return activity.interaction_type === 'pixiv_profile_wait'
+      ? t(key)
+      : t(key, { remaining: taskRemainingLabel(activity.remaining_seconds, t, formatNumber) });
+  }
+  if (activity.kind === 'pixiv_cooldown') {
+    const key = activity.reason === 'baseline' ? 'task.pixivCooldown.baseline' : activity.reason === 'http_429' ? 'task.pixivCooldown.rateLimit' : 'task.pixivCooldown.risk';
+    return t(key, {
+      level: formatNumber(Math.max(0, Number(activity.risk_level || 0))),
+      remaining: taskRemainingLabel(activity.remaining_seconds, t, formatNumber),
+    });
+  }
+  if (activity.kind !== 'llm_retry') return '';
   const values = {
     attempt: formatNumber(Math.max(0, Number(activity.attempt || 0))),
     maximum: formatNumber(Math.max(1, Number(activity.max_attempts || 1))),
@@ -512,7 +541,7 @@ function TaskRow({ task, onCancel, onRemove, onRetry }) {
     <div className="flow-task-progress">
       <div className="flow-task-stage"><div className="flow-task-stage-heading"><strong>{stageLabel}</strong>{imagePosition && <span className="flow-task-image-position">{imagePosition}</span>}</div><span>{overallLabel}</span></div>
       <div className={`flow-task-meter ${task.status === 'running' ? 'active' : ''}`} role="progressbar" aria-label={stageLabel} aria-valuemin="0" aria-valuemax="100" aria-valuenow={displayProgress} aria-valuetext={progressAriaLabel}><i style={{ width: `${visualProgress}%` }}/></div>
-      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{activityLabel || itemDetail}</span>{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
+      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{itemDetail}</span>{activityLabel && <span className="flow-task-activity">{activityLabel}</span>}{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
     </div>
     <div className="flow-task-controls">{task.status === 'failed' && <IconButton icon="refresh" label={t('task.retry')} onClick={() => onRetry(task)}/>} {(task.status === 'running' || task.status === 'queued' || task.status === 'waiting_input') ? <IconButton icon="pause" label={t('task.cancel')} onClick={() => onCancel(task.id)}/> : <IconButton icon="x" label={t('task.remove')} onClick={() => onRemove(task.id)}/>}</div>
   </article>;
@@ -560,9 +589,10 @@ function ActivityLog({ logs, clearLogs, notify }) {
 }
 
 function GeneralSettings({ status, theme, setTheme, notify, reloadStatus }) {
-  const { locale, locales, setLocale, t } = useI18n();
+  const { formatDateTime, locale, locales, setLocale, t } = useI18n();
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState('');
+  const pixivSession = status.pixiv_session || { state: status.pixiv_logged_in ? 'authenticated' : 'missing' };
   async function saveKey() {
     if (!apiKey.trim()) return;
     setBusy('key');
@@ -573,15 +603,31 @@ function GeneralSettings({ status, theme, setTheme, notify, reloadStatus }) {
   async function accountAction(platform, action) {
     setBusy(`${platform}-${action}`);
     try {
-      await api(`/api/${platform}-${action === 'login' ? 'open-login' : 'logout'}`, { method: 'POST' });
-      if (action === 'login') { await reloadStatus(); notify(t('settings.loginOpened', { platform: PLATFORM_META[platform].label })); } else { await reloadStatus(); notify(t('settings.profileCleared')); }
+      const endpoint = action === 'login' ? 'open-login' : action === 'cancel' ? 'login-cancel' : 'logout';
+      await api(`/api/${platform}-${endpoint}`, { method: 'POST' });
+      await reloadStatus();
+      if (action === 'login') notify(t(platform === 'pixiv' ? 'settings.pixivLoginStarted' : 'settings.loginOpened', { platform: PLATFORM_META[platform].label }));
+      if (action === 'cancel') notify(t('settings.pixivLoginCanceled'));
+      if (action === 'logout') notify(t('settings.profileCleared'));
     } catch (error) { notify(localizedError(error, t), 'error'); }
     finally { setBusy(''); }
   }
+  const pixivState = String(pixivSession.state || 'missing');
+  const pixivChecking = pixivState === 'checking';
+  const pixivInUse = pixivState === 'in_use';
+  const pixivLogoutBusy = pixivState === 'in_use' && String(pixivSession.in_use_by || '').startsWith('logout');
+  const pixivDetails = [];
+  if (pixivSession.last_verified_at) pixivDetails.push(t('settings.pixivLastVerified', { time: formatDateTime(pixivSession.last_verified_at) }));
+  if (pixivSession.last_error_code) pixivDetails.push(t('settings.pixivError', { reason: pixivSession.last_error || pixivSession.last_error_code }));
+  if (Number(pixivSession.risk_level || 0) > 0) pixivDetails.push(t('settings.pixivRiskLevel', { level: pixivSession.risk_level }));
+  if (pixivSession.cooldown_until) pixivDetails.push(t('settings.pixivCooldownUntil', { time: formatDateTime(pixivSession.cooldown_until) }));
   return <div className="settings-page">
     <section className="settings-section"><h3>{t('settings.appearance')}</h3><div className="settings-row"><div><strong>{t('settings.theme')}</strong><small>{t('settings.themeHint')}</small></div><div className="flow-segmented"><button aria-pressed={theme === 'dark'} className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')}>{t('settings.theme.dark')}</button><button aria-pressed={theme === 'light'} className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')}>{t('settings.theme.light')}</button></div></div><div className="settings-row"><div><strong>{t('settings.language')}</strong><small>{t('settings.languageHint')}</small></div><div className="flow-segmented locale-segmented">{locales.map(item => <button key={item.id} lang={item.id} aria-pressed={locale === item.id} className={locale === item.id ? 'active' : ''} onClick={() => setLocale(item.id)}>{item.label}</button>)}</div></div></section>
     <section className="settings-section"><h3>{t('settings.civitaiApi')}</h3><form className="settings-inline-field" onSubmit={event => { event.preventDefault(); saveKey(); }}><input className="credential-username" type="text" autoComplete="username" value="civitai-api" readOnly aria-hidden="true" tabIndex={-1}/><input type="password" autoComplete="new-password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={status.api_key_masked || t('settings.apiKeyPlaceholder')}/><Button type="submit" variant="primary" disabled={!apiKey.trim() || busy === 'key'}>{t('common.save')}</Button></form></section>
-    <section className="settings-section"><h3>{t('settings.accounts')}</h3>{['civitai','pixiv'].map(id => <div className="account-row" key={id}><PlatformBadge id={id} connected={status[`${id}_logged_in`]}/><span>{status[`${id}_logged_in`] ? t('settings.profileCreated') : t('settings.profileMissing')}</span><div><Button icon="link" onClick={() => accountAction(id, 'login')} disabled={busy.startsWith(id)}>{t('common.login')}</Button>{status[`${id}_logged_in`] && <Button variant="danger-ghost" icon="logout" onClick={() => accountAction(id, 'logout')} disabled={busy.startsWith(id)}>{t('common.clear')}</Button>}</div></div>)}</section>
+    <section className="settings-section"><h3>{t('settings.accounts')}</h3>
+      <div className="account-row"><PlatformBadge id="civitai" connected={status.civitai_logged_in}/><div className="account-copy"><strong>{status.civitai_logged_in ? t('settings.profileCreated') : t('settings.profileMissing')}</strong></div><div className="account-actions"><Button icon="link" onClick={() => accountAction('civitai', 'login')} disabled={busy.startsWith('civitai')}>{t('common.login')}</Button>{status.civitai_logged_in && <Button variant="danger-ghost" icon="logout" onClick={() => accountAction('civitai', 'logout')} disabled={busy.startsWith('civitai')}>{t('common.clear')}</Button>}</div></div>
+      <div className={`account-row pixiv-session ${pixivState}`}><PlatformBadge id="pixiv" connected={pixivState === 'authenticated'}/><div className="account-copy"><strong>{t(`settings.pixivSession.${pixivState}`)}</strong>{pixivDetails.length > 0 && <small>{pixivDetails.join(' · ')}</small>}</div><div className="account-actions">{pixivChecking ? <Button icon="x" onClick={() => accountAction('pixiv', 'cancel')} disabled={busy.startsWith('pixiv')}>{t('common.cancel')}</Button> : !pixivLogoutBusy && <Button icon="link" onClick={() => accountAction('pixiv', 'login')} disabled={busy.startsWith('pixiv') || pixivInUse}>{pixivState === 'authenticated' ? t('settings.verifyAgain') : t('common.login')}</Button>}{pixivSession.profile_exists && !pixivLogoutBusy && <Button variant="danger-ghost" icon="logout" onClick={() => accountAction('pixiv', 'logout')} disabled={busy.startsWith('pixiv') || pixivChecking || pixivInUse}>{t('common.clear')}</Button>}</div></div>
+    </section>
   </div>;
 }
 

@@ -204,49 +204,40 @@ class PixivLlmTagPipelineTests(unittest.TestCase):
 
 
 class PixivBrowserReuseTests(unittest.TestCase):
-    def test_profile_cdp_endpoint_ignores_stale_port_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            profile = Path(temp_dir)
-            (profile / "DevToolsActivePort").write_text("40123\n/devtools/browser/test", encoding="utf-8")
-            with patch.object(support.httpx, "get", side_effect=support.httpx.ConnectError("closed")):
-                self.assertIsNone(support._profile_cdp_endpoint(profile))
-
-    def test_open_browser_attaches_to_login_window(self) -> None:
+    def test_open_browser_always_owns_a_persistent_context_without_remote_debugging(self) -> None:
         page = Mock()
-        page.url = "https://www.pixiv.net/"
+        page.is_closed.return_value = False
         context = Mock()
         context.pages = [page]
-        browser = SimpleNamespace(contexts=[context])
         chromium = Mock()
-        chromium.connect_over_cdp.return_value = browser
+        chromium.launch_persistent_context.return_value = context
         pw = SimpleNamespace(chromium=chromium)
 
-        with patch.object(support, "_profile_cdp_endpoint", return_value="http://127.0.0.1:40123"):
+        with patch.object(support.PIXIV_SESSION, "ensure_profile_identity"):
             opened_context, opened_page = support.open_pixiv_browser(pw)
 
         self.assertIs(opened_context, context)
         self.assertIs(opened_page, page)
-        chromium.connect_over_cdp.assert_called_once_with("http://127.0.0.1:40123")
-        chromium.launch_persistent_context.assert_not_called()
+        call = chromium.launch_persistent_context.call_args
+        self.assertEqual(call.args[0], str(support.PIXIV_PROFILE_DIR))
+        self.assertTrue(call.kwargs["no_viewport"])
+        self.assertNotIn("args", call.kwargs)
+        self.assertFalse(hasattr(chromium, "connect_over_cdp") and chromium.connect_over_cdp.called)
 
-    def test_profile_lock_error_is_actionable(self) -> None:
+    def test_profile_lock_error_is_actionable_and_coded(self) -> None:
         chromium = Mock()
-        chromium.launch_persistent_context.side_effect = RuntimeError("Target closed")
+        chromium.launch_persistent_context.side_effect = RuntimeError(
+            "Failed to create a ProcessSingleton for your profile directory"
+        )
         pw = SimpleNamespace(chromium=chromium)
 
-        with patch.object(support, "_profile_cdp_endpoint", return_value=None):
-            with self.assertRaisesRegex(RuntimeError, "关闭占用该账号配置的 Chrome 窗口"):
-                support.open_pixiv_browser(pw)
+        with self.assertRaises(support.PixivFlowError) as caught:
+            support.open_pixiv_browser(pw)
 
-    def test_attached_login_browser_is_not_closed_after_task(self) -> None:
-        context = Mock()
-        context._pixiv_uploader_attached = True
+        self.assertEqual(caught.exception.code, "pixiv_profile_locked_external")
+        self.assertIn("外部 Chrome", str(caught.exception))
 
-        support.close_pixiv_browser(context)
-
-        context.close.assert_not_called()
-
-    def test_owned_browser_is_closed_after_task(self) -> None:
+    def test_owned_browser_is_always_closed_after_flow(self) -> None:
         context = Mock(spec=["close"])
 
         support.close_pixiv_browser(context)
@@ -277,7 +268,7 @@ class PixivUploadFailureTests(unittest.TestCase):
         self.assertEqual(progress_events, [("filling_pixiv", {"stage_progress": 0.0})])
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0].name, "browser_session")
-        self.assertEqual(steps[0].reason, "browser_closed")
+        self.assertEqual(steps[0].reason, "pixiv_browser_closed")
 
 
 class PixivUploadStartupTests(unittest.TestCase):
@@ -369,6 +360,8 @@ class PixivUploadStartupTests(unittest.TestCase):
                 stack.enter_context(patch.object(splitter, "create_upload_manifest", side_effect=prepare))
                 stack.enter_context(patch.object(splitter, "open_pixiv_browser", side_effect=open_browser))
                 stack.enter_context(patch.object(splitter, "create_pixiv_post", side_effect=publish))
+                stack.enter_context(patch.object(splitter, "_acquire_pixiv_profile_for_task", return_value=object()))
+                stack.enter_context(patch.object(splitter, "PixivRateController"))
                 stack.enter_context(patch.object(splitter, "find_target_successes", return_value={}))
                 stack.enter_context(patch.object(splitter, "write_manifest"))
                 stack.enter_context(patch.object(splitter, "save_json"))
@@ -387,18 +380,51 @@ class PixivUploadStartupTests(unittest.TestCase):
             playwright.stop.assert_called_once_with()
 
 
+class UploadFinalizationTests(unittest.TestCase):
+    def test_confirmed_success_moves_source_out_of_upload(self) -> None:
+        import pixiv_uploader.publishing as publishing
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            upload = root / "upload"
+            done = root / "done"
+            upload.mkdir()
+            source = upload / "image.png"
+            source.write_bytes(b"confirmed")
+
+            with patch.object(publishing, "DONE_DIR", done):
+                destination = publishing.move_to_done(source)
+
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.is_file())
+            self.assertEqual(destination.parent, done)
+            self.assertEqual(destination.read_bytes(), b"confirmed")
+
+    def test_archive_failure_does_not_report_a_fake_destination(self) -> None:
+        import pixiv_uploader.publishing as publishing
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            missing_source = root / "upload" / "missing.png"
+            with patch.object(publishing, "DONE_DIR", root / "done"):
+                with self.assertRaises(FileNotFoundError):
+                    publishing.move_to_done(missing_source)
+
+            self.assertFalse((root / "done").exists())
+
+
 class LoginBrowserLaunchTests(unittest.TestCase):
-    def test_login_browser_exposes_local_cdp_endpoint(self) -> None:
+    def test_legacy_login_launcher_is_only_used_for_civitai(self) -> None:
         import pixiv_uploader.web as web_server
 
-        with tempfile.TemporaryDirectory() as temp_dir, \
-             patch.object(web_server, "_find_chrome_executable", return_value="chrome"), \
-             patch.object(web_server.subprocess, "Popen") as popen:
-            web_server._open_login_browser(Path(temp_dir) / "profile", "https://www.pixiv.net/")
+        with patch.object(web_server, "_open_login_browser") as open_legacy:
+            response = web_server.app.test_client().post("/api/civitai-open-login")
 
-        command = popen.call_args.args[0]
-        self.assertIn("--remote-debugging-address=127.0.0.1", command)
-        self.assertIn("--remote-debugging-port=0", command)
+        self.assertEqual(response.status_code, 200)
+        open_legacy.assert_called_once_with(
+            web_server.CIVITAI_PROFILE_DIR,
+            "https://civitai.com/login?returnUrl=/",
+        )
 
 
 if __name__ == "__main__":

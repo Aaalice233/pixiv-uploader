@@ -30,8 +30,15 @@ from .pixiv.llm_reverse import (
     normalize_llm_reverse_config,
     validate_llm_reverse_config,
 )
+from .pixiv.session import (
+    PIXIV_PROFILE_DIR,
+    PIXIV_SESSION,
+    PixivFlowError,
+    PixivProfileInUseError,
+    PixivRateController,
+)
 from .pixiv.storage import ensure_runtime_files, load_json, save_json
-from .pixiv.support import PIXIV_PROFILE_DIR
+from .pixiv.support import run_pixiv_login_flow
 from .pixiv.tagger_settings import (
     load_haintag_settings as _load_haintag_settings,
     resolve_cl_model_dir,
@@ -147,6 +154,13 @@ _shutdown_timer: threading.Timer | None = None
 _shutdown_lock = threading.Lock()
 # Serializes tasks that replace process-global sys.stdout/stderr/builtins.input
 _EXEC_LOCK = threading.Lock()
+# Makes Pixiv task admission, standalone login, and profile clearing atomic.
+# The queued task record or acquired profile lease becomes the durable
+# reservation before this lock is released.
+_pixiv_admission_lock = threading.Lock()
+_pixiv_login_lock = threading.Lock()
+_pixiv_login_thread: threading.Thread | None = None
+_pixiv_login_cancel: threading.Event | None = None
 
 SSE_CLIENTS: list[queue.Queue] = []
 CLIENTS_LOCK = threading.Lock()
@@ -274,6 +288,26 @@ def _broadcast_sse(event_type: str, data: dict) -> None:
             SSE_CLIENTS.remove(q)
 
 
+def _pixiv_session_payload(session_snapshot: dict | None = None) -> dict:
+    payload = dict(session_snapshot or PIXIV_SESSION.snapshot())
+    payload.update(PixivRateController().snapshot())
+    return payload
+
+
+def _broadcast_pixiv_session(session_snapshot: dict) -> None:
+    payload = _pixiv_session_payload(session_snapshot)
+    _broadcast_sse(
+        "status_update",
+        {
+            "pixiv_session": payload,
+            "pixiv_logged_in": payload.get("state") == "authenticated",
+        },
+    )
+
+
+PIXIV_SESSION.add_listener(_broadcast_pixiv_session)
+
+
 _TASK_PRIVATE_FIELDS = {"thread", "log_lines", "pending_input", "cancel_event"}
 
 
@@ -295,7 +329,26 @@ class _TaskProgressController:
                 return
             fields = self._state.advance(stage, **details)
             task.update(fields)
+            activity = task.get("activity") or {}
+            if activity.get("kind") == "pixiv_interaction":
+                task["status"] = "waiting_input"
             task["count"] = f"{task['current']} / {task['total']}" if task["total"] else "—"
+            snap = _task_snapshot(task)
+        _broadcast_sse("task_update", snap)
+
+    def interaction(self, activity: dict | None) -> None:
+        with TASKS_LOCK:
+            task = TASKS.get(self._task_id)
+            if task is None or task.get("status") in {"done", "failed", "canceled"}:
+                return
+            if activity:
+                task["activity"] = dict(activity)
+                task["status"] = "waiting_input"
+            else:
+                task["activity"] = {}
+                cancel_event = task.get("cancel_event")
+                if task.get("status") == "waiting_input" and not (cancel_event and cancel_event.is_set()):
+                    task["status"] = "running"
             snap = _task_snapshot(task)
         _broadcast_sse("task_update", snap)
 
@@ -468,6 +521,10 @@ def _run_task(task_id: str, cmd: int, params: dict) -> None:
         return
 
     with _EXEC_LOCK:
+        if cancel_event and cancel_event.is_set():
+            _push_log_line(task_id, "INFO", "worker", "任务已取消")
+            progress.finish("canceled")
+            return
         _set_task_status(task_id, "running")
         progress.report("initializing", stage_progress=0.05)
         _run_task_locked(task_id, cmd, params, progress)
@@ -541,6 +598,7 @@ def _run_task_locked(
                 ai_tags_by_platform={"pixiv": bool((params.get("ai_tags_by_platform") or {}).get("pixiv", True))},
                 cancel_event=cancel_event,
                 progress_callback=progress.report,
+                interaction_callback=progress.interaction,
             )
             result = cmd_upload(args)
             progress.store_result(result)
@@ -686,6 +744,7 @@ def api_run(cmd):
     if not isinstance(params, dict):
         return _api_error("invalid_task_params", detail="任务参数必须是对象")
     params = dict(params)
+    uses_pixiv = False
     label, target = CMD_LABELS[cmd]
     if cmd == 1:
         posts = params.get("posts") or []
@@ -706,6 +765,7 @@ def api_run(cmd):
             return _api_error("unsupported_file_in_list", detail="files 中包含不支持的图片格式")
         params["targets"] = targets
         params["files"] = normalized_files
+        uses_pixiv = "pixiv" in {part.strip().lower() for part in targets.split(",")}
         target = _target_label(targets)
         if params["files"]:
             label = f"发布 {len(params['files'])} 张图片"
@@ -724,13 +784,40 @@ def api_run(cmd):
         target=target,
         total=requested_total,
     )
-    with TASKS_LOCK:
-        TASKS[task_id] = task
-    _broadcast_sse("task_update", _task_snapshot(task))
-
     t = threading.Thread(target=_run_task, args=(task_id, cmd, params), daemon=True)
     task["thread"] = t
-    t.start()
+    if uses_pixiv:
+        with _pixiv_admission_lock:
+            pixiv_snapshot = PIXIV_SESSION.snapshot()
+            pixiv_owner = str(pixiv_snapshot.get("in_use_by") or "")
+            if pixiv_owner or _has_active_pixiv_task():
+                return _api_error(
+                    "pixiv_profile_in_use",
+                    409,
+                    detail="已有 Pixiv 流程正在使用或等待使用 Profile",
+                    owner=pixiv_owner or "publishing_task",
+                )
+            with TASKS_LOCK:
+                TASKS[task_id] = task
+    else:
+        with TASKS_LOCK:
+            TASKS[task_id] = task
+    _broadcast_sse("task_update", _task_snapshot(task))
+
+    try:
+        t.start()
+    except Exception as exc:
+        with TASKS_LOCK:
+            failed_task = TASKS.get(task_id)
+            if failed_task is task:
+                failed_task["status"] = "failed"
+                failed_task["activity"] = {}
+                failed_snapshot = _task_snapshot(failed_task)
+            else:
+                failed_snapshot = None
+        if failed_snapshot is not None:
+            _broadcast_sse("task_update", failed_snapshot)
+        return _api_error("task_start_failed", 500, detail=str(exc), reason=str(exc))
     return jsonify({"task_id": task_id})
 
 
@@ -749,8 +836,10 @@ def api_cancel(task_id):
         TASKS[task_id]["cancel_flag"] = True
         ev = TASKS[task_id].get("cancel_event")
         pending = TASKS[task_id].get("pending_input")
+        snapshot = _task_snapshot(TASKS[task_id])
     if ev:
         ev.set()
+    _broadcast_sse("task_update", snapshot)
     if pending:
         pending["result"][0] = ""
         pending["event"].set()
@@ -1323,6 +1412,7 @@ def api_status():
     except Exception:
         pass
     from .version import __version__
+    pixiv_session = _pixiv_session_payload()
     return jsonify({
         "version":           __version__,
         "mosaic_installed":  model_path.exists() and _censor_deps_ok(),
@@ -1331,7 +1421,8 @@ def api_status():
         "upload_count":      upload_count,
         "has_api_key":       bool(api_key),
         "api_key_masked":    masked,
-        "pixiv_logged_in":   PIXIV_PROFILE_DIR.exists(),
+        "pixiv_session":     pixiv_session,
+        "pixiv_logged_in":   pixiv_session.get("state") == "authenticated",
         "civitai_logged_in": CIVITAI_PROFILE_DIR.exists(),
         "scheduler":         _scheduler_from_config(cfg),
         "llm_reverse_enabled": bool(llm_cfg.get("enabled")),
@@ -1505,17 +1596,110 @@ def api_install_cl_tagger_status(task_id):
     return jsonify(state)
 
 
+def _has_active_pixiv_task() -> bool:
+    with TASKS_LOCK:
+        return any(
+            task.get("status") in {"queued", "running", "waiting_input"}
+            and "pixiv" in {
+                part.strip().lower()
+                for part in str((task.get("params") or {}).get("targets", "")).split(",")
+                if part.strip()
+            }
+            for task in TASKS.values()
+        )
+
+
+def _pixiv_session_response(*, ok: bool = True):
+    session = _pixiv_session_payload()
+    return jsonify({
+        "ok": ok,
+        "pixiv_session": session,
+        "pixiv_logged_in": session.get("state") == "authenticated",
+    })
+
+
+def _pixiv_login_worker(lease, cancel_event: threading.Event) -> None:
+    global _pixiv_login_thread, _pixiv_login_cancel
+    try:
+        from patchright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            run_pixiv_login_flow(
+                pw,
+                cancel_event=cancel_event,
+                owner="login:web",
+                lease=lease,
+            )
+    except PixivFlowError as exc:
+        if exc.code == "pixiv_login_canceled":
+            logging.getLogger(__name__).info("Pixiv 登录流程已取消")
+        else:
+            logging.getLogger(__name__).warning("Pixiv 登录流程结束 [%s]: %s", exc.code, exc)
+    except Exception as exc:
+        try:
+            PIXIV_SESSION.update_verified(
+                "error",
+                error_code="pixiv_login_error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except OSError:
+            logging.getLogger(__name__).exception("Pixiv 登录流程异常且无法持久化错误状态")
+        else:
+            logging.getLogger(__name__).exception("Pixiv 登录流程异常")
+    finally:
+        PIXIV_SESSION.release(lease)
+        with _pixiv_login_lock:
+            if threading.current_thread() is _pixiv_login_thread:
+                _pixiv_login_thread = None
+                _pixiv_login_cancel = None
+        _broadcast_pixiv_session(PIXIV_SESSION.snapshot())
+
+
 @app.route("/api/pixiv-logout", methods=["POST"])
 def api_pixiv_logout():
-    with TASKS_LOCK:
-        running_pixiv = any(
-            t.get("status") in {"running", "waiting_input"} and t.get("cmd") in (2, 3)
-            for t in TASKS.values()
+    with _pixiv_admission_lock:
+        if _has_active_pixiv_task():
+            return _api_error(
+                "pixiv_profile_in_use",
+                409,
+                detail="已有未结束的 Pixiv 发布任务",
+                owner="publishing_task",
+            )
+        try:
+            lease = PIXIV_SESSION.acquire("logout:web")
+        except PixivProfileInUseError as exc:
+            return _api_error(
+                "pixiv_profile_in_use",
+                409,
+                detail="Pixiv Profile 正在使用中",
+                owner=exc.owner,
+            )
+    try:
+        if PIXIV_PROFILE_DIR.exists():
+            shutil.rmtree(PIXIV_PROFILE_DIR)
+        PIXIV_SESSION.clear()
+    except OSError as exc:
+        profile_still_exists = PIXIV_PROFILE_DIR.exists()
+        try:
+            if profile_still_exists:
+                PIXIV_SESSION.update_verified(
+                    "error",
+                    error_code="pixiv_profile_clear_failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                PIXIV_SESSION.clear()
+        except OSError:
+            logging.getLogger(__name__).exception("Pixiv Profile 清除失败且无法同步会话状态")
+        return _api_error(
+            "pixiv_profile_clear_failed",
+            500,
+            detail=str(exc),
+            reason=str(exc),
         )
-    if running_pixiv:
-        return _api_error("profile_in_use", detail="pixiv task is running", platform="Pixiv")
-    shutil.rmtree(PIXIV_PROFILE_DIR, ignore_errors=True)
-    return jsonify({"ok": True})
+    finally:
+        PIXIV_SESSION.release(lease)
+    return _pixiv_session_response()
 
 
 @app.route("/api/civitai-logout", methods=["POST"])
@@ -1533,12 +1717,54 @@ def api_civitai_logout():
 
 @app.route("/api/pixiv-open-login", methods=["POST"])
 def api_pixiv_open_login():
-    try:
-        _open_login_browser(PIXIV_PROFILE_DIR, "https://accounts.pixiv.net/login?lang=zh")
-    except Exception as exc:
-        logging.getLogger(__name__).warning(f"pixiv login browser: {exc}")
-        return _api_error("generic", 500, detail=str(exc), reason=str(exc))
-    return jsonify({"ok": True})
+    global _pixiv_login_thread, _pixiv_login_cancel
+    with _pixiv_admission_lock:
+        if _has_active_pixiv_task():
+            return _api_error(
+                "pixiv_profile_in_use",
+                409,
+                detail="已有未结束的 Pixiv 发布任务",
+                owner="publishing_task",
+            )
+        with _pixiv_login_lock:
+            if _pixiv_login_thread is not None and _pixiv_login_thread.is_alive():
+                return _pixiv_session_response()
+            try:
+                lease = PIXIV_SESSION.acquire("login:web")
+            except PixivProfileInUseError as exc:
+                return _api_error(
+                    "pixiv_profile_in_use",
+                    409,
+                    detail=str(exc),
+                    owner=exc.owner,
+                )
+            cancel_event = threading.Event()
+            thread = threading.Thread(
+                target=_pixiv_login_worker,
+                args=(lease, cancel_event),
+                name="pixiv-login",
+                daemon=True,
+            )
+            _pixiv_login_thread = thread
+            _pixiv_login_cancel = cancel_event
+            try:
+                thread.start()
+            except Exception as exc:
+                _pixiv_login_thread = None
+                _pixiv_login_cancel = None
+                PIXIV_SESSION.release(lease)
+                return _api_error("pixiv_login_start_failed", 500, detail=str(exc), reason=str(exc))
+    return _pixiv_session_response()
+
+
+@app.route("/api/pixiv-login-cancel", methods=["POST"])
+def api_pixiv_login_cancel():
+    with _pixiv_login_lock:
+        cancel_event = _pixiv_login_cancel
+        thread = _pixiv_login_thread
+    if cancel_event is not None and thread is not None and thread.is_alive():
+        cancel_event.set()
+    return _pixiv_session_response()
 
 
 @app.route("/api/civitai-open-login", methods=["POST"])
@@ -1694,8 +1920,6 @@ def _scheduler_fire() -> None:
     sched = _scheduler_from_config(cfg)
     if not sched.get("enabled"):
         return
-    with TASKS_LOCK:
-        any_running = any(t.get("status") in ("running", "queued", "waiting_input") for t in TASKS.values())
     upload_dir = SCRIPT_DIR / "upload"
     has_images = upload_dir.exists() and any(
         f.is_file() and f.suffix.lower() in UPLOAD_IMAGE_SUFFIXES for f in upload_dir.iterdir()
@@ -1703,8 +1927,14 @@ def _scheduler_fire() -> None:
     sched["next_fire_at"] = None
     cfg["scheduler"] = sched
     _save_config(cfg)
-    if not any_running and has_images:
-        targets_str = sched.get("targets", "civitai,pixiv")
+    targets_str = sched.get("targets", "civitai,pixiv")
+    targets_pixiv = "pixiv" in {part.strip().lower() for part in targets_str.split(",")}
+    pixiv_busy = False
+    admitted = False
+    task_id = ""
+    task = None
+    thread = None
+    if has_images:
         count = max(1, int(sched.get("count", 1)))
         sort_mode = sched.get("sort", "random")
         tl = targets_str.lower()
@@ -1725,12 +1955,49 @@ def _scheduler_fire() -> None:
             target=_target_label(targets_str),
             total=count,
         )
-        with TASKS_LOCK:
-            TASKS[task_id] = task
+        thread = threading.Thread(target=_run_task, args=(task_id, cmd, params), daemon=True)
+        task["thread"] = thread
+
+        if targets_pixiv:
+            with _pixiv_admission_lock:
+                pixiv_owner = str(PIXIV_SESSION.snapshot().get("in_use_by") or "")
+                with TASKS_LOCK:
+                    any_running = any(
+                        item.get("status") in {"running", "queued", "waiting_input"}
+                        for item in TASKS.values()
+                    )
+                    pixiv_task_busy = any(
+                        item.get("status") in {"running", "queued", "waiting_input"}
+                        and "pixiv" in {
+                            part.strip().lower()
+                            for part in str((item.get("params") or {}).get("targets", "")).split(",")
+                            if part.strip()
+                        }
+                        for item in TASKS.values()
+                    )
+                    pixiv_busy = bool(pixiv_owner) or pixiv_task_busy
+                    if not any_running and not pixiv_busy:
+                        TASKS[task_id] = task
+                        admitted = True
+        else:
+            with TASKS_LOCK:
+                any_running = any(
+                    item.get("status") in {"running", "queued", "waiting_input"}
+                    for item in TASKS.values()
+                )
+                if not any_running:
+                    TASKS[task_id] = task
+                    admitted = True
+
+    if admitted and task is not None and thread is not None:
         _broadcast_sse("task_update", _task_snapshot(task))
-        t = threading.Thread(target=_run_task, args=(task_id, cmd, params), daemon=True)
-        task["thread"] = t
-        t.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            app.logger.exception("定时发布任务线程启动失败: %s", exc)
+            _set_task_status(task_id, "failed")
+    elif pixiv_busy:
+        app.logger.info("Pixiv Profile 正在使用中，本轮定时发布已安全延后")
     _arm_scheduler(cfg)
 
 
@@ -1816,6 +2083,12 @@ def api_stream():
         for snap in all_tasks:
             yield f"event: task_update\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
         yield f"event: scheduler_update\ndata: {json.dumps(_scheduler_from_config(_load_config()), ensure_ascii=False)}\n\n"
+        pixiv_session = _pixiv_session_payload()
+        status_update = {
+            "pixiv_session": pixiv_session,
+            "pixiv_logged_in": pixiv_session.get("state") == "authenticated",
+        }
+        yield f"event: status_update\ndata: {json.dumps(status_update, ensure_ascii=False)}\n\n"
         for entry in recent_logs[-50:]:
             yield f"event: log\ndata: {json.dumps(entry, ensure_ascii=False)}\n\n"
         for pi in pending_inputs:

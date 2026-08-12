@@ -180,6 +180,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .flow-task-row.canceled .flow-task-meter i { background: var(--flow-faint); }
 .flow-task-progress-meta { color: var(--flow-faint); font-family: var(--flow-mono); font-size: 9px; }
 .flow-task-progress-meta span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-task-progress-meta .flow-task-activity { flex: 1 1 auto; color: var(--flow-warning); text-align: center; }
 .flow-task-progress-meta span:last-child { flex: 0 0 auto; }
 .flow-task-controls { display: flex; justify-content: flex-end; }
 .flow-task-controls .flow-icon-button { width: 34px; height: 34px; }
@@ -340,10 +341,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .maintenance-action-footer > span { color: var(--flow-faint); font-size: 9px; }
 .maintenance-action-footer > div { display: flex; align-items: center; gap: 10px; }
 .settings-loading { min-height: 90px; display: grid; place-items: center; color: var(--flow-faint); font-size: 11px; }
-.account-row { min-height: 60px; display: grid; grid-template-columns: 116px 1fr auto; align-items: center; gap: 12px; }
+.account-row { min-height: 68px; display: grid; grid-template-columns: 116px minmax(0, 1fr) auto; align-items: center; gap: 12px; }
 .account-row + .account-row { box-shadow: 0 1px 0 var(--flow-line) inset; }
-.account-row > span:not(.flow-platform-badge) { color: var(--flow-faint); font-size: 10px; }
-.account-row > div { display: flex; gap: 6px; }
+.account-copy { min-width: 0; display: grid; gap: 4px; }
+.account-copy strong { color: var(--flow-muted); font-size: 11px; font-weight: 620; }
+.account-copy small { overflow: hidden; color: var(--flow-faint); font-size: 9px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.account-row.pixiv-session.checking .account-copy strong, .account-row.pixiv-session.in_use .account-copy strong { color: var(--flow-warning); }
+.account-row.pixiv-session.authenticated .account-copy strong { color: var(--flow-success); }
+.account-row.pixiv-session.error .account-copy strong, .account-row.pixiv-session.login_required .account-copy strong { color: var(--flow-danger); }
+.account-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .flow-file-button { min-height: 40px; align-self: end; display: grid; place-items: center; border-radius: 9px; color: var(--flow-muted); background: var(--flow-surface-raised); font-size: 11px; font-weight: 600; cursor: pointer; }
 .flow-file-button:hover { color: var(--flow-text); background: var(--flow-surface-hover); }
 .flow-file-button input { display: none; }
@@ -498,9 +504,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .settings-row { align-items: flex-start; flex-direction: column; }
   .watermark-image-preview { grid-template-columns: 88px minmax(0, 1fr); }
   .watermark-image-preview figure { width: 88px; height: 88px; }
-  .account-row { padding: 11px 0; grid-template-columns: 1fr auto; }
+  .account-row { padding: 11px 0; grid-template-columns: minmax(0, 1fr) auto; }
   .account-row > .flow-platform-badge { grid-column: 1; grid-row: 1; justify-self: start; }
-  .account-row > span:not(.flow-platform-badge) { grid-column: 1 / -1; grid-row: 2; }
+  .account-copy { grid-column: 1 / -1; grid-row: 2; }
+  .account-copy small { overflow: visible; white-space: normal; }
+  .account-actions { grid-column: 2; grid-row: 1; }
   .persona-layout { grid-template-columns: 1fr; }
   .persona-layout > nav { display: flex; overflow-x: auto; }
   .persona-sample-fields { grid-template-columns: 1fr; }
@@ -521,7 +529,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .quick-publish { grid-template-columns: 65px 1fr; padding: 15px; }
   .quick-preview { width: 65px; }
   .flow-task-row { grid-template-columns: 64px minmax(0, 1fr) 34px; padding-left: 14px; }
-  .flow-task-progress-meta span + span { display: none; }
+  .flow-task-progress-meta span:not(:first-child):not(.flow-task-activity) { display: none; }
+  .flow-task-progress-meta .flow-task-activity { text-align: right; }
+  .account-actions { grid-column: 1 / -1; grid-row: 3; justify-content: flex-start; flex-wrap: wrap; }
   .flow-task-state { font-size: 9px; }
   .publish-library { padding: 17px 14px; }
   .publish-image-grid { grid-template-columns: repeat(3, minmax(60px, 1fr)); gap: 7px; }

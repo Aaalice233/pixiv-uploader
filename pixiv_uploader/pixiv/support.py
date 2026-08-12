@@ -23,6 +23,14 @@ from PIL import Image
 
 from ..paths import PROJECT_ROOT
 from ..runtime import ensure_runtime_layout
+from .session import (
+    PIXIV_PROFILE_DIR,
+    PIXIV_CAPTCHA_TIMEOUT_SECONDS,
+    PIXIV_LOGIN_TIMEOUT_SECONDS,
+    PIXIV_SESSION,
+    PixivFlowError,
+    PixivRateController,
+)
 from .storage import (
     create_rule_fit_compare_path,
     create_rule_fit_manifest_path,
@@ -41,8 +49,8 @@ from .tagger_settings import (
 log = logging.getLogger("pixiv_uploader")
 
 PIXIV_BASE = "https://www.pixiv.net"
-PIXIV_UPLOAD_URL = f"{PIXIV_BASE}/upload.php"
-PIXIV_PROFILE_DIR = Path.home() / ".civitai_splitter_pixiv_chrome"
+PIXIV_UPLOAD_URL = f"{PIXIV_BASE}/illustration/create"
+PIXIV_LEGACY_UPLOAD_URL = f"{PIXIV_BASE}/upload.php"
 PIXIV_RULE_FIT_PROFILE_DIR = Path.home() / ".civitai_splitter_pixiv_rule_fit_chrome"
 H_UINT_RE = re.compile(r"^\d+$")
 LORA_RE = re.compile(r"<lora:([^:>]+):([^>]+)>")
@@ -152,8 +160,35 @@ class PixivStep:
         return {"name": self.name, "ok": self.ok, "reason": self.reason, "detail": self.detail}
 
 
-class PixivBrowserClosedError(RuntimeError):
-    pass
+class PixivBrowserClosedError(PixivFlowError):
+    def __init__(self, message: str = "Pixiv 浏览器窗口已关闭；发布完成前请保持该窗口打开"):
+        super().__init__("pixiv_browser_closed", message)
+
+
+class PixivRateLimitedError(PixivFlowError):
+    def __init__(self, retry_after: float = 0.0, *, submitted: bool = False):
+        super().__init__(
+            "pixiv_rate_limited_after_submit" if submitted else "pixiv_rate_limited",
+            "Pixiv 返回 HTTP 429，发布已进入风险冷却",
+            maybe_posted=submitted,
+        )
+        self.retry_after = max(0.0, float(retry_after or 0.0))
+        self.submitted = submitted
+
+
+@dataclass
+class PixivPostResult:
+    url: str | None
+    steps: list[PixivStep]
+    error_code: str = ""
+    batch_fatal: bool = False
+    maybe_posted: bool = False
+    risk_signal: str = ""
+    retry_after: float = 0.0
+
+    def __iter__(self):
+        yield self.url
+        yield self.steps
 
 
 PIXIV_SELECTORS: dict[str, Any] = {
@@ -1697,67 +1732,151 @@ def build_pixiv_payload(
     }
 
 
-def _profile_cdp_endpoint(profile_dir: Path) -> str | None:
-    active_port_file = profile_dir / "DevToolsActivePort"
-    try:
-        port = int(active_port_file.read_text(encoding="utf-8").splitlines()[0])
-        endpoint = f"http://127.0.0.1:{port}"
-        response = httpx.get(f"{endpoint}/json/version", timeout=1.5)
-        if response.status_code == 200:
-            return endpoint
-    except (FileNotFoundError, IndexError, OSError, ValueError, httpx.HTTPError):
-        pass
-    return None
+def _looks_like_profile_lock_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "processsingleton",
+            "user data directory is already in use",
+            "profile in use",
+            "singletonlock",
+            "failed to create a process singleton",
+        )
+    )
 
 
 def open_pixiv_browser(pw, profile_dir: Path | None = None):
     target_profile = profile_dir or PIXIV_PROFILE_DIR
-    cdp_endpoint = _profile_cdp_endpoint(target_profile)
-    if cdp_endpoint:
-        # The account-login window owns the profile lock, so attach to that
-        # browser instead of starting a second Chrome process with the same profile.
-        browser = pw.chromium.connect_over_cdp(cdp_endpoint)
-        if not browser.contexts:
-            raise RuntimeError("Pixiv login browser has no usable context")
-        context = browser.contexts[0]
-        setattr(context, "_pixiv_uploader_attached", True)
-        page = next(
-            (candidate for candidate in reversed(context.pages) if "pixiv.net" in candidate.url),
-            context.pages[0] if context.pages else context.new_page(),
-        )
-        log.info("Pixiv: 已接管现有登录浏览器")
-    else:
-        try:
-            context = pw.chromium.launch_persistent_context(
-                str(target_profile),
-                channel="chrome",
-                headless=False,
-                args=[
-                    "--start-minimized",
-                    "--disable-sync",
-                    "--no-first-run",
-                ],
-                ignore_default_args=["--enable-automation", "--no-sandbox"],
-            )
-        except Exception as exc:
-            if target_profile == PIXIV_PROFILE_DIR:
-                raise RuntimeError(
-                    "无法启动 Pixiv 自动化浏览器；请关闭占用该账号配置的 Chrome 窗口后重试"
-                ) from exc
-            raise
-        setattr(context, "_pixiv_uploader_attached", False)
-        page = context.pages[0] if context.pages else context.new_page()
     try:
-        page.set_viewport_size({"width": 1920, "height": 1080})
-    except Exception:
-        pass
+        context = pw.chromium.launch_persistent_context(
+            str(target_profile),
+            channel="chrome",
+            headless=False,
+            no_viewport=True,
+            ignore_default_args=["--enable-automation", "--no-sandbox"],
+        )
+    except Exception as exc:
+        if target_profile == PIXIV_PROFILE_DIR and _looks_like_profile_lock_error(exc):
+            raise PixivFlowError(
+                "pixiv_profile_locked_external",
+                "无法启动 Pixiv 浏览器；该 Profile 正被外部 Chrome 占用，请关闭相关窗口后重试",
+            ) from exc
+        raise PixivFlowError(
+            "pixiv_browser_launch_failed",
+            f"无法启动 Pixiv 浏览器：{type(exc).__name__}: {exc}",
+        ) from exc
+    if target_profile == PIXIV_PROFILE_DIR:
+        try:
+            PIXIV_SESSION.ensure_profile_identity()
+        except OSError as exc:
+            try:
+                context.close()
+            except Exception:
+                log.exception("Pixiv Profile 标识写入失败后关闭浏览器失败")
+            raise PixivFlowError(
+                "pixiv_session_state_unavailable",
+                f"无法持久化 Pixiv Profile 标识：{type(exc).__name__}: {exc}",
+            ) from exc
+    page = next(
+        (candidate for candidate in reversed(context.pages) if not candidate.is_closed()),
+        None,
+    )
+    if page is None:
+        page = context.new_page()
     return context, page
 
 
 def close_pixiv_browser(context) -> None:
-    if getattr(context, "_pixiv_uploader_attached", False) is True:
-        return
     context.close()
+
+
+def _persist_pixiv_session_state(
+    session_store,
+    state: str,
+    *,
+    error_code: str = "",
+    error: str = "",
+) -> dict[str, Any] | None:
+    if session_store is None:
+        return None
+    try:
+        return session_store.update_verified(state, error_code=error_code, error=error)
+    except OSError as exc:
+        raise PixivFlowError(
+            "pixiv_session_state_unavailable",
+            f"无法持久化 Pixiv 会话状态：{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def run_pixiv_login_flow(
+    pw,
+    *,
+    cancel_event=None,
+    interaction_callback=None,
+    owner: str = "login",
+    lease=None,
+) -> dict[str, Any]:
+    owns_lease = lease is None
+    active_lease = lease or PIXIV_SESSION.acquire(owner)
+    context = None
+    try:
+        context, page = open_pixiv_browser(pw)
+        ensure_on_pixiv_upload_page(
+            page,
+            cancel_event=cancel_event,
+            interaction_callback=interaction_callback,
+        )
+        return PIXIV_SESSION.snapshot()
+    except InterruptedError as exc:
+        _persist_pixiv_session_state(
+            PIXIV_SESSION,
+            "login_required",
+            error_code="pixiv_login_canceled",
+            error="Pixiv 登录已取消",
+        )
+        raise PixivFlowError("pixiv_login_canceled", "Pixiv 登录已取消") from exc
+    except PixivBrowserClosedError as exc:
+        _persist_pixiv_session_state(
+            PIXIV_SESSION,
+            "login_required",
+            error_code="pixiv_login_browser_closed",
+            error="登录验证完成前关闭了 Pixiv 浏览器",
+        )
+        raise PixivFlowError(
+            "pixiv_login_browser_closed",
+            "登录验证完成前关闭了 Pixiv 浏览器",
+        ) from exc
+    except PixivFlowError as exc:
+        if exc.code not in {
+            "pixiv_login_timeout",
+            "pixiv_login_canceled",
+            "pixiv_session_state_unavailable",
+        }:
+            state = "login_required" if "login" in exc.code else "error"
+            _persist_pixiv_session_state(
+                PIXIV_SESSION,
+                state,
+                error_code=exc.code,
+                error=str(exc),
+            )
+        raise
+    except Exception as exc:
+        _persist_pixiv_session_state(
+            PIXIV_SESSION,
+            "error",
+            error_code="pixiv_login_error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise PixivFlowError("pixiv_login_error", f"Pixiv 登录验证失败：{exc}") from exc
+    finally:
+        if context is not None:
+            try:
+                close_pixiv_browser(context)
+            except Exception as exc:
+                log.warning("关闭 Pixiv 登录浏览器失败: %s: %s", type(exc).__name__, exc)
+        if owns_lease:
+            PIXIV_SESSION.release(active_lease)
 
 
 def extract_artwork_id(url: str) -> str | None:
@@ -1787,12 +1906,29 @@ def _fetch_json_in_page(page, url: str) -> dict[str, Any] | None:
         return None
 
 
-def ensure_pixiv_logged_in(page, start_url: str = PIXIV_BASE) -> None:
-    safe_goto(page, start_url, wait=6)
-    if "login" in page.url or "accounts.pixiv.net" in page.url:
-        print("未登录 Pixiv。请在浏览器里登录 Pixiv，然后按 Enter 继续...")
-        input()
-        safe_goto(page, start_url, wait=6)
+def ensure_pixiv_logged_in(
+    page,
+    start_url: str = PIXIV_BASE,
+    *,
+    cancel_event=None,
+    interaction_callback=None,
+    session_store=PIXIV_SESSION,
+) -> None:
+    safe_goto(
+        page,
+        start_url,
+        wait=2,
+        cancel_event=cancel_event,
+        strict=True,
+    )
+    if _is_pixiv_login_url(_page_url(page)):
+        _persist_pixiv_session_state(session_store, "login_required")
+        wait_for_pixiv_authentication(
+            page,
+            cancel_event=cancel_event,
+            interaction_callback=interaction_callback,
+            session_store=session_store,
+        )
 
 
 def _collect_artwork_urls_from_page(page, max_items: int) -> list[str]:
@@ -2214,7 +2350,7 @@ def collect_rule_fit_sample_manifests(
     min_fanart: int,
     min_r18: int,
 ) -> dict[str, Any]:
-    ensure_pixiv_logged_in(page, PIXIV_BASE)
+    ensure_pixiv_logged_in(page, PIXIV_BASE, session_store=None)
     existing_manifests = sorted(
         path for path in manifest_dir.glob("*.json")
         if not path.name.endswith(".compare.json")
@@ -2520,77 +2656,222 @@ def summarize_rule_fit_report(compare_results: list[dict[str, Any]]) -> dict[str
     }
 
 
-def safe_goto(page, url: str, wait: float = 5.0) -> None:
+def safe_goto(
+    page,
+    url: str,
+    wait: float = 5.0,
+    *,
+    cancel_event=None,
+    strict: bool = False,
+) -> None:
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
+        if strict:
+            raise PixivFlowError(
+                "pixiv_navigation_failed",
+                f"Pixiv 页面导航失败（{url}）：{type(exc).__name__}: {exc}",
+            ) from exc
         log.warning(f"safe_goto({url}) 失败: {type(exc).__name__}: {exc}")
-    time.sleep(wait)
+    _sleep_with_cancel(wait, cancel_event)
 
 
-def _wait_for_file_input(page, timeout: float = 30.0) -> bool:
-    """Poll for file input up to timeout seconds. Returns True if found."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _first_visible_locator(page, PIXIV_SELECTORS["file_input"]) is not None:
+def _page_url(page) -> str:
+    try:
+        return str(page.url or "")
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        raise PixivFlowError(
+            "pixiv_page_unavailable",
+            f"无法读取 Pixiv 页面状态：{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def _is_pixiv_login_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    return host == "accounts.pixiv.net" or (host.endswith("pixiv.net") and "login" in path)
+
+
+def _is_pixiv_url(url: str) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    return host == "pixiv.net" or host.endswith(".pixiv.net")
+
+
+def _is_pixiv_upload_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+    return host in {"pixiv.net", "www.pixiv.net"} and path in {
+        "/illustration/create",
+        "/upload.php",
+    }
+
+
+def _has_pixiv_upload_form(page) -> bool:
+    try:
+        url = _page_url(page)
+        parsed = urlparse(url)
+        if parsed.netloc.lower() not in {"www.pixiv.net", "pixiv.net"}:
+            return False
+        return _first_visible_locator(page, PIXIV_SELECTORS["file_input"]) is not None
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        return False
+
+
+def _wait_for_file_input(page, timeout: float = 30.0, *, cancel_event=None) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        _raise_if_canceled(cancel_event)
+        if _has_pixiv_upload_form(page):
             return True
-        time.sleep(1)
+        _sleep_with_cancel(min(1.0, max(0.05, deadline - time.monotonic())), cancel_event)
     return False
 
 
-def ensure_on_pixiv_upload_page(page) -> None:
-    if "upload.php" in page.url:
-        if _wait_for_file_input(page, timeout=5.0):
-            return
-    safe_goto(page, PIXIV_UPLOAD_URL, wait=4)
-
-    # If redirected to login page, ask user to log in first.
-    if "login" in page.url or "accounts.pixiv.net" in page.url:
-        print("\n[!] Pixiv 未登录，请在浏览器里完成登录，然后按 Enter 继续...")
-        input()
-        safe_goto(page, PIXIV_UPLOAD_URL, wait=6)
-
-    # Wait up to 30 s for the React SPA to render the file input.
-    if _wait_for_file_input(page, timeout=30.0):
-        return
-
-    # If still not found, fall back to manual intervention.
-    print(
-        f"\n[!] 没找到上传表单（当前 URL: {page.url}）。"
-        "\n  请在浏览器里导航到 https://www.pixiv.net/upload.php"
-        "\n  能看到拖拽上传区域后，回到这里按 Enter 继续..."
-    )
-    input()
-    if not _wait_for_file_input(page, timeout=15.0):
-        print("[!] 仍未检测到上传表单，强行继续（可能会失败）...")
+def _emit_interaction(interaction_callback, activity: dict[str, Any] | None) -> None:
+    if interaction_callback is not None:
+        interaction_callback(activity)
 
 
-def _alert_captcha(page):
-    """Bring the browser forward and repeat a system alert until resolved."""
+def _notify_user_once(page) -> None:
     try:
         page.bring_to_front()
-    except Exception:
-        pass
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
     try:
         import winsound
-
-        stop_event = threading.Event()
-
-        def alert_loop() -> None:
-            while not stop_event.is_set():
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-                stop_event.wait(1.25)
-
-        threading.Thread(target=alert_loop, name="pixiv-captcha-alert", daemon=True).start()
-        return stop_event.set
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
     except Exception:
         try:
             sys.stdout.write("\a")
             sys.stdout.flush()
         except Exception:
             pass
-    return lambda: None
+
+
+def _interaction_activity(interaction_type: str, *, deadline: float, phase: str = "") -> dict[str, Any]:
+    remaining_seconds = max(0, int(deadline - time.monotonic() + 0.999))
+    return {
+        "kind": "pixiv_interaction",
+        "interaction_type": interaction_type,
+        "phase": phase,
+        "remaining_seconds": remaining_seconds,
+        "deadline": datetime.now(timezone.utc).timestamp() + remaining_seconds,
+    }
+
+
+def wait_for_pixiv_authentication(
+    page,
+    *,
+    cancel_event=None,
+    interaction_callback=None,
+    timeout: float = PIXIV_LOGIN_TIMEOUT_SECONDS,
+    session_store=PIXIV_SESSION,
+) -> None:
+    deadline = time.monotonic() + timeout
+    _notify_user_once(page)
+    try:
+        while time.monotonic() < deadline:
+            _raise_if_canceled(cancel_event)
+            _emit_interaction(interaction_callback, _interaction_activity("pixiv_login", deadline=deadline))
+            current_url = _page_url(page)
+            if not _is_pixiv_login_url(current_url) and _is_pixiv_url(current_url):
+                for upload_url in (PIXIV_UPLOAD_URL, PIXIV_LEGACY_UPLOAD_URL):
+                    safe_goto(
+                        page,
+                        upload_url,
+                        wait=1,
+                        cancel_event=cancel_event,
+                        strict=True,
+                    )
+                    if _is_pixiv_login_url(_page_url(page)):
+                        break
+                    if _wait_for_file_input(page, timeout=5.0, cancel_event=cancel_event):
+                        _persist_pixiv_session_state(session_store, "authenticated")
+                        return
+            _sleep_with_cancel(1.0, cancel_event)
+    except PixivBrowserClosedError:
+        _persist_pixiv_session_state(
+            session_store,
+            "login_required",
+            error_code="pixiv_login_browser_closed",
+            error="登录完成前关闭了 Pixiv 浏览器",
+        )
+        raise
+    except InterruptedError:
+        _persist_pixiv_session_state(
+            session_store,
+            "login_required",
+            error_code="pixiv_login_canceled",
+            error="已取消 Pixiv 登录等待",
+        )
+        raise
+    except PixivFlowError:
+        raise
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        _persist_pixiv_session_state(
+            session_store,
+            "error",
+            error_code="pixiv_login_verification_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise PixivFlowError(
+            "pixiv_login_verification_failed",
+            f"Pixiv 登录状态检测失败：{type(exc).__name__}: {exc}",
+        ) from exc
+    finally:
+        _emit_interaction(interaction_callback, None)
+    _persist_pixiv_session_state(
+        session_store,
+        "login_required",
+        error_code="pixiv_login_timeout",
+        error="Pixiv 登录等待超过 15 分钟",
+    )
+    raise PixivFlowError("pixiv_login_timeout", "Pixiv 登录等待超过 15 分钟")
+
+
+def ensure_on_pixiv_upload_page(page, *, cancel_event=None, interaction_callback=None) -> None:
+    if _is_pixiv_upload_url(_page_url(page)) and _wait_for_file_input(
+        page, timeout=3.0, cancel_event=cancel_event
+    ):
+        _persist_pixiv_session_state(PIXIV_SESSION, "authenticated")
+        return
+    last_url = ""
+    for upload_url in (PIXIV_UPLOAD_URL, PIXIV_LEGACY_UPLOAD_URL):
+        safe_goto(
+            page,
+            upload_url,
+            wait=2,
+            cancel_event=cancel_event,
+            strict=True,
+        )
+        last_url = _page_url(page)
+        if _is_pixiv_login_url(last_url):
+            _persist_pixiv_session_state(PIXIV_SESSION, "login_required")
+            wait_for_pixiv_authentication(
+                page,
+                cancel_event=cancel_event,
+                interaction_callback=interaction_callback,
+            )
+            return
+        if _wait_for_file_input(page, timeout=15.0, cancel_event=cancel_event):
+            _persist_pixiv_session_state(PIXIV_SESSION, "authenticated")
+            return
+    _persist_pixiv_session_state(
+        PIXIV_SESSION,
+        "error",
+        error_code="pixiv_upload_form_missing",
+        error=f"Pixiv 投稿页未渲染上传表单：{last_url or _page_url(page)}",
+    )
+    raise PixivFlowError(
+        "pixiv_upload_form_missing",
+        f"Pixiv 投稿页未渲染上传表单（当前 URL: {last_url or _page_url(page)}）",
+    )
 
 
 def _raise_if_canceled(cancel_event) -> None:
@@ -2628,7 +2909,8 @@ def _human_move_and_click(page, locator, *, cancel_event=None) -> None:
         raise InterruptedError("task canceled")
     try:
         box = locator.bounding_box(timeout=3000)
-    except Exception:
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         box = None
     if not box:
         locator.click()
@@ -2640,7 +2922,8 @@ def _human_move_and_click(page, locator, *, cancel_event=None) -> None:
             "() => ({x: window._lastMouseX || 640, y: window._lastMouseY || 360})"
         )
         cx, cy = current["x"], current["y"]
-    except Exception:
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
         cx, cy = 640.0, 360.0
     steps = random.randint(15, 30)
     cp1x = cx + (target_x - cx) * 0.3 + random.uniform(-50, 50)
@@ -2686,8 +2969,11 @@ def _first_visible_locator(page, selectors: list[str]):
     for selector in selectors:
         try:
             locator = page.locator(selector)
-            if locator.count() > 0:
-                return locator.first
+            count = min(locator.count(), 8)
+            for index in range(count):
+                candidate = locator.nth(index)
+                if candidate.is_visible(timeout=250):
+                    return candidate
         except Exception as exc:
             _raise_if_browser_closed_exception(exc)
             continue
@@ -2982,44 +3268,199 @@ def _set_radio_by_attr(page, name: str, attr_name: str, attr_value: str, cancel_
         return PixivStep(name, False, "exception", f"{type(exc).__name__}: {exc}")
 
 
-def _accept_safety_check(page) -> tuple:
-    """Detect Pixiv's 安全検査 section and alert if reCAPTCHA is present.
+PIXIV_CAPTCHA_SELECTORS = (
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="google.com/recaptcha"]',
+    'iframe[src*="hcaptcha"]',
+    'iframe[src*="newcaptcha"]',
+    'iframe[title*="hCaptcha" i]',
+    'iframe[title*="captcha" i]',
+    '.g-recaptcha',
+    '.h-captcha',
+    '[data-sitekey]',
+)
+PIXIV_CAPTCHA_TOKEN_SELECTORS = (
+    'textarea[name="g-recaptcha-response"]',
+    'textarea[name="h-captcha-response"]',
+    'input[name="g-recaptcha-response"]',
+    'input[name="h-captcha-response"]',
+)
 
-    Returns (PixivStep, stop_fn). stop_fn silences the alert; no-op if no alert played.
-    """
-    stop_fn = lambda: None
+
+def _detect_pixiv_captcha(page) -> dict[str, Any]:
+    try:
+        token_present = bool(page.evaluate(
+            """selectors => selectors.some(selector =>
+                Array.from(document.querySelectorAll(selector)).some(node =>
+                    String(node.value || node.textContent || '').trim().length > 0
+                )
+            )""",
+            list(PIXIV_CAPTCHA_TOKEN_SELECTORS),
+        ))
+        matches: list[str] = []
+        for selector in PIXIV_CAPTCHA_SELECTORS:
+            locator = page.locator(selector)
+            count = min(locator.count(), 4)
+            for index in range(count):
+                candidate = locator.nth(index)
+                try:
+                    if candidate.is_visible(timeout=500):
+                        matches.append(selector)
+                        break
+                except Exception as exc:
+                    _raise_if_browser_closed_exception(exc)
+        provider = ""
+        joined = " ".join(matches).lower()
+        if "hcaptcha" in joined or "newcaptcha" in joined:
+            provider = "hcaptcha"
+        elif "recaptcha" in joined or "g-recaptcha" in joined:
+            provider = "recaptcha"
+        elif matches:
+            provider = "pixiv"
+        return {
+            "present": bool(matches),
+            "active": bool(matches) and not token_present,
+            "provider": provider,
+            "token_present": token_present,
+        }
+    except PixivBrowserClosedError:
+        raise
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        raise PixivFlowError(
+            "pixiv_captcha_detection_failed",
+            f"无法读取 Pixiv 人机验证状态：{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+class PixivHttp429Monitor:
+    def __init__(self, page) -> None:
+        self.page = page
+        self._events: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._handler = self._on_response
+        page.on("response", self._handler)
+
+    def _on_response(self, response) -> None:
+        try:
+            parsed = urlparse(response.url)
+            host = (parsed.hostname or "").lower()
+            resource_type = str(response.request.resource_type or "").lower()
+            if response.status != 429 or not (host == "pixiv.net" or host.endswith(".pixiv.net")):
+                return
+            if resource_type not in {"document", "xhr", "fetch"}:
+                return
+            retry_after = PixivRateController.parse_retry_after(response.headers.get("retry-after"))
+            event = {
+                "url": response.url,
+                "resource_type": resource_type,
+                "retry_after": retry_after,
+            }
+            with self._lock:
+                self._events.append(event)
+            log.warning("    pixiv: 捕获 HTTP 429 (%s, Retry-After=%ss)", response.url, retry_after)
+        except Exception:
+            log.exception("Pixiv 429 响应监听失败")
+
+    def consume(self) -> dict[str, Any] | None:
+        with self._lock:
+            if not self._events:
+                return None
+            events = self._events[:]
+            self._events.clear()
+        return max(events, key=lambda item: float(item.get("retry_after") or 0.0))
+
+    def close(self) -> None:
+        try:
+            self.page.remove_listener("response", self._handler)
+        except Exception:
+            pass
+
+
+def _accept_safety_check(page) -> PixivStep:
     actions: list[str] = []
     try:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         _jsleep(0.5, jitter=0.0)
-
         section_present = any(
-            page.locator(f'text="{h}"').count() > 0
-            for h in ["安全検査", "安全检查", "Security Check"]
+            page.locator(f'text="{heading}"').count() > 0
+            for heading in ["安全検査", "安全检查", "Security Check"]
         )
-        if not section_present:
-            return PixivStep("safety_check", True, detail="not_present"), stop_fn
-
-        actions.append("detected")
-
-        # reCAPTCHA inside the safety check section → alert user to complete it manually.
-        recaptcha_selectors = [
-            'iframe[src*="recaptcha"]',
-            'iframe[src*="google.com/recaptcha"]',
-            '.g-recaptcha',
-            '[data-sitekey]',
-        ]
-        if any(page.locator(sel).count() > 0 for sel in recaptcha_selectors):
-            log.warning("    pixiv: 安全检查区域出现 reCAPTCHA，请在浏览器里完成验证")
-            stop_fn = _alert_captcha(page)
-            actions.append("recaptcha_alert")
-
-        return PixivStep("safety_check", True, detail=", ".join(actions)), stop_fn
+        if section_present:
+            actions.append("section_detected")
+        captcha = _detect_pixiv_captcha(page)
+        if captcha["present"]:
+            actions.append(f"{captcha['provider'] or 'captcha'}_detected")
+        return PixivStep("safety_check", True, detail=", ".join(actions) or "not_present")
     except InterruptedError:
         raise
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
-        return PixivStep("safety_check", True, detail=f"skipped: {exc}"), stop_fn
+        return PixivStep("safety_check", True, detail=f"skipped: {exc}")
+
+
+def _publish_enabled(locator) -> bool:
+    try:
+        return bool(locator.is_enabled())
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        return False
+
+
+def _wait_for_pre_submit_ready(
+    page,
+    publish_locator,
+    *,
+    cancel_event=None,
+    interaction_callback=None,
+    http_monitor: PixivHttp429Monitor | None = None,
+) -> tuple[bool, str]:
+    normal_deadline = time.monotonic() + 120
+    captcha_deadline: float | None = None
+    captcha_provider = ""
+    notified = False
+    try:
+        while True:
+            _raise_if_canceled(cancel_event)
+            rate_event = http_monitor.consume() if http_monitor else None
+            if rate_event:
+                raise PixivRateLimitedError(rate_event.get("retry_after", 0.0), submitted=False)
+            captcha = _detect_pixiv_captcha(page)
+            enabled = _publish_enabled(publish_locator)
+            unresolved_challenge = bool(captcha["active"] or (captcha["present"] and not captcha["token_present"]))
+            if unresolved_challenge:
+                if captcha_deadline is None:
+                    captcha_deadline = time.monotonic() + PIXIV_CAPTCHA_TIMEOUT_SECONDS
+                    captcha_provider = captcha["provider"] or "captcha"
+                    log.warning("    pixiv: 投稿点击前出现 %s，等待用户在 Pixiv 页面完成验证", captcha_provider)
+                if not notified:
+                    _notify_user_once(page)
+                    notified = True
+                if time.monotonic() >= captcha_deadline:
+                    exc = PixivFlowError(
+                        "pixiv_captcha_timeout_before_submit",
+                        "Pixiv 人机验证等待超过 10 分钟",
+                    )
+                    exc.batch_fatal = True
+                    raise exc
+                _emit_interaction(
+                    interaction_callback,
+                    _interaction_activity("pixiv_captcha_before_submit", deadline=captcha_deadline, phase="before_submit"),
+                )
+            elif enabled:
+                return captcha_deadline is not None, captcha_provider
+            elif captcha_deadline is not None and time.monotonic() >= captcha_deadline:
+                exc = PixivFlowError(
+                    "pixiv_captcha_timeout_before_submit",
+                    "Pixiv 人机验证等待超过 10 分钟",
+                )
+                exc.batch_fatal = True
+                raise exc
+            elif captcha_deadline is None and time.monotonic() >= normal_deadline:
+                raise PixivFlowError("pixiv_publish_button_timeout", "Pixiv 投稿按钮 120 秒内未启用")
+            _sleep_with_cancel(1.0, cancel_event)
+    finally:
+        _emit_interaction(interaction_callback, None)
 
 
 def _set_checkbox_by_attr(page, name: str, attr_name: str, desired: bool, cancel_event=None) -> PixivStep:
@@ -3087,9 +3528,9 @@ def _record_step(steps: list[PixivStep], page, log_dir: Path | None, step: Pixiv
             if capture:
                 step.detail = (step.detail + f" | {capture}").strip(" |")
         log.error(f"    pixiv: {step.name} ✗ [{step.reason}] {step.detail}")
-    # Small random pause after every recorded operation — reduces fingerprint
-    # similarity across requests and lowers risk of triggering Pixiv's bot check.
-    time.sleep(random.uniform(0.1, 0.5))
+    # Keep form operations paced while allowing cancellation to wake the task promptly.
+    if step.name != "redirect":
+        _sleep_with_cancel(random.uniform(0.1, 0.5), cancel_event)
     return step
 
 
@@ -3167,12 +3608,13 @@ def _create_pixiv_post(
     page,
     payload: dict[str, Any],
     image_path: Path,
-    delay: float,
     log_dir: Path | None,
     cancel_event,
     steps: list[PixivStep],
     progress_callback=None,
-) -> tuple[str | None, list[PixivStep]]:
+    interaction_callback=None,
+    http_monitor: PixivHttp429Monitor | None = None,
+) -> PixivPostResult | tuple[str | None, list[PixivStep]]:
     form_progress = {
         "ensure_upload_page": 0.05,
         "select_file": 0.15,
@@ -3212,9 +3654,15 @@ def _create_pixiv_post(
 
     try:
         _raise_if_canceled(cancel_event)
-        ensure_on_pixiv_upload_page(page)
+        ensure_on_pixiv_upload_page(
+            page,
+            cancel_event=cancel_event,
+            interaction_callback=interaction_callback,
+        )
         record(PixivStep("ensure_upload_page", True))
     except InterruptedError:
+        raise
+    except PixivFlowError:
         raise
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
@@ -3306,9 +3754,9 @@ def _create_pixiv_post(
         cancel_event=cancel_event,
     ))
 
-    # Safety check (安全検査) — new Pixiv required section; always ok, won't abort on miss
-    safety_step, stop_alert = _accept_safety_check(page)
-    record(safety_step)
+    # Pixiv may render CAPTCHA in this section. Submission readiness is handled
+    # centrally below so pre-click and post-click behavior cannot be mixed.
+    record(_accept_safety_check(page))
 
     if any(not s.ok for s in steps):
         log.error("    pixiv: 字段填写有失败步骤，放弃 publish")
@@ -3320,99 +3768,200 @@ def _create_pixiv_post(
         return None, steps
     record(PixivStep("locate_publish", True))
 
-    enabled = False
-    for _ in range(60):
-        _raise_if_canceled(cancel_event)
-        try:
-            if publish_locator.is_enabled():
-                enabled = True
-                break
-        except Exception as exc:
-            _raise_if_browser_closed_exception(exc)
-        _sleep_with_cancel(2, cancel_event)
-    if not enabled:
-        record(PixivStep("publish_enable", False, "verify_failed", "publish 按钮 120 秒内未启用"))
-        stop_alert()
-        return None, steps
-    stop_alert()
-    record(PixivStep("publish_enable", True))
+    try:
+        pre_submit_captcha, captcha_provider = _wait_for_pre_submit_ready(
+            page,
+            publish_locator,
+            cancel_event=cancel_event,
+            interaction_callback=interaction_callback,
+            http_monitor=http_monitor,
+        )
+    except PixivRateLimitedError as exc:
+        record(PixivStep("publish_enable", False, exc.code, str(exc)))
+        return PixivPostResult(
+            None,
+            steps,
+            error_code=exc.code,
+            batch_fatal=False,
+            maybe_posted=False,
+            risk_signal="http_429",
+            retry_after=exc.retry_after,
+        )
+    except InterruptedError:
+        raise
+    except PixivFlowError as exc:
+        record(PixivStep("publish_enable", False, exc.code, str(exc)))
+        return PixivPostResult(
+            None,
+            steps,
+            error_code=exc.code,
+            batch_fatal=exc.batch_fatal,
+            maybe_posted=exc.maybe_posted,
+            risk_signal="captcha" if "captcha" in exc.code else "",
+            retry_after=float(getattr(exc, "retry_after", 0.0) or 0.0),
+        )
+    record(PixivStep(
+        "publish_enable",
+        True,
+        detail=(f"enabled after {captcha_provider}" if pre_submit_captcha else "enabled"),
+    ))
 
     try:
         _human_move_and_click(page, publish_locator, cancel_event=cancel_event)
-        record(PixivStep("publish_click", True))
+    except InterruptedError:
+        raise
     except Exception as exc:
-        _raise_if_browser_closed_exception(exc)
+        try:
+            _raise_if_browser_closed_exception(exc)
+        except PixivBrowserClosedError as closed_exc:
+            closed_exc.pixiv_steps = steps
+            raise
         record(PixivStep("publish_click", False, "exception", f"{type(exc).__name__}: {exc}"))
         return None, steps
+    record(PixivStep("publish_click", True))
 
-    # Success requires an artwork URL, a known post-submit destination, or
-    # Pixiv's explicit success message. DOM disappearance alone is ambiguous.
+    # The click above is the only automatic submit attempt. From this point on,
+    # success is observed but the button is never clicked again.
     artwork_re = re.compile(r"/artworks/\d+")
-    # Only match actual hCaptcha iframes — the broad div:has-text("安全检查")
-    # was firing false positives on Pixiv's footer/disclaimer text even on the
-    # success page. Require being still on the upload/create page too.
-    captcha_selectors = [
-        'iframe[src*="hcaptcha"]',
-        'iframe[src*="newcaptcha"]',
-        'iframe[title*="hCaptcha"]',
-        'iframe[title*="captcha" i]',
-        'iframe[src*="recaptcha"]',
-        'iframe[src*="google.com/recaptcha"]',
-        '.g-recaptcha',
-        '[data-sitekey]',
-    ]
     captcha_detected = False
-    captcha_grace = time.monotonic() + 6  # give 6 s for normal redirect before captcha detection
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        _sleep_with_cancel(1.5, cancel_event)
-        try:
-            url = page.url
-        except Exception as exc:
-            _raise_if_browser_closed_exception(exc)
-            record(PixivStep("redirect", False, "exception", f"page unavailable: {exc}"))
-            return None, steps
-        if artwork_re.search(url):
-            _sleep_with_cancel(delay, cancel_event)
-            record(PixivStep("redirect", True, detail=f"artwork url={url}"))
-            stop_alert()
-            return url, steps
-        upload_in_url = "upload.php" in url or "illustration/create" in url
-        if not upload_in_url and _is_pixiv_submit_destination(url):
-            _sleep_with_cancel(delay, cancel_event)
-            artwork_url = _resolve_posted_artwork_url(page, payload.get("title_ja", ""))
-            if artwork_url:
-                detail = f"resolved artwork url={artwork_url} from {url}"
-            else:
-                detail = f"submit destination reached; artwork url unresolved, fallback={url}"
-            record(PixivStep("redirect", True, detail=detail))
-            stop_alert()
-            return artwork_url or url, steps
-        # Success modal text ("作品投稿成功") — appears while URL is still the upload page.
-        try:
-            if page.locator('text=作品投稿成功').count() > 0:
-                _sleep_with_cancel(delay, cancel_event)
+    captcha_deadline: float | None = None
+    captcha_notified = False
+    normal_deadline = time.monotonic() + 60
+    last_submit_destination = ""
+    rate_event: dict[str, Any] | None = None
+    try:
+        while True:
+            _sleep_with_cancel(1.0, cancel_event)
+            try:
+                url = str(page.url or "")
+            except Exception as exc:
+                _raise_if_browser_closed_exception(exc)
+                raise
+
+            if artwork_re.search(url):
+                record(PixivStep("redirect", True, detail=f"artwork url={url}"))
+                signal = "http_429" if rate_event else ("captcha" if pre_submit_captcha or captcha_detected else "")
+                return PixivPostResult(
+                    url,
+                    steps,
+                    risk_signal=signal,
+                    retry_after=float((rate_event or {}).get("retry_after") or 0.0),
+                )
+
+            upload_in_url = _is_pixiv_upload_url(url)
+            if not upload_in_url and _is_pixiv_submit_destination(url):
+                last_submit_destination = url
                 artwork_url = _resolve_posted_artwork_url(page, payload.get("title_ja", ""))
-                detail = f"success modal text detected url={artwork_url or url}"
-                record(PixivStep("redirect", True, detail=detail))
-                stop_alert()
-                return artwork_url or url, steps
-        except Exception as exc:
-            _raise_if_browser_closed_exception(exc)
-        # Captcha detection: only after grace period so normal redirects finish first.
-        if not captcha_detected and upload_in_url and time.monotonic() > captcha_grace:
-            if _first_visible_locator(page, captcha_selectors) is not None:
-                captcha_detected = True
-                log.warning("    pixiv: 触发人机验证！在浏览器里完成验证 → 点'投稿'，脚本等你 5 分钟")
-                deadline = time.monotonic() + 300
-                stop_alert = _alert_captcha(page)
-    timeout_msg = (
-        "5 分钟内未检测到投稿成功确认（人机验证未完成？）"
-        if captcha_detected
-        else "60 秒内未检测到投稿成功确认"
-    )
-    record(PixivStep("redirect", False, "verify_failed", timeout_msg))
-    return None, steps
+                if artwork_url:
+                    record(PixivStep("redirect", True, detail=f"resolved artwork url={artwork_url} from {url}"))
+                    signal = "http_429" if rate_event else ("captcha" if pre_submit_captcha or captcha_detected else "")
+                    return PixivPostResult(
+                        artwork_url,
+                        steps,
+                        risk_signal=signal,
+                        retry_after=float((rate_event or {}).get("retry_after") or 0.0),
+                    )
+
+            try:
+                success_text = any(
+                    page.get_by_text(text, exact=False).count() > 0
+                    for text in ("作品投稿成功", "投稿しました", "投稿成功", "Your work has been submitted")
+                )
+            except Exception as exc:
+                _raise_if_browser_closed_exception(exc)
+                success_text = False
+            if success_text:
+                artwork_url = _resolve_posted_artwork_url(page, payload.get("title_ja", ""))
+                if artwork_url:
+                    record(PixivStep("redirect", True, detail=f"explicit success message url={artwork_url}"))
+                    signal = "http_429" if rate_event else ("captcha" if pre_submit_captcha or captcha_detected else "")
+                    return PixivPostResult(
+                        artwork_url,
+                        steps,
+                        risk_signal=signal,
+                        retry_after=float((rate_event or {}).get("retry_after") or 0.0),
+                    )
+                log.warning("    pixiv: 检测到明确成功提示，但尚未解析到作品 URL，继续等待确认")
+
+            new_rate_event = http_monitor.consume() if http_monitor else None
+            if new_rate_event and (
+                rate_event is None
+                or float(new_rate_event.get("retry_after") or 0.0) > float(rate_event.get("retry_after") or 0.0)
+            ):
+                rate_event = new_rate_event
+
+            # Pixiv may render the post-submit challenge on an intermediate
+            # management/login landing page rather than keeping the upload URL.
+            # Detect it on every Pixiv-owned page; explicit artwork URLs have
+            # already returned above, so this cannot turn a confirmed success
+            # back into an interaction wait.
+            captcha = _detect_pixiv_captcha(page) if _is_pixiv_url(url) else {"active": False, "provider": ""}
+            challenge_active = bool(captcha["active"])
+            if challenge_active:
+                if not captcha_detected:
+                    captcha_detected = True
+                    captcha_deadline = time.monotonic() + PIXIV_CAPTCHA_TIMEOUT_SECONDS
+                    log.warning(
+                        "    pixiv: 投稿点击后出现 %s；等待用户完成验证，必要时请在 Pixiv 页面手动点一次投稿",
+                        captcha["provider"] or "CAPTCHA",
+                    )
+                if not captcha_notified:
+                    _notify_user_once(page)
+                    captcha_notified = True
+            if captcha_detected and captcha_deadline is not None:
+                # Once a post-click challenge has appeared, keep the task in
+                # waiting_input until publication is explicitly confirmed. The
+                # widget disappearing alone does not prove that Pixiv accepted
+                # the first click, and the user may still need to submit once in
+                # the Pixiv page.
+                _emit_interaction(
+                    interaction_callback,
+                    _interaction_activity(
+                        "pixiv_captcha_after_submit",
+                        deadline=captcha_deadline,
+                        phase="after_submit",
+                    ),
+                )
+                if time.monotonic() >= captcha_deadline:
+                    record(PixivStep(
+                        "redirect",
+                        False,
+                        "pixiv_captcha_timeout_after_submit",
+                        "点击投稿后的人机验证等待超过 10 分钟；结果可能已发布",
+                    ))
+                    return PixivPostResult(
+                        None,
+                        steps,
+                        error_code="pixiv_captcha_timeout_after_submit",
+                        batch_fatal=True,
+                        maybe_posted=True,
+                        risk_signal="captcha",
+                    )
+            elif time.monotonic() >= normal_deadline:
+                if rate_event:
+                    code = "pixiv_rate_limited_after_submit"
+                    detail = "Pixiv 返回 HTTP 429；投稿结果未确认且禁止自动重试"
+                elif last_submit_destination:
+                    code = "pixiv_submit_destination_unresolved"
+                    detail = (
+                        "已到达 Pixiv 投稿落地页，但无法解析新作品 URL；"
+                        "结果待人工核对且禁止自动重试"
+                    )
+                else:
+                    code = "pixiv_submit_unconfirmed"
+                    detail = "点击投稿后 60 秒内未检测到明确成功结果；禁止自动重试"
+                record(PixivStep("redirect", False, code, detail))
+                return PixivPostResult(
+                    None,
+                    steps,
+                    error_code=code,
+                    batch_fatal=True,
+                    maybe_posted=True,
+                    risk_signal="http_429" if rate_event else "",
+                    retry_after=float((rate_event or {}).get("retry_after") or 0.0),
+                )
+    finally:
+        _emit_interaction(interaction_callback, None)
 
 
 def create_pixiv_post(
@@ -3423,25 +3972,105 @@ def create_pixiv_post(
     log_dir: Path | None = None,
     cancel_event=None,
     progress_callback=None,
-) -> tuple[str | None, list[PixivStep]]:
+    interaction_callback=None,
+) -> PixivPostResult:
     steps: list[PixivStep] = []
+    http_monitor: PixivHttp429Monitor | None = None
     try:
-        return _create_pixiv_post(
+        http_monitor = PixivHttp429Monitor(page)
+        raw_result = _create_pixiv_post(
             page,
             payload,
             image_path,
-            delay,
             log_dir,
             cancel_event,
             steps,
             progress_callback,
+            interaction_callback,
+            http_monitor,
+        )
+        if isinstance(raw_result, PixivPostResult):
+            return raw_result
+        url, returned_steps = raw_result
+        last_failure = next((step for step in reversed(returned_steps) if not step.ok), None)
+        return PixivPostResult(
+            url,
+            returned_steps,
+            error_code=(last_failure.reason if last_failure else ""),
+            batch_fatal=False,
+            maybe_posted=any(step.name == "publish_click" and step.ok for step in returned_steps) and not url,
         )
     except InterruptedError as exc:
         exc.pixiv_steps = steps
         raise
+    except PixivFlowError as exc:
+        submitted = any(step.name == "publish_click" and step.ok for step in steps)
+        if isinstance(exc, PixivBrowserClosedError):
+            try:
+                PIXIV_SESSION.update_verified(
+                    "error",
+                    error_code="pixiv_browser_closed",
+                    error=str(exc),
+                )
+            except OSError as state_exc:
+                log.error(
+                    "    无法持久化 Pixiv 浏览器关闭状态 "
+                    "[pixiv_session_state_unavailable]：%s: %s",
+                    type(state_exc).__name__,
+                    state_exc,
+                )
+        reason = exc.code
+        step_name = "browser_session" if isinstance(exc, PixivBrowserClosedError) else "pixiv_flow"
+        step = PixivStep(step_name, False, reason, str(exc))
+        steps.append(step)
+        log.error("    pixiv: %s ✗ [%s] %s", step.name, step.reason, step.detail)
+        risk_signal = ""
+        retry_after = 0.0
+        if isinstance(exc, PixivRateLimitedError):
+            risk_signal = "http_429"
+            retry_after = exc.retry_after
+        elif "captcha" in exc.code:
+            risk_signal = "captcha"
+        batch_fatal = exc.batch_fatal
+        if isinstance(exc, PixivRateLimitedError) and not submitted:
+            batch_fatal = False
+        return PixivPostResult(
+            None,
+            steps,
+            error_code=reason,
+            batch_fatal=batch_fatal,
+            maybe_posted=exc.maybe_posted or submitted,
+            risk_signal=risk_signal,
+            retry_after=retry_after,
+        )
     except Exception as exc:
         if not _is_browser_closed_exception(exc):
             raise
-        step = PixivStep("browser_session", False, "browser_closed", str(exc))
-        _record_step(steps, page, log_dir, step, cancel_event=cancel_event)
-        return None, steps
+        submitted = any(step.name == "publish_click" and step.ok for step in steps)
+        try:
+            PIXIV_SESSION.update_verified(
+                "error",
+                error_code="pixiv_browser_closed",
+                error=str(exc),
+            )
+        except OSError as state_exc:
+            log.error(
+                "    无法持久化 Pixiv 浏览器关闭状态 "
+                "[pixiv_session_state_unavailable]：%s: %s",
+                type(state_exc).__name__,
+                state_exc,
+            )
+        step = PixivStep("browser_session", False, "pixiv_browser_closed", str(exc))
+        steps.append(step)
+        log.error("    pixiv: %s ✗ [%s] %s", step.name, step.reason, step.detail)
+        return PixivPostResult(
+            None,
+            steps,
+            error_code="pixiv_browser_closed",
+            batch_fatal=True,
+            maybe_posted=submitted,
+        )
+    finally:
+        if http_monitor is not None:
+            http_monitor.close()
+        _emit_interaction(interaction_callback, None)
