@@ -2716,7 +2716,7 @@ def _has_pixiv_upload_form(page) -> bool:
         parsed = urlparse(url)
         if parsed.netloc.lower() not in {"www.pixiv.net", "pixiv.net"}:
             return False
-        return _first_visible_locator(page, PIXIV_SELECTORS["file_input"]) is not None
+        return _first_attached_locator(page, PIXIV_SELECTORS["file_input"]) is not None
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
         return False
@@ -2963,6 +2963,18 @@ def _raise_if_browser_closed_exception(exc: BaseException) -> None:
         raise PixivBrowserClosedError(
             "Pixiv 浏览器窗口已关闭；发布完成前请保持该窗口打开"
         ) from exc
+
+
+def _first_attached_locator(page, selectors: list[str]):
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0:
+                return locator.first
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
+            continue
+    return None
 
 
 def _first_visible_locator(page, selectors: list[str]):
@@ -3669,7 +3681,10 @@ def _create_pixiv_post(
         record(PixivStep("ensure_upload_page", False, "exception", f"{type(exc).__name__}: {exc}"))
         return None, steps
 
-    file_input = _first_visible_locator(page, PIXIV_SELECTORS["file_input"])
+    # Pixiv intentionally hides the native file input behind its drop zone.
+    # Playwright can set files on an attached hidden input, so visibility is
+    # neither required nor a valid signal that the upload form is unavailable.
+    file_input = _first_attached_locator(page, PIXIV_SELECTORS["file_input"])
     if file_input is None:
         record(PixivStep("select_file", False, "selector_miss", str(PIXIV_SELECTORS["file_input"])))
         return None, steps

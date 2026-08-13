@@ -172,6 +172,20 @@ class PixivAuthenticationRecoveryTests(unittest.TestCase):
         update.assert_called_once_with("login_required")
         wait.assert_called_once()
 
+    def test_hidden_file_input_counts_as_rendered_upload_form(self) -> None:
+        page = Mock()
+        file_input = Mock()
+        matches = Mock()
+        matches.count.return_value = 1
+        matches.first = file_input
+        page.locator.return_value = matches
+
+        with patch.object(support, "_page_url", return_value="https://www.pixiv.net/illustration/create"):
+            self.assertTrue(support._has_pixiv_upload_form(page))
+
+        self.assertIs(support._first_attached_locator(page, ['input[type="file"]']), file_input)
+        file_input.is_visible.assert_not_called()
+
 
 class PixivCaptchaStateMachineTests(unittest.TestCase):
     def test_pre_submit_captcha_waits_then_allows_one_submit(self) -> None:
@@ -216,7 +230,7 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
         monitor = Mock()
         monitor.consume.return_value = None
         successful_step = lambda name, *_args, **_kwargs: support.PixivStep(name, True)
-        locator_results = [file_input, None, publish]
+        visible_locator_results = [None, publish]
         captcha_active = {"present": True, "active": True, "provider": "hcaptcha", "token_present": False}
         captcha_done = {"present": False, "active": False, "provider": "", "token_present": True}
         payload = {
@@ -232,7 +246,9 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
         with patch.object(type(page), "url", new_callable=PropertyMock, create=True) as page_url, patch.object(
             support, "ensure_on_pixiv_upload_page"
         ), patch.object(
-            support, "_first_visible_locator", side_effect=locator_results
+            support, "_first_attached_locator", return_value=file_input
+        ), patch.object(
+            support, "_first_visible_locator", side_effect=visible_locator_results
         ), patch.object(support, "_fill_if_found", side_effect=successful_step), patch.object(
             support, "_fill_tag_input", side_effect=successful_step
         ), patch.object(support, "_set_radio_by_attr", side_effect=successful_step), patch.object(
@@ -259,7 +275,6 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
                 page,
                 payload,
                 Path("image.png"),
-                0,
                 None,
                 None,
                 steps,
