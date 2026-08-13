@@ -3,18 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import random
 import re
 import shutil
-import sys
 import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-import httpx
 from PIL import Image, PngImagePlugin
 
 from .paths import PROJECT_ROOT, runtime_paths
@@ -155,12 +152,10 @@ _RUNTIME_PATHS = runtime_paths(SCRIPT_DIR)
 UPLOAD_DIR = SCRIPT_DIR / "upload"
 DONE_DIR = SCRIPT_DIR / "done"
 LOG_DIR = _RUNTIME_PATHS.logs
-PROGRESS_DIR = _RUNTIME_PATHS.progress
 TMP_DIR = _RUNTIME_PATHS.temp
 CHROME_PROFILE_DIR = Path.home() / ".civitai_splitter_chrome"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 CIVITAI_BASE = "https://civitai.red"
-CIVITAI_API = "https://civitai.red/api/v1"
 DONE_DAYS = 7
 _LORA_RE = re.compile(r"<lora:([^:>]+):([^>]+)>")
 TARGETS = {"civitai", "pixiv"}
@@ -390,88 +385,6 @@ def setup_logging():
 log = logging.getLogger("pixiv_uploader")
 
 
-def parse_post_id(value: str) -> int:
-    match = re.search(r"(\d+)", value)
-    if not match:
-        raise ValueError(f"无法从 '{value}' 提取 post ID")
-    return int(match.group(1))
-
-
-def fetch_post_images(post_id: int, api_key: str) -> list[dict]:
-    headers = {"Authorization": f"Bearer {api_key}"}
-    seen = {}
-
-    with httpx.Client(timeout=10, follow_redirects=True) as client:
-        for nsfw in ["None", "Soft", "Mature", "X"]:
-            url = f"{CIVITAI_API}/images"
-            params = {"postId": post_id, "limit": 200, "nsfw": nsfw}
-            try:
-                while url:
-                    resp = client.get(url, headers=headers, params=params)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    for item in data.get("items", []):
-                        seen[item["id"]] = item
-                    next_page = data.get("metadata", {}).get("nextPage")
-                    if next_page:
-                        url = next_page
-                        params = {}
-                    else:
-                        break
-            except (httpx.HTTPStatusError, httpx.TimeoutException):
-                pass
-
-    before = len(seen)
-    with httpx.Client(timeout=5, follow_redirects=True) as client2:
-        for level in range(1, 32):
-            try:
-                resp = client2.get(
-                    f"{CIVITAI_API}/images",
-                    headers=headers,
-                    params={"postId": post_id, "limit": 200, "browsingLevel": level},
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("items", []):
-                        seen[item["id"]] = item
-            except (httpx.HTTPStatusError, httpx.TimeoutException):
-                pass
-    if len(seen) > before:
-        log.info(f"  browsingLevel 补扫发现 {len(seen) - before} 张额外图片")
-
-    images = sorted(seen.values(), key=lambda item: item["id"])
-    log.info(f"  Post {post_id}: 找到 {len(images)} 张图片")
-    return images
-
-
-def best_image_url(img: dict) -> str:
-    url = img["url"]
-    width = img.get("width")
-    return re.sub(r"/width=\d+/", f"/width={width}/" if width else "/", url)
-
-
-def build_a1111_params(meta: dict) -> str:
-    parts = []
-
-    lora_tags = _LORA_RE.findall(meta.get("prompt", ""))
-    if lora_tags:
-        parts.append(", ".join(f"<lora:{name}:{weight}>" for name, weight in lora_tags))
-
-    settings = []
-    mapping = [
-        ("steps", "Steps"), ("sampler", "Sampler"), ("cfgScale", "CFG scale"),
-        ("seed", "Seed"), ("Size", "Size"), ("Model", "Model"),
-        ("Clip skip", "Clip skip"),
-    ]
-    for key, label in mapping:
-        value = meta.get(key)
-        if value is not None:
-            settings.append(f"{label}: {value}")
-
-    if settings:
-        parts.append(", ".join(settings))
-    return "\n".join(parts)
-
-
 def strip_prompts_keep_lora(image_path: Path, dest_dir: Path) -> Path:
     pil_img = Image.open(image_path)
     old_params = pil_img.info.get("parameters", "")
@@ -508,34 +421,6 @@ def strip_prompts_keep_lora(image_path: Path, dest_dir: Path) -> Path:
     dest = dest_dir / f"{image_path.stem}.png"
     pil_img.save(dest, "PNG", pnginfo=pnginfo)
     return dest
-
-
-def download_and_embed_metadata(images: list[dict], api_key: str, dest_dir: Path) -> list[Path]:
-    headers = {"Authorization": f"Bearer {api_key}"}
-    paths = []
-
-    with httpx.Client(timeout=60, follow_redirects=True) as client:
-        for idx, img in enumerate(images):
-            url = best_image_url(img)
-            log.info(f"  下载 [{idx + 1}/{len(images)}] {img['id']}...")
-            resp = client.get(url, headers=headers)
-            resp.raise_for_status()
-
-            jpeg_path = dest_dir / f"{img['id']}.jpeg"
-            jpeg_path.write_bytes(resp.content)
-
-            meta = img.get("meta") or {}
-            if meta:
-                png_path = dest_dir / f"{img['id']}.png"
-                pil_img = Image.open(jpeg_path)
-                pnginfo = PngImagePlugin.PngInfo()
-                pnginfo.add_text("parameters", build_a1111_params(meta))
-                pil_img.save(png_path, "PNG", pnginfo=pnginfo)
-                jpeg_path.unlink()
-                paths.append(png_path)
-            else:
-                paths.append(jpeg_path)
-    return paths
 
 
 LOG_KEEP_PER_GROUP = 100
@@ -593,18 +478,6 @@ def cleanup_done_dir():
 
     if removed:
         log.info(f"清理 done/ 目录：删除了 {removed} 个超过 {DONE_DAYS} 天的文件")
-
-
-def migrate_progress_files():
-    PROGRESS_DIR.mkdir(exist_ok=True)
-    migrated = 0
-    for file in SCRIPT_DIR.glob("*_progress.json"):
-        dest = PROGRESS_DIR / file.name
-        if not dest.exists():
-            shutil.move(str(file), str(dest))
-            migrated += 1
-    if migrated:
-        log.info(f"迁移了 {migrated} 个旧进度文件到 runtime/progress/")
 
 
 def move_to_done(src: Path) -> Path:
@@ -727,16 +600,6 @@ def create_civitai_post(page, image_path: Path, delay: float, cancel_event=None)
             return post_url
     log.error("    发布超时（60 秒内未跳转），跳过")
     return None
-
-
-def load_progress(progress_path: Path) -> dict:
-    if progress_path.exists():
-        return json.loads(progress_path.read_text(encoding="utf-8"))
-    return {"completed": [], "failed": [], "remaining": []}
-
-
-def save_progress(progress_path: Path, progress: dict):
-    progress_path.write_text(json.dumps(progress, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def parse_targets(raw: str) -> list[str]:
@@ -1185,198 +1048,6 @@ def create_upload_manifest(
         manifest["status_by_target"]["civitai"] = "skipped_civitai_safety"
     append_validation_case(image_path, files["validation"], manifest)
     return manifest, pixiv_ready
-
-
-def cmd_split(args):
-    progress_callback = getattr(args, "progress_callback", None)
-    _emit_progress(progress_callback, "split_discover", stage_progress=0.0)
-    api_key = args.api_key or os.environ.get("CIVITAI_API_KEY")
-    if not api_key:
-        log.error("需要 API key。用 --api-key 或设置 CIVITAI_API_KEY 环境变量。")
-        sys.exit(1)
-
-    posts_input = args.posts
-    if not posts_input:
-        raw = input("\nPost ID or URL (space-separated for multiple): ").strip()
-        if not raw:
-            log.info("没有输入。")
-            return
-        posts_input = raw.split()
-
-    post_ids = [parse_post_id(item) for item in posts_input]
-    log.info(f"\n准备拆分 {len(post_ids)} 个 post: {post_ids}")
-
-    all_tasks = []
-    failed_posts = 0
-    for post_index, post_id in enumerate(post_ids, 1):
-        _raise_if_canceled(getattr(args, "cancel_event", None))
-        try:
-            images = fetch_post_images(post_id, api_key)
-        except Exception as exc:
-            failed_posts += 1
-            log.error(f"  Post {post_id} 获取图片失败: {exc}")
-            log.debug(traceback.format_exc())
-            continue
-        finally:
-            _emit_progress(
-                progress_callback,
-                "split_discover",
-                stage_progress=post_index / max(1, len(post_ids)),
-            )
-        if not images:
-            log.info(f"  Post {post_id} 没有找到图片，跳过")
-            continue
-        all_tasks.append((post_id, images))
-
-    if not all_tasks:
-        log.info("没有需要处理的图片。")
-        return {
-            "status": "no_work",
-            "total": 0,
-            "processed": 0,
-            "succeeded": 0,
-            "failed": 0,
-            "unprocessed": 0,
-            "failed_posts": failed_posts,
-        }
-
-    total_images = sum(len(images) for _, images in all_tasks)
-    log.info(f"\n共 {total_images} 张图需要拆分。")
-
-    processed_count = 0
-    success_count = 0
-    fail_count = 0
-    completed_work = 0.0
-    PROGRESS_DIR.mkdir(exist_ok=True)
-    for post_id, images in all_tasks:
-        log.info(f"\n--- 处理 Post {post_id} ({len(images)} 张图) ---")
-        old_progress = SCRIPT_DIR / f"{post_id}_progress.json"
-        progress_path = PROGRESS_DIR / f"{post_id}_progress.json"
-        if old_progress.exists() and not progress_path.exists():
-            shutil.move(str(old_progress), str(progress_path))
-            log.info("  迁移旧进度文件到 runtime/progress/")
-        progress = load_progress(progress_path)
-
-        completed_ids = {item["image_id"] for item in progress["completed"]}
-        completed_here = sum(1 for image in images if image["id"] in completed_ids)
-        processed_count += completed_here
-        success_count += completed_here
-        completed_work += completed_here
-        remaining_images = [img for img in images if img["id"] not in completed_ids]
-        if not remaining_images:
-            log.info("  所有图片已处理完毕。")
-            continue
-
-        temp_dir = make_temp_dir(f"civitai_split_{post_id}_")
-        try:
-            _raise_if_canceled(getattr(args, "cancel_event", None))
-            _emit_progress(
-                progress_callback,
-                "split_download",
-                stage_progress=0.0,
-                overall_progress=completed_work / max(1, total_images),
-                total=total_images,
-                current=processed_count,
-                succeeded=success_count,
-                failed=fail_count,
-            )
-            log.info(f"  下载 {len(remaining_images)} 张图片...")
-            local_paths = download_and_embed_metadata(remaining_images, api_key, temp_dir)
-            completed_work += 0.35 * len(local_paths)
-            _emit_progress(
-                progress_callback,
-                "split_download",
-                stage_progress=1.0,
-                overall_progress=completed_work / max(1, total_images),
-                total=total_images,
-                current=processed_count,
-                succeeded=success_count,
-                failed=fail_count,
-            )
-
-            log.info("  开始上传（每张独立开关浏览器，规避验证码）...")
-            with sync_playwright() as pw:
-                for idx, (img, local_path) in enumerate(zip(remaining_images, local_paths), 1):
-                    _raise_if_canceled(getattr(args, "cancel_event", None))
-                    _emit_progress(
-                        progress_callback,
-                        "split_publish",
-                        stage_progress=0.0,
-                        overall_progress=completed_work / max(1, total_images),
-                        item_index=processed_count + 1,
-                        item_name=str(img["id"]),
-                        total=total_images,
-                        current=processed_count,
-                        succeeded=success_count,
-                        failed=fail_count,
-                    )
-                    log.info(f"\n  [{idx}/{len(remaining_images)}] 上传图片 {img['id']}...")
-                    context, page = open_civitai_browser(pw)
-                    try:
-                        new_url = create_civitai_post(
-                            page,
-                            local_path,
-                            args.delay,
-                            cancel_event=getattr(args, "cancel_event", None),
-                        )
-                    except Exception as exc:
-                        log.error(f"    图片 {img['id']} 发布异常: {exc}")
-                        log.debug(traceback.format_exc())
-                        new_url = None
-                    finally:
-                        context.close()
-                    if new_url:
-                        progress["completed"].append({"image_id": img["id"], "new_post_url": new_url})
-                        success_count += 1
-                    else:
-                        progress["failed"].append({"image_id": img["id"], "error": "发布失败"})
-                        fail_count += 1
-                    processed_count += 1
-                    completed_work += 0.65
-                    save_progress(progress_path, progress)
-                    _emit_progress(
-                        progress_callback,
-                        "split_publish",
-                        stage_progress=1.0 if new_url else 0.0,
-                        overall_progress=completed_work / max(1, total_images),
-                        item_index=processed_count,
-                        item_name=str(img["id"]),
-                        total=total_images,
-                        current=processed_count,
-                        succeeded=success_count,
-                        failed=fail_count,
-                    )
-        except InterruptedError:
-            raise
-        except Exception as exc:
-            log.error(f"  Post {post_id} 处理异常: {exc}")
-            log.debug(traceback.format_exc())
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        log.info(f"\n  Post {post_id} 完成: {len(progress['completed'])} 成功, {len(progress['failed'])} 失败")
-
-    unprocessed_count = max(0, total_images - processed_count)
-    status = "success" if not failed_posts and not fail_count and not unprocessed_count else "failed"
-    if status == "success":
-        _emit_progress(
-            progress_callback,
-            "finalizing",
-            stage_progress=1.0,
-            overall_progress=1.0,
-            total=total_images,
-            current=processed_count,
-            succeeded=success_count,
-            failed=fail_count,
-        )
-    return {
-        "status": status,
-        "total": total_images,
-        "processed": processed_count,
-        "succeeded": success_count,
-        "failed": fail_count,
-        "unprocessed": unprocessed_count,
-        "failed_posts": failed_posts,
-    }
 
 
 def _select_by_sort(images: list, sort_mode: str, count: int) -> list:
@@ -2532,11 +2203,6 @@ def main():
     parser = argparse.ArgumentParser(description="Pixiv Uploader CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    sp_split = subparsers.add_parser("split", help="拆分已发布的多图 post")
-    sp_split.add_argument("posts", nargs="*", help="Post ID 或 URL（支持多个，不填则交互输入）")
-    sp_split.add_argument("--api-key", help="Civitai API key")
-    sp_split.add_argument("--delay", type=float, default=10, help="每个 post 间隔秒数（默认10）")
-
     sp_upload = subparsers.add_parser("upload", help="批量上传 upload/ 目录的图片")
     sp_upload.add_argument("--delay", type=float, default=10, help="每个 post 间隔秒数（默认10）")
     sp_upload.add_argument("--targets", default="civitai", help="发布目标，逗号分隔：civitai,pixiv")
@@ -2580,12 +2246,9 @@ def main():
     log.info(f"=== 启动 Pixiv Uploader CLI {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
     prune_logs()
     cleanup_done_dir()
-    migrate_progress_files()
 
     try:
-        if args.command == "split":
-            cmd_split(args)
-        elif args.command == "upload":
+        if args.command == "upload":
             cmd_upload(args)
         elif args.command == "pixiv-fit-collect":
             cmd_pixiv_fit_collect(args)

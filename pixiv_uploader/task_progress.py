@@ -79,13 +79,6 @@ def build_progress_profile(command: int, params: dict[str, Any] | None = None) -
             stages.extend(_UPLOAD_PIXIV_PUBLISH_STAGES)
         stages.append(ProgressStage("finalizing_image", 4))
         return ProgressProfile(tuple(stages), per_item=True)
-    if command == 1:
-        return ProgressProfile((
-            ProgressStage("split_discover", 15),
-            ProgressStage("split_download", 30),
-            ProgressStage("split_publish", 50),
-            ProgressStage("finalizing", 5),
-        ))
     if command == 4:
         return ProgressProfile((ProgressStage("installing", 1),))
     if command == 5:
@@ -106,9 +99,6 @@ def build_progress_profile(command: int, params: dict[str, Any] | None = None) -
 STAGE_LABELS = {
     "queued": "等待执行",
     "initializing": "初始化任务",
-    "split_discover": "读取 Civitai 帖子",
-    "split_download": "下载与写入元数据",
-    "split_publish": "发布到 Civitai",
     "reading_metadata": "读取图片与元数据",
     "safety_check": "检查内容安全",
     "preparing_artifacts": "准备发布副本",

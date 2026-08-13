@@ -7,6 +7,7 @@ import {
   safeExternalUrl,
   taskSummary,
   taskViewModel,
+  upsertTask,
 } from '../frontend/src/task-view-model.js';
 
 const structuredTask = {
@@ -48,6 +49,25 @@ test('selects only safe retryable unsuccessful images in order', () => {
   const model = taskViewModel(structuredTask);
   assert.equal(model.canExpand, true);
   assert.deepEqual(model.retryableFiles, ['partial.png', 'later.png']);
+});
+
+test('upserts API and repeated SSE snapshots without duplicate tasks', () => {
+  const inserted = upsertTask([], { id: 'task-1', status: 'queued', progress: 0 });
+  const reconciled = upsertTask(inserted, { id: 'task-1', status: 'running', progress: 0.2 });
+  const repeated = upsertTask(reconciled, { id: 'task-1', status: 'running', progress: 0.2 });
+
+  assert.equal(repeated.length, 1);
+  assert.deepEqual(repeated[0], { id: 'task-1', status: 'running', progress: 0.2 });
+});
+
+test('keeps per-image results expandable for a single-image task', () => {
+  const model = taskViewModel({
+    cmd: 3,
+    items: [{ index: 1, name: 'only.png', status: 'succeeded', targets: { pixiv: { status: 'success', post_url: 'https://www.pixiv.net/artworks/1' } } }],
+  });
+
+  assert.equal(model.canExpand, true);
+  assert.equal(model.items[0].targets.pixiv.postUrl, 'https://www.pixiv.net/artworks/1');
 });
 
 test('falls back cleanly for legacy v3 snapshots without items', () => {

@@ -220,23 +220,6 @@ class TaskProgressStateTests(unittest.TestCase):
         self.assertNotIn("publishing_civitai", pixiv_stages)
         self.assertNotIn("generating_copy", pixiv_stages)
 
-    def test_split_can_report_real_work_fraction_across_interleaved_stages(self) -> None:
-        state = TaskProgressState(build_progress_profile(1, {}), total=4)
-        downloaded = state.advance(
-            "split_download",
-            stage_progress=1.0,
-            overall_progress=0.35,
-        )
-        published = state.advance(
-            "split_publish",
-            stage_progress=1.0,
-            overall_progress=0.5,
-        )
-
-        self.assertGreater(published["progress"], downloaded["progress"])
-        self.assertLess(published["progress"], 1.0)
-
-
 class PublishingItemOutcomeTests(unittest.TestCase):
     def test_success_partial_uncertain_cancel_and_archive_failure_outcomes(self) -> None:
         success = {

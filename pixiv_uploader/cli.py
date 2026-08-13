@@ -22,18 +22,6 @@ SCRIPT_DIR = PROJECT_ROOT
 PUBLISHING_COMMAND = ["-m", "pixiv_uploader.publishing"]
 
 
-def _read_config_key() -> str:
-    cfg_file = SCRIPT_DIR / "config.json"
-    if cfg_file.exists():
-        try:
-            return json.loads(cfg_file.read_text(encoding="utf-8")).get("api_key", "")
-        except Exception:
-            pass
-    return ""
-
-
-DEFAULT_API_KEY = os.environ.get("CIVITAI_API_KEY", "") or _read_config_key()
-
 LAST_UPDATE_CHECK_FILE = SCRIPT_DIR / ".last_update_check"
 UPDATE_CHECK_INTERVAL_HOURS = 24  # 最多 24 小时检一次，避免每次启动联网
 
@@ -183,15 +171,14 @@ def header():
         print()
         print(_update_banner)
     print()
-    print("  [1] 拆分 Civitai 帖子（一帖多图 -> 多帖单图）")
-    print("  [2] 上传到双端 (Civitai + Pixiv)")
-    print("  [3] 仅上传到 Pixiv")
-    print("  [4] 安装 / 检查 R-18 自动打码")
-    print("  [5] 检查 / 拉取更新")
-    print("  [6] 配置 / 下载 Tagger 模型 (PixAI / CL)")
-    print("  [7] 切换 Pixiv 账号（清除 + 重新登录）")
-    print("  [8] 切换 Civitai 账号（清除 + 重新登录）")
-    print("  [9] 定时自动发布（配置 / 启动）")
+    print("  [1] 发布到 Civitai + Pixiv")
+    print("  [2] 仅发布到 Pixiv")
+    print("  [3] 安装 / 检查 R-18 自动打码")
+    print("  [4] 检查 / 拉取更新")
+    print("  [5] 配置 / 下载 Tagger 模型 (PixAI / CL)")
+    print("  [6] 切换 Pixiv 账号（清除 + 重新登录）")
+    print("  [7] 切换 Civitai 账号（清除 + 重新登录）")
+    print("  [8] 定时自动发布（配置 / 启动）")
     print("  [Q] 退出")
     print()
 
@@ -201,20 +188,6 @@ def run(args: list[str], extra_env: dict | None = None) -> int:
     if extra_env:
         env.update(extra_env)
     return subprocess.call([sys.executable, *args], cwd=str(SCRIPT_DIR), env=env)
-
-
-def cmd_split() -> None:
-    api_key = os.environ.get("CIVITAI_API_KEY", "") or DEFAULT_API_KEY
-    if not api_key:
-        print()
-        print("[!] 未检测到 CIVITAI_API_KEY 环境变量。")
-        print("    永久设置（推荐）：在 cmd 跑   setx CIVITAI_API_KEY 你的key")
-        print("    然后重新打开此窗口。")
-        print()
-        api_key = input("    或现在临时输入 key（留空返回菜单）: ").strip()
-        if not api_key:
-            return
-    run([*PUBLISHING_COMMAND, "split"], extra_env={"CIVITAI_API_KEY": api_key})
 
 
 _SORT_CHOICES = {
@@ -588,23 +561,22 @@ def main() -> int:
     has, n, info = _check_updates(force=False)
     if has:
         first_line = info.splitlines()[0] if info else ""
-        _update_banner = f"  [!] 远端有 {n} 个新提交可拉取（最新: {first_line[:60]}）。选 [5] 更新"
+        _update_banner = f"  [!] 远端有 {n} 个新提交可拉取（最新: {first_line[:60]}）。选 [4] 更新"
 
     handlers = {
-        "1": ("拆分 Civitai 帖子", cmd_split),
-        "2": ("上传到双端", cmd_upload_dual),
-        "3": ("仅上传到 Pixiv", cmd_upload_pixiv),
-        "4": ("安装 / 检查打码", cmd_setup_censor),
-        "5": ("检查 / 拉取更新", cmd_check_update),
-        "6": ("配置 / 下载 Tagger 模型", cmd_tagger_menu),
-        "7": ("切换 Pixiv 账号（清除 + 重新登录）", cmd_pixiv_logout),
-        "8": ("切换 Civitai 账号（清除 + 重新登录）", cmd_civitai_login),
-        "9": ("定时自动发布", cmd_scheduler),
+        "1": ("发布到 Civitai + Pixiv", cmd_upload_dual),
+        "2": ("仅发布到 Pixiv", cmd_upload_pixiv),
+        "3": ("安装 / 检查打码", cmd_setup_censor),
+        "4": ("检查 / 拉取更新", cmd_check_update),
+        "5": ("配置 / 下载 Tagger 模型", cmd_tagger_menu),
+        "6": ("切换 Pixiv 账号（清除 + 重新登录）", cmd_pixiv_logout),
+        "7": ("切换 Civitai 账号（清除 + 重新登录）", cmd_civitai_login),
+        "8": ("定时自动发布", cmd_scheduler),
     }
     while True:
         header()
         try:
-            choice = input("  请选择 [1-9, Q]: ").strip().lower()
+            choice = input("  请选择 [1-8, Q]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0

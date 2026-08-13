@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider, localizedError, requestLocale, useI18n } from './i18n.jsx';
-import { ITEM_STATUS_META, TARGET_STATUS_META, taskViewModel } from './task-view-model.js';
+import { APP_PAGE_IDS, SETTINGS_TAB_IDS, readAppRoute, routeHash } from './app-route.js';
+import { ITEM_STATUS_META, TARGET_STATUS_META, taskViewModel, upsertTask } from './task-view-model.js';
 
 const THEME_KEY = 'flow-theme-v2';
 const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'];
@@ -9,23 +10,12 @@ const PLATFORM_META = {
   civitai: { label: 'Civitai', short: 'C', tone: 'blue' },
   pixiv: { label: 'Pixiv', short: 'P', tone: 'cyan' },
 };
-const SIDEBAR_PAGES = Object.freeze([['workspace','upload'], ['split','split'], ['tasks','queue'], ['logs','terminal']]);
-const SETTINGS_NAV = Object.freeze([['general','settings'], ['pixiv','shield'], ['llm','wand'], ['scheduler','clock'], ['system','refresh']]);
-const APP_PAGES = new Set([...SIDEBAR_PAGES.map(([id]) => id), 'settings']);
-const SETTINGS_TABS = new Set(SETTINGS_NAV.map(([id]) => id));
+const SIDEBAR_ICONS = Object.freeze({ workspace: 'upload', logs: 'terminal', settings: 'settings' });
+const SETTINGS_ICONS = Object.freeze({ general: 'settings', pixiv: 'shield', llm: 'wand', scheduler: 'clock', system: 'refresh' });
+const SIDEBAR_PAGES = Object.freeze(APP_PAGE_IDS.map(id => [id, SIDEBAR_ICONS[id]]));
+const SETTINGS_NAV = Object.freeze(SETTINGS_TAB_IDS.map(id => [id, SETTINGS_ICONS[id]]));
 const ACTIVE_TASK_STATUSES = new Set(['queued', 'running', 'waiting_input']);
 const MAINTENANCE_COMMANDS = new Set([4, 5]);
-
-function readAppRoute(hash = window.location.hash) {
-  const [candidatePage = '', candidateTab = ''] = hash.replace(/^#\/?/, '').split('/');
-  const page = APP_PAGES.has(candidatePage) ? candidatePage : 'workspace';
-  const settingsTab = page === 'settings' && SETTINGS_TABS.has(candidateTab) ? candidateTab : 'general';
-  return { page, settingsTab };
-}
-
-function routeHash(page, settingsTab = 'general') {
-  return page === 'settings' ? `#/settings/${settingsTab}` : `#/${page}`;
-}
 
 function isMaintenanceTask(task) {
   return task?.category === 'maintenance' || MAINTENANCE_COMMANDS.has(Number(task?.cmd));
@@ -107,7 +97,6 @@ function Icon({ name, size = 18 }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true };
   const paths = {
     upload: <><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 15v4h16v-4"/></>,
-    split: <><path d="M6 4v5a3 3 0 0 0 3 3h6a3 3 0 0 1 3 3v5"/><path d="m3 7 3-3 3 3"/><path d="m15 17 3 3 3-3"/></>,
     shield: <><path d="m12 3 8 3v6c0 5-3.5 8.5-8 9-4.5-.5-8-4-8-9V6l8-3Z"/><path d="m9 12 2 2 4-4"/></>,
     refresh: <><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 8A7 7 0 0 1 18.7 6L20 9"/><path d="M17.9 16A7 7 0 0 1 5.3 18L4 15"/></>,
     settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></>,
@@ -413,31 +402,6 @@ function shuffled(values) {
   return result;
 }
 
-function SplitPage({ onStart }) {
-  const { formatNumber, t } = useI18n();
-  const [value, setValue] = useState('');
-  const [busy, setBusy] = useState(false);
-  const posts = useMemo(() => value.split(/[\s,，]+/).map(item => item.trim()).filter(Boolean), [value]);
-  async function submit(event) {
-    event.preventDefault();
-    if (!posts.length || busy) return;
-    setBusy(true);
-    try {
-      if (await onStart(posts)) setValue('');
-    } finally {
-      setBusy(false);
-    }
-  }
-  return <section className="split-page">
-    <div className="split-intro"><span><Icon name="split" size={23}/></span><div><h2>{t('split.heading')}</h2><p>{t('split.description')}</p></div></div>
-    <form className="split-form" onSubmit={submit}>
-      <label className="flow-field"><span>{t('dialog.splitLabel')}</span><textarea rows="8" value={value} placeholder={t('dialog.splitPlaceholder')} onChange={event => setValue(event.target.value)}/></label>
-      <div className="split-form-footer"><span>{posts.length ? t('split.detected', { count: formatNumber(posts.length) }) : t('split.inputHint')}</span><Button type="submit" variant="primary" icon="split" disabled={!posts.length || busy}>{busy ? t('split.creating') : t('split.start')}</Button></div>
-    </form>
-    <div className="split-notes"><div><Icon name="check" size={16}/><span>{t('split.noteMetadata')}</span></div><div><Icon name="check" size={16}/><span>{t('split.noteQueue')}</span></div></div>
-  </section>;
-}
-
 function InputRequiredDialog({ request, onSubmit }) {
   const { t } = useI18n();
   const [value, setValue] = useState('');
@@ -602,7 +566,7 @@ function TaskRow({ task, expanded, onToggle, onCancel, onRemove, onRetry }) {
   </article>;
 }
 
-function TaskCenter({ tasks, onCancel, onRemove, onRetry }) {
+function WorkspaceTaskSection({ tasks, onCancel, onRemove, onRetry, onCreate }) {
   const { formatNumber, t } = useI18n();
   const [filter, setFilter] = useState('all');
   const [expandedTasks, setExpandedTasks] = useState(() => new Set());
@@ -623,9 +587,9 @@ function TaskCenter({ tasks, onCancel, onRemove, onRetry }) {
     if (next.has(id)) next.delete(id); else next.add(id);
     return next;
   });
-  return <section className="flow-workbench flow-page-panel">
+  return <section className="flow-workbench workspace-task-section">
     <header className="flow-page-toolbar"><div className="flow-page-summary"><Icon name="queue" size={17}/><span>{t('task.centerSummary', { total: formatNumber(workflowTasks.length), active: formatNumber(activeCount) })}</span></div><div className="flow-segmented task-filters" role="group" aria-label={t('task.filterLabel')}>{['all','active','failed'].map(id => <button key={id} aria-pressed={filter === id} className={filter === id ? 'active' : ''} onClick={() => setFilter(id)}>{t(`task.filter.${id}`)}</button>)}</div></header>
-    <div className="flow-task-list">{visibleTasks.length ? visibleTasks.map(task => <TaskRow key={task.id} task={task} expanded={expandedTasks.has(task.id)} onToggle={() => toggleTask(task.id)} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{workflowTasks.length ? t('task.filterEmpty') : t('task.emptyTitle')}</strong><span>{workflowTasks.length ? t('task.filterEmptyHint') : t('task.emptyHint')}</span></div>}</div>
+    <div className="flow-task-list">{visibleTasks.length ? visibleTasks.map(task => <TaskRow key={task.id} task={task} expanded={expandedTasks.has(task.id)} onToggle={() => toggleTask(task.id)} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{workflowTasks.length ? t('task.filterEmpty') : t('task.emptyTitle')}</strong><span>{workflowTasks.length ? t('task.filterEmptyHint') : t('task.emptyHint')}</span>{!workflowTasks.length && <Button variant="primary" icon="upload" onClick={onCreate}>{t('nav.createPublish')}</Button>}</div>}</div>
   </section>;
 }
 
@@ -1092,40 +1056,31 @@ function Sidebar({ status, page, activeTaskCount, onNavigate, mobileOpen, setMob
     <div className="app-brand"><span>PU</span><div><strong>{t('app.name')}</strong><small>{t('app.tagline')}</small></div></div>
     <IconButton className="mobile-menu-button" icon={mobileOpen ? 'x' : 'menu'} label={t('nav.menu')} onClick={() => setMobileOpen(!mobileOpen)}/>
     <div className="app-sidebar-content">
-      <nav className="app-sidebar-nav" aria-label={t('nav.pages')}><small>{t('nav.workspaceGroup')}</small>{SIDEBAR_PAGES.map(([id,icon]) => <button key={id} aria-current={page === id ? 'page' : undefined} className={page === id ? 'active' : ''} onClick={() => navigate(id)}><Icon name={icon}/><span>{t(`nav.${id}`)}</span>{id === 'tasks' && activeTaskCount > 0 && <b>{activeTaskCount}</b>}</button>)}</nav>
+      <nav className="app-sidebar-nav" aria-label={t('nav.pages')}><small>{t('nav.workspaceGroup')}</small>{SIDEBAR_PAGES.map(([id,icon]) => <button key={id} aria-current={page === id ? 'page' : undefined} className={page === id ? 'active' : ''} onClick={() => navigate(id)}><Icon name={icon}/><span>{t(`nav.${id}`)}</span>{id === 'workspace' && activeTaskCount > 0 && <b>{activeTaskCount}</b>}</button>)}</nav>
       <div className="app-sidebar-bottom">
         <div className="sidebar-platforms"><PlatformBadge id="civitai" connected={status.civitai_logged_in}/><PlatformBadge id="pixiv" connected={status.pixiv_logged_in}/></div>
-        <div className="sidebar-bottom-actions"><button aria-current={page === 'settings' ? 'page' : undefined} className={page === 'settings' ? 'active' : ''} onClick={() => navigate('settings')}><Icon name="settings"/><span>{t('nav.settings')}</span></button></div>
       </div>
     </div>
   </aside>;
 }
 
-function QuickPublish({ images, scheduler, onPublish, onOpenFolder }) {
+function QuickPublish({ images, scheduler, onPublish, onOpenFolder, onOpenScheduler }) {
   const { formatNumber, formatTime, t } = useI18n();
   const previews = images.slice(0, 4);
+  const schedulerLabel = scheduler.enabled
+    ? (scheduler.next_fire_at ? t('quick.schedulerNext', { time: formatTime(scheduler.next_fire_at) }) : t('quick.waitingSchedule'))
+    : t('quick.schedulerDisabled');
   return <section className="quick-publish">
     <div className="quick-preview">{previews.length ? previews.map(image => <img src={`/upload/${encodeURIComponent(image.name)}`} alt="" key={image.name}/>) : <div><Icon name="image" size={27}/></div>}</div>
     <div className="quick-copy"><span>{t('quick.pending')}</span><strong>{formatNumber(images.length)}<small> {t('common.imageUnit', { count: images.length })}</small></strong></div>
-    {scheduler.enabled && <div className="quick-scheduler"><Icon name="clock" size={16}/><span>{scheduler.next_fire_at ? formatTime(scheduler.next_fire_at) : t('quick.waitingSchedule')}</span></div>}
+    <button className={`quick-scheduler ${scheduler.enabled ? 'enabled' : ''}`} onClick={onOpenScheduler}><Icon name="clock" size={16}/><span>{schedulerLabel}</span><Icon name="arrow" size={14}/></button>
     <div className="quick-actions"><Button icon="folder" onClick={onOpenFolder}>{t('quick.openFolder')}</Button><Button variant="primary" icon="upload" onClick={onPublish}>{t('nav.createPublish')}</Button></div>
-  </section>;
-}
-
-function WorkspaceOverview({ tasks, scheduler, onNavigate }) {
-  const { formatNumber, formatTime, t } = useI18n();
-  const workflowTasks = tasks.filter(task => !isMaintenanceTask(task));
-  const activeTasks = workflowTasks.filter(task => ACTIVE_TASK_STATUSES.has(task.status));
-  const currentTask = activeTasks.find(task => task.status === 'running' || task.status === 'waiting_input') || activeTasks[0];
-  return <section className="workspace-overview">
-    <article className="workspace-card"><div className="workspace-card-icon"><Icon name="queue" size={20}/></div><div className="workspace-card-copy"><span>{t('workspace.queue')}</span><strong>{activeTasks.length ? t('workspace.activeCount', { count: formatNumber(activeTasks.length) }) : t('workspace.queueIdle')}</strong><small>{currentTask ? taskStageLabel(currentTask, t) : t('workspace.queueIdleHint')}</small></div><Button icon="arrow" onClick={() => onNavigate('tasks')}>{t('workspace.viewTasks')}</Button></article>
-    <article className="workspace-card"><div className="workspace-card-icon"><Icon name="clock" size={20}/></div><div className="workspace-card-copy"><span>{t('workspace.scheduler')}</span><strong>{scheduler.enabled ? t('workspace.schedulerEnabled') : t('workspace.schedulerDisabled')}</strong><small>{scheduler.enabled && scheduler.next_fire_at ? t('workspace.nextRun', { time: formatTime(scheduler.next_fire_at) }) : t('workspace.schedulerHint')}</small></div><Button icon="settings" onClick={() => onNavigate('settings', 'scheduler')}>{t('workspace.configure')}</Button></article>
   </section>;
 }
 
 function FlowConsoleApp() {
   const { t } = useI18n();
-  const [route, setRoute] = useState(() => readAppRoute());
+  const [route, setRoute] = useState(() => readAppRoute(window.location.hash));
   const [theme, setThemeState] = useState(() => localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark');
   const [status, setStatus] = useState({});
   const [images, setImages] = useState([]);
@@ -1157,7 +1112,7 @@ function FlowConsoleApp() {
   useEffect(() => { document.documentElement.dataset.flowTheme = theme; }, []);
   useEffect(() => {
     const syncRoute = () => {
-      const nextRoute = readAppRoute();
+      const nextRoute = readAppRoute(window.location.hash);
       const canonicalHash = routeHash(nextRoute.page, nextRoute.settingsTab);
       if (window.location.hash !== canonicalHash) window.history.replaceState(null, '', canonicalHash);
       setRoute(nextRoute);
@@ -1188,7 +1143,7 @@ function FlowConsoleApp() {
     source.onopen = () => setConnected(true);
     source.onerror = () => setConnected(false);
     listen('task_update', task => {
-      setTasks(previous => { const index = previous.findIndex(item => item.id === task.id); return index < 0 ? [...previous, task] : previous.map(item => item.id === task.id ? { ...item, ...task } : item); });
+      setTasks(previous => upsertTask(previous, task));
       if (isMaintenanceTask(task) && task.status === 'done') reloadStatus().catch(() => {});
     });
     listen('task_remove', data => setTasks(previous => previous.filter(task => task.id !== data.id)));
@@ -1202,6 +1157,7 @@ function FlowConsoleApp() {
 
   async function runTask(command, params = {}, noticeKey = 'task.queuedNotice') {
     const result = await api(`/api/run/${command}`, jsonOptions('POST', params));
+    if (result.task) setTasks(previous => upsertTask(previous, result.task));
     notify(t(noticeKey));
     return result;
   }
@@ -1223,18 +1179,12 @@ function FlowConsoleApp() {
   }
   async function openFolder() { try { await api('/api/open-folder'); } catch (error) { notify(localizedError(error, t), 'error'); } }
   async function submitInput(answer) { try { await api(`/api/tasks/${inputRequest.task_id}/resume`, jsonOptions('POST', { answer })); setInputRequest(null); } catch (error) { notify(localizedError(error, t), 'error'); } }
-  async function startSplit(posts) {
-    try { await runTask(1, { posts }); navigate('tasks'); return true; }
-    catch (error) { notify(localizedError(error, t), 'error'); return false; }
-  }
   async function startMaintenance(command) {
     try { await runTask(command, {}, 'maintenance.started'); }
     catch (error) { notify(localizedError(error, t), 'error'); }
   }
   async function startPublish(command, params) {
-    const result = await runTask(command, params);
-    navigate('tasks');
-    return result;
+    return runTask(command, params);
   }
   const activeTaskCount = tasks.filter(task => !isMaintenanceTask(task) && ACTIVE_TASK_STATUSES.has(task.status)).length;
 
@@ -1244,9 +1194,7 @@ function FlowConsoleApp() {
     <main className="app-main">
       <header className="app-topbar"><div><h1 ref={pageHeading} tabIndex={-1}>{t(`page.${route.page}`)}</h1><span className={connected ? 'connected' : ''}><i/>{connected ? t('app.connected') : t('app.reconnecting')}</span></div><span className="app-version">v{status.version || t('common.notAvailable')}</span></header>
       <div className="app-content"><div key={route.page} className="app-page">
-        {route.page === 'workspace' && <><QuickPublish images={images} scheduler={scheduler} onPublish={() => setDialog('publish')} onOpenFolder={openFolder}/><WorkspaceOverview tasks={tasks} scheduler={scheduler} onNavigate={navigate}/></>}
-        {route.page === 'split' && <SplitPage onStart={startSplit}/>}
-        {route.page === 'tasks' && <TaskCenter tasks={tasks} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask}/>}
+        {route.page === 'workspace' && <><QuickPublish images={images} scheduler={scheduler} onPublish={() => setDialog('publish')} onOpenFolder={openFolder} onOpenScheduler={() => navigate('settings', 'scheduler')}/><WorkspaceTaskSection tasks={tasks} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask} onCreate={() => setDialog('publish')}/></>}
         {route.page === 'logs' && <ActivityLog logs={logs} clearLogs={() => setLogs([])} notify={notify}/>}
         {route.page === 'settings' && <SettingsPage tab={route.settingsTab} onTabChange={tab => navigate('settings', tab)} status={status} scheduler={scheduler} llmConfig={llmConfig} llmPlatformSpecs={llmPlatformSpecs} theme={theme} setTheme={setTheme} reloadStatus={reloadStatus} setScheduler={setScheduler} setLlmConfig={setLlmConfig} notify={notify} tasks={tasks} connected={connected} onMaintenance={startMaintenance} onCancel={cancelTask} onNavigate={navigate}/>}
       </div></div>

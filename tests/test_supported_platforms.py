@@ -76,6 +76,12 @@ class PlatformApiTests(unittest.TestCase):
         self.script_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_retired_split_command_is_rejected(self) -> None:
+        response = self.client.post("/api/run/1", json={"posts": ["123456"]})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error_code"], "invalid_command")
+
     def test_publish_api_rejects_unknown_targets_before_starting_task(self) -> None:
         response = self.client.post("/api/run/2", json={"targets": "civitai,xhs", "files": []})
 
@@ -107,7 +113,10 @@ class PlatformApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        task_id = response.get_json()["task_id"]
+        payload = response.get_json()
+        task_id = payload["task_id"]
+        self.assertEqual(payload["task"]["id"], task_id)
+        self.assertEqual(payload["task"]["status"], "queued")
         task = next(item for item in self.client.get("/api/tasks").get_json() if item["id"] == task_id)
         self.assertEqual(task["current"], 0)
         self.assertEqual(task["total"], 1)
@@ -129,6 +138,19 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(task["items"][0]["status"], "queued")
         self.assertNotIn("source_path", task["items"][0])
         self.assertNotIn("private", str(task["items"][0]))
+
+    def test_pixiv_publish_api_returns_an_initial_task_snapshot(self) -> None:
+        with patch.object(self.web_server.threading.Thread, "start"):
+            response = self.client.post(
+                "/api/run/3",
+                json={"targets": "pixiv", "files": ["example.png"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["task"]["id"], payload["task_id"])
+        self.assertEqual(payload["task"]["cmd"], 3)
+        self.assertEqual(payload["task"]["status"], "queued")
 
     def test_maintenance_commands_are_classified_outside_workflow_tasks(self) -> None:
         with patch.object(self.web_server.threading.Thread, "start"):

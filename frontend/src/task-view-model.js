@@ -26,6 +26,13 @@ const RETRYABLE_STATUSES = new Set(['failed', 'partial', 'canceled', 'unprocesse
 const FAILED_STATUSES = new Set(['failed', 'partial', 'uncertain']);
 const SAFE_NAME_PATTERN = /^[^/\\\0]+$/;
 
+export function upsertTask(tasks, incoming) {
+  if (!incoming?.id) return tasks;
+  const index = tasks.findIndex(task => task.id === incoming.id);
+  if (index < 0) return [...tasks, incoming];
+  return tasks.map(task => task.id === incoming.id ? { ...task, ...incoming } : task);
+}
+
 function boundedInteger(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : fallback;
@@ -130,6 +137,6 @@ export function taskViewModel(task) {
     retryableFiles,
     activeItem,
     hasStructuredItems: items !== null && ([2, 3].includes(Number(task?.cmd)) || items.length > 0),
-    canExpand: Boolean(items && items.length > 1),
+    canExpand: Boolean(items?.length),
   };
 }

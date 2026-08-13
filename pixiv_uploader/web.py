@@ -169,7 +169,6 @@ _pixai_tasks: dict[str, dict] = {}
 _pixai_tasks_lock = threading.Lock()
 
 CMD_LABELS = {
-    1: ("拆分 Civitai 帖子", "本地处理"),
     2: ("发布图片", "Civitai + Pixiv"),
     3: ("发布到 Pixiv", "Pixiv"),
     4: ("安装打码模型", "本地处理"),
@@ -178,7 +177,6 @@ CMD_LABELS = {
 }
 MAINTENANCE_COMMANDS = frozenset({4, 5})
 CMD_LOG_SOURCES = {
-    1: "civitai",
     2: "publish",
     3: "pixiv",
     4: "setup",
@@ -604,26 +602,7 @@ def _run_task_locked(
             progress.finish("canceled")
             return
 
-        if cmd == 1:
-            from .publishing import cmd_split
-            args = argparse.Namespace(
-                posts=params.get("posts", []),
-                api_key=os.environ.get("CIVITAI_API_KEY", params.get("api_key", "")),
-                delay=params.get("delay", 10),
-                cancel_event=cancel_event,
-                progress_callback=progress.report,
-            )
-            result = cmd_split(args)
-            progress.store_result(result)
-            if _is_task_canceled(task_id):
-                _push_log_line(task_id, "INFO", "worker", "任务已取消")
-                progress.finish("canceled")
-                return
-            if isinstance(result, dict) and result.get("status") != "success":
-                progress.finish("failed")
-                return
-
-        elif cmd in (2, 3):
+        if cmd in (2, 3):
             default_targets = "civitai,pixiv" if cmd == 2 else "pixiv"
             from .publishing import cmd_upload
 
@@ -793,11 +772,6 @@ def api_run(cmd):
     params = dict(params)
     uses_pixiv = False
     label, target = CMD_LABELS[cmd]
-    if cmd == 1:
-        posts = params.get("posts") or []
-        if not isinstance(posts, list) or not any(str(post).strip() for post in posts):
-            return _api_error("posts_required", detail="至少填写一个 Civitai Post ID 或 URL")
-        params["posts"] = [str(post).strip() for post in posts if str(post).strip()]
     if cmd in (2, 3):
         try:
             targets = _validate_target_string(params.get("targets", "civitai,pixiv" if cmd == 2 else "pixiv"))
@@ -849,7 +823,8 @@ def api_run(cmd):
     else:
         with TASKS_LOCK:
             TASKS[task_id] = task
-    _broadcast_sse("task_update", _task_snapshot(task))
+    initial_snapshot = _task_snapshot(task)
+    _broadcast_sse("task_update", initial_snapshot)
 
     try:
         t.start()
@@ -859,7 +834,7 @@ def api_run(cmd):
             reason_code="task_start_failed",
         )
         return _api_error("task_start_failed", 500, detail=str(exc), reason=str(exc))
-    return jsonify({"task_id": task_id})
+    return jsonify({"task_id": task_id, "task": initial_snapshot})
 
 
 @app.route("/api/tasks")
