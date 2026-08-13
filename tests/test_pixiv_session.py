@@ -8,22 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, patch
 
 import pixiv_uploader.pixiv.support as support
-from pixiv_uploader.pixiv.session import (
-    PixivProfileInUseError,
-    PixivRateController,
-    PixivSessionStore,
-)
-
-
-class MutableClock:
-    def __init__(self, value: float = 1_000.0) -> None:
-        self.value = value
-
-    def __call__(self) -> float:
-        return self.value
-
-    def sleep(self, seconds: float) -> None:
-        self.value += seconds
+from pixiv_uploader.pixiv.session import PixivProfileInUseError, PixivSessionStore
 
 
 class PixivSessionStoreTests(unittest.TestCase):
@@ -288,14 +273,12 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
 
         click.assert_called_once()
         self.assertEqual(result.url, "https://www.pixiv.net/artworks/123")
-        self.assertEqual(result.risk_signal, "captcha")
 
     def test_captcha_after_submit_never_triggers_a_second_automatic_click(self) -> None:
         result, click, activities = self._run_post(pre_submit_captcha=False, post_submit_captcha=True)
 
         click.assert_called_once()
         self.assertEqual(result.url, "https://www.pixiv.net/artworks/123")
-        self.assertEqual(result.risk_signal, "captcha")
         self.assertTrue(any(activity and activity["interaction_type"] == "pixiv_captcha_after_submit" for activity in activities))
 
     def test_post_submit_captcha_is_detected_on_pixiv_management_landing(self) -> None:
@@ -307,7 +290,6 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
 
         click.assert_called_once()
         self.assertEqual(result.url, "https://www.pixiv.net/artworks/123")
-        self.assertEqual(result.risk_signal, "captcha")
         self.assertTrue(any(
             activity and activity["interaction_type"] == "pixiv_captcha_after_submit"
             for activity in activities
@@ -322,102 +304,6 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
                 Mock(),
                 cancel_event=cancel_event,
             )
-
-
-class PixivRateControllerTests(unittest.TestCase):
-    def test_three_risk_levels_persist_deduplicate_and_decay(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "risk.json"
-            clock = MutableClock()
-            controller = PixivRateController(
-                state_path=state_path,
-                clock=clock,
-                sleeper=clock.sleep,
-                random_uniform=lambda low, _high: low,
-            )
-            level_one = controller.record_risk("captcha", work_key="image-a")
-            unrelated_429 = controller.record_risk("http_429", work_key="image-a")
-            duplicate = controller.record_risk("captcha", work_key="image-a")
-            level_two = controller.record_risk("captcha", work_key="image-b")
-            level_three = controller.record_risk("http_429", work_key="image-c")
-            reloaded = PixivRateController(state_path=state_path, clock=clock)
-
-            self.assertEqual(level_one["risk_level"], 1)
-            self.assertEqual(unrelated_429["risk_level"], 2)
-            self.assertEqual(duplicate["risk_level"], 2)
-            self.assertEqual(level_two["risk_level"], 3)
-            self.assertEqual(level_three["risk_level"], 3)
-            self.assertEqual(reloaded.snapshot()["risk_level"], 3)
-
-            clock.value += level_three["cooldown_remaining_seconds"] + 1
-            controller.wait(poll_seconds=10_000)
-            controller.record_success(risk_signal=True)
-            controller.record_success()
-            controller.record_success()
-            self.assertEqual(controller.record_success()["risk_level"], 2)
-            clock.value += 2 * 24 * 60 * 60 + 1
-            self.assertEqual(controller.snapshot()["risk_level"], 0)
-
-    def test_normal_delay_uses_point_eight_to_one_point_four_jitter(self) -> None:
-        ranges: list[tuple[float, float]] = []
-        with tempfile.TemporaryDirectory() as temp_dir:
-            controller = PixivRateController(
-                state_path=Path(temp_dir) / "risk.json",
-                random_uniform=lambda low, high: ranges.append((low, high)) or high,
-            )
-            snapshot = controller.schedule_baseline(10)
-
-        self.assertEqual(ranges, [(8.0, 14.0)])
-        self.assertGreaterEqual(snapshot["cooldown_remaining_seconds"], 13)
-
-    def test_baseline_does_not_replace_an_active_risk_cooldown_reason(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "risk.json"
-            clock = MutableClock()
-            controller = PixivRateController(
-                state_path=state_path,
-                clock=clock,
-                random_uniform=lambda low, _high: low,
-            )
-            risk = controller.record_risk("captcha", work_key="image")
-            baseline = controller.schedule_baseline(10)
-
-        self.assertEqual(baseline["cooldown_reason"], "captcha")
-        self.assertEqual(baseline["cooldown_until"], risk["cooldown_until"])
-
-    def test_http_429_uses_its_current_risk_level_unless_retry_after_is_longer(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "risk.json"
-            clock = MutableClock()
-            controller = PixivRateController(
-                state_path=state_path,
-                clock=clock,
-                random_uniform=lambda low, _high: low,
-            )
-
-            snapshot = controller.record_risk("http_429", work_key="image", retry_after=60)
-
-        self.assertEqual(snapshot["risk_level"], 1)
-        self.assertEqual(snapshot["cooldown_remaining_seconds"], 120)
-
-    def test_retry_after_supports_seconds_and_http_dates(self) -> None:
-        self.assertEqual(PixivRateController.parse_retry_after("120", now=1_000), 120)
-        self.assertEqual(
-            PixivRateController.parse_retry_after("Thu, 01 Jan 1970 00:20:00 GMT", now=1_000),
-            200,
-        )
-
-    def test_cooldown_wait_is_cancelable(self) -> None:
-        cancel_event = threading.Event()
-        cancel_event.set()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            controller = PixivRateController(
-                state_path=Path(temp_dir) / "risk.json",
-                random_uniform=lambda low, _high: low,
-            )
-            controller.record_risk("captcha", work_key="image")
-            with self.assertRaises(InterruptedError):
-                controller.wait(cancel_event=cancel_event)
 
 
 class PixivProfileQueueTests(unittest.TestCase):
@@ -447,14 +333,25 @@ class PixivProfileQueueTests(unittest.TestCase):
 
 
 class PixivWebContractTests(unittest.TestCase):
+    def test_session_payload_does_not_add_removed_cooldown_state(self) -> None:
+        import pixiv_uploader.web as web
+
+        session = {
+            "state": "authenticated",
+            "last_verified_at": "2026-01-01T00:00:00+00:00",
+        }
+        with patch.object(web.PIXIV_SESSION, "snapshot", return_value=session):
+            payload = web._pixiv_session_payload()
+
+        self.assertEqual(payload, session)
+        self.assertIsNot(payload, session)
+
     def test_status_api_exposes_structured_session_and_compatible_boolean(self) -> None:
         import pixiv_uploader.web as web
 
         session = {
             "state": "authenticated",
             "last_verified_at": "2026-01-01T00:00:00+00:00",
-            "risk_level": 2,
-            "cooldown_until": "2026-01-01T00:05:00+00:00",
         }
         with patch.object(web, "_pixiv_session_payload", return_value=session):
             response = web.app.test_client().get("/api/status")
@@ -583,7 +480,7 @@ class PixivRetrySafetyTests(unittest.TestCase):
 
         self.assertEqual(decision, "stop_uncertain")
 
-    def test_429_before_click_can_retry_but_after_click_cannot(self) -> None:
+    def test_429_stops_batch_and_after_click_remains_uncertain(self) -> None:
         import pixiv_uploader.publishing as publishing
 
         before = support.PixivPostResult(None, [], error_code="pixiv_rate_limited", batch_fatal=True)
@@ -592,7 +489,7 @@ class PixivRetrySafetyTests(unittest.TestCase):
 
         self.assertEqual(
             publishing._pixiv_retry_decision(before, [], attempt=0, max_retries=1),
-            "retry_after_cooldown",
+            "stop_batch",
         )
         self.assertEqual(
             publishing._pixiv_retry_decision(before, [], attempt=1, max_retries=1),

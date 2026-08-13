@@ -35,7 +35,6 @@ from .pixiv.session import (
     PIXIV_SESSION,
     PixivFlowError,
     PixivProfileInUseError,
-    PixivRateController,
 )
 from .pixiv.storage import ensure_runtime_files, load_json, save_json
 from .pixiv.support import run_pixiv_login_flow
@@ -287,9 +286,7 @@ def _broadcast_sse(event_type: str, data: dict) -> None:
 
 
 def _pixiv_session_payload(session_snapshot: dict | None = None) -> dict:
-    payload = dict(session_snapshot or PIXIV_SESSION.snapshot())
-    payload.update(PixivRateController().snapshot())
-    return payload
+    return dict(session_snapshot or PIXIV_SESSION.snapshot())
 
 
 def _broadcast_pixiv_session(session_snapshot: dict) -> None:
@@ -363,6 +360,9 @@ class _TaskProgressController:
             task["count"] = f"{task['current']} / {task['total']}" if task["total"] else "—"
             snap = _task_snapshot(task)
         _broadcast_sse("task_update", snap)
+        if stage == "item_complete" and details.get("item_status") == "succeeded":
+            # 成功状态只会在原图完成归档后上报，立即刷新列表，避免批次期间继续请求已移走的缩略图。
+            _broadcast_sse("images_changed", {})
 
     def interaction(self, activity: dict | None) -> None:
         with TASKS_LOCK:

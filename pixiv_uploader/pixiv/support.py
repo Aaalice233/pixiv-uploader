@@ -29,7 +29,6 @@ from .session import (
     PIXIV_LOGIN_TIMEOUT_SECONDS,
     PIXIV_SESSION,
     PixivFlowError,
-    PixivRateController,
 )
 from .storage import (
     create_rule_fit_compare_path,
@@ -166,13 +165,12 @@ class PixivBrowserClosedError(PixivFlowError):
 
 
 class PixivRateLimitedError(PixivFlowError):
-    def __init__(self, retry_after: float = 0.0, *, submitted: bool = False):
+    def __init__(self, *, submitted: bool = False):
         super().__init__(
             "pixiv_rate_limited_after_submit" if submitted else "pixiv_rate_limited",
-            "Pixiv 返回 HTTP 429，发布已进入风险冷却",
+            "Pixiv 返回 HTTP 429，已停止当前发布批次",
             maybe_posted=submitted,
         )
-        self.retry_after = max(0.0, float(retry_after or 0.0))
         self.submitted = submitted
 
 
@@ -183,8 +181,6 @@ class PixivPostResult:
     error_code: str = ""
     batch_fatal: bool = False
     maybe_posted: bool = False
-    risk_signal: str = ""
-    retry_after: float = 0.0
 
     def __iter__(self):
         yield self.url
@@ -3362,15 +3358,13 @@ class PixivHttp429Monitor:
                 return
             if resource_type not in {"document", "xhr", "fetch"}:
                 return
-            retry_after = PixivRateController.parse_retry_after(response.headers.get("retry-after"))
             event = {
                 "url": response.url,
                 "resource_type": resource_type,
-                "retry_after": retry_after,
             }
             with self._lock:
                 self._events.append(event)
-            log.warning("    pixiv: 捕获 HTTP 429 (%s, Retry-After=%ss)", response.url, retry_after)
+            log.warning("    pixiv: 捕获 HTTP 429 (%s)，停止当前发布批次", response.url)
         except Exception:
             log.exception("Pixiv 429 响应监听失败")
 
@@ -3380,7 +3374,7 @@ class PixivHttp429Monitor:
                 return None
             events = self._events[:]
             self._events.clear()
-        return max(events, key=lambda item: float(item.get("retry_after") or 0.0))
+        return events[-1]
 
     def close(self) -> None:
         try:
@@ -3436,7 +3430,7 @@ def _wait_for_pre_submit_ready(
             _raise_if_canceled(cancel_event)
             rate_event = http_monitor.consume() if http_monitor else None
             if rate_event:
-                raise PixivRateLimitedError(rate_event.get("retry_after", 0.0), submitted=False)
+                raise PixivRateLimitedError(submitted=False)
             captcha = _detect_pixiv_captcha(page)
             enabled = _publish_enabled(publish_locator)
             unresolved_challenge = bool(captcha["active"] or (captcha["present"] and not captcha["token_present"]))
@@ -3797,10 +3791,8 @@ def _create_pixiv_post(
             None,
             steps,
             error_code=exc.code,
-            batch_fatal=False,
+            batch_fatal=True,
             maybe_posted=False,
-            risk_signal="http_429",
-            retry_after=exc.retry_after,
         )
     except InterruptedError:
         raise
@@ -3812,8 +3804,6 @@ def _create_pixiv_post(
             error_code=exc.code,
             batch_fatal=exc.batch_fatal,
             maybe_posted=exc.maybe_posted,
-            risk_signal="captcha" if "captcha" in exc.code else "",
-            retry_after=float(getattr(exc, "retry_after", 0.0) or 0.0),
         )
     record(PixivStep(
         "publish_enable",
@@ -3855,13 +3845,7 @@ def _create_pixiv_post(
 
             if artwork_re.search(url):
                 record(PixivStep("redirect", True, detail=f"artwork url={url}"))
-                signal = "http_429" if rate_event else ("captcha" if pre_submit_captcha or captcha_detected else "")
-                return PixivPostResult(
-                    url,
-                    steps,
-                    risk_signal=signal,
-                    retry_after=float((rate_event or {}).get("retry_after") or 0.0),
-                )
+                return PixivPostResult(url, steps)
 
             upload_in_url = _is_pixiv_upload_url(url)
             if not upload_in_url and _is_pixiv_submit_destination(url):
@@ -3869,13 +3853,7 @@ def _create_pixiv_post(
                 artwork_url = _resolve_posted_artwork_url(page, payload.get("title_ja", ""))
                 if artwork_url:
                     record(PixivStep("redirect", True, detail=f"resolved artwork url={artwork_url} from {url}"))
-                    signal = "http_429" if rate_event else ("captcha" if pre_submit_captcha or captcha_detected else "")
-                    return PixivPostResult(
-                        artwork_url,
-                        steps,
-                        risk_signal=signal,
-                        retry_after=float((rate_event or {}).get("retry_after") or 0.0),
-                    )
+                    return PixivPostResult(artwork_url, steps)
 
             try:
                 success_text = any(
@@ -3889,20 +3867,11 @@ def _create_pixiv_post(
                 artwork_url = _resolve_posted_artwork_url(page, payload.get("title_ja", ""))
                 if artwork_url:
                     record(PixivStep("redirect", True, detail=f"explicit success message url={artwork_url}"))
-                    signal = "http_429" if rate_event else ("captcha" if pre_submit_captcha or captcha_detected else "")
-                    return PixivPostResult(
-                        artwork_url,
-                        steps,
-                        risk_signal=signal,
-                        retry_after=float((rate_event or {}).get("retry_after") or 0.0),
-                    )
+                    return PixivPostResult(artwork_url, steps)
                 log.warning("    pixiv: 检测到明确成功提示，但尚未解析到作品 URL，继续等待确认")
 
             new_rate_event = http_monitor.consume() if http_monitor else None
-            if new_rate_event and (
-                rate_event is None
-                or float(new_rate_event.get("retry_after") or 0.0) > float(rate_event.get("retry_after") or 0.0)
-            ):
+            if new_rate_event:
                 rate_event = new_rate_event
 
             # Pixiv may render the post-submit challenge on an intermediate
@@ -3950,7 +3919,6 @@ def _create_pixiv_post(
                         error_code="pixiv_captcha_timeout_after_submit",
                         batch_fatal=True,
                         maybe_posted=True,
-                        risk_signal="captcha",
                     )
             elif time.monotonic() >= normal_deadline:
                 if rate_event:
@@ -3972,8 +3940,6 @@ def _create_pixiv_post(
                     error_code=code,
                     batch_fatal=True,
                     maybe_posted=True,
-                    risk_signal="http_429" if rate_event else "",
-                    retry_after=float((rate_event or {}).get("retry_after") or 0.0),
                 )
     finally:
         _emit_interaction(interaction_callback, None)
@@ -4005,16 +3971,18 @@ def create_pixiv_post(
             http_monitor,
         )
         if isinstance(raw_result, PixivPostResult):
-            return raw_result
-        url, returned_steps = raw_result
-        last_failure = next((step for step in reversed(returned_steps) if not step.ok), None)
-        return PixivPostResult(
-            url,
-            returned_steps,
-            error_code=(last_failure.reason if last_failure else ""),
-            batch_fatal=False,
-            maybe_posted=any(step.name == "publish_click" and step.ok for step in returned_steps) and not url,
-        )
+            result = raw_result
+        else:
+            url, returned_steps = raw_result
+            last_failure = next((step for step in reversed(returned_steps) if not step.ok), None)
+            result = PixivPostResult(
+                url,
+                returned_steps,
+                error_code=(last_failure.reason if last_failure else ""),
+                batch_fatal=False,
+                maybe_posted=any(step.name == "publish_click" and step.ok for step in returned_steps) and not url,
+            )
+        return result
     except InterruptedError as exc:
         exc.pixiv_steps = steps
         raise
@@ -4039,24 +4007,13 @@ def create_pixiv_post(
         step = PixivStep(step_name, False, reason, str(exc))
         steps.append(step)
         log.error("    pixiv: %s ✗ [%s] %s", step.name, step.reason, step.detail)
-        risk_signal = ""
-        retry_after = 0.0
-        if isinstance(exc, PixivRateLimitedError):
-            risk_signal = "http_429"
-            retry_after = exc.retry_after
-        elif "captcha" in exc.code:
-            risk_signal = "captcha"
         batch_fatal = exc.batch_fatal
-        if isinstance(exc, PixivRateLimitedError) and not submitted:
-            batch_fatal = False
         return PixivPostResult(
             None,
             steps,
             error_code=reason,
             batch_fatal=batch_fatal,
             maybe_posted=exc.maybe_posted or submitted,
-            risk_signal=risk_signal,
-            retry_after=retry_after,
         )
     except Exception as exc:
         if not _is_browser_closed_exception(exc):

@@ -361,7 +361,6 @@ class PixivUploadStartupTests(unittest.TestCase):
                 stack.enter_context(patch.object(splitter, "open_pixiv_browser", side_effect=open_browser))
                 stack.enter_context(patch.object(splitter, "create_pixiv_post", side_effect=publish))
                 stack.enter_context(patch.object(splitter, "_acquire_pixiv_profile_for_task", return_value=object()))
-                stack.enter_context(patch.object(splitter, "PixivRateController"))
                 stack.enter_context(patch.object(splitter, "find_target_successes", return_value={}))
                 stack.enter_context(patch.object(splitter, "write_manifest"))
                 stack.enter_context(patch.object(splitter, "save_json"))

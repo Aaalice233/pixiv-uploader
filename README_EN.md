@@ -94,10 +94,10 @@ Do not close browser windows opened by the application while login or publishing
 - **Long-lived session** — sign-in and publishing both use system Chrome with one stable persistent Profile. Each Pixiv batch launches one browser Context and reuses it across images. Keep the device, Profile, and network egress stable, and do not open that Profile in an external Chrome instance at the same time.
 - **Expired session** — the task moves to “Action needed” and opens Pixiv sign-in. After you sign in on Pixiv, the app verifies the submission page again and automatically resumes the current image. The wait limit is 15 minutes and remains cancelable from the Publishing workspace.
 - **CAPTCHA** — for a challenge before submission, the app performs exactly one automatic submit after you solve it. If the challenge appears after Submit was already clicked, complete it on Pixiv and click Submit once only when Pixiv explicitly asks. The app never submits a second time automatically. The CAPTCHA limit is 10 minutes, and the whole Pixiv queue pauses while waiting.
-- **Adaptive cooldown** — normal success adds `0.8–1.4×` jitter around `--delay` (about 8–14 seconds by default). CAPTCHA or HTTP 429 raises the next cooldown to 2–5, 5–10, or 15–30 minutes and honors a longer `Retry-After` when provided. Three risk-free successes or 24 hours without a new risk signal lower the level. Risk and pending cooldown survive application restarts.
+- **Rate limits** — when Pixiv returns HTTP 429, the current Pixiv batch stops immediately without starting a risk level, adding an extra risk wait, or retrying automatically. Unconfirmed images remain in place to avoid duplicate submissions. The regular user-configured post interval still applies.
 - **Safe archival and termination** — an image counts as complete only after every selected target is confirmed and the source has moved into `done/`; confirmed uploads do not remain in `upload/`, and an archival failure is reported explicitly. Closing the browser, timing out, or canceling stops the Pixiv batch and keeps unconfirmed images. If Submit was clicked but success cannot be confirmed, the manifest records `maybe_posted` and automatic retry is forbidden until you check the Pixiv artworks page.
 
-The account card reports “Not set up / Verification pending / Verifying / Signed in / Sign-in required / In use / Verification failed,” along with last verification, risk level, and cooldown. The Publishing workspace shows the current sign-in, CAPTCHA, or cooldown reason and remaining time in real time.
+The account card reports “Not set up / Verification pending / Verifying / Signed in / Sign-in required / In use / Verification failed” and the last verification time. The Publishing workspace shows sign-in and CAPTCHA waits with their remaining time in real time.
 
 ### CLI menu
 
@@ -196,7 +196,6 @@ Choose a text or image watermark under **Settings → Pixiv processing → Water
 | `runtime/civitai/safety.json` | Local Civitai safety rules |
 | `runtime/pixiv/censor.json` | Local Pixiv censor presets and detection classes |
 | `runtime/pixiv/session.json` | Last verified Pixiv session result and timestamp |
-| `runtime/pixiv/risk_state.json` | Pixiv risk level, safe-success count, and restart-safe cooldown |
 | `runtime/pixiv/*.json` | Local tag overrides, age rules, popularity cache, and validation data |
 | `runtime/watermark/config.json` | Active text or image watermark configuration |
 | `runtime/watermark/fonts/` | Locally imported fonts |

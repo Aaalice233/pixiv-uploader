@@ -391,6 +391,35 @@ class WebTaskProgressTests(unittest.TestCase):
         self.assertEqual(task["items"][0]["reason_code"], "batch_stopped")
         self.assertLess(task["progress"], 1.0)
 
+    def test_archived_item_immediately_refreshes_upload_images(self) -> None:
+        params = {"targets": "pixiv", "files": ["image.png"]}
+        task = web._new_task_record(
+            "archived-item-refresh",
+            3,
+            params,
+            title="发布 1 张图片",
+            target="Pixiv",
+            total=1,
+        )
+        task["status"] = "running"
+        with web.TASKS_LOCK:
+            web.TASKS[task["id"]] = task
+        controller = web._TaskProgressController(task["id"], 3, params)
+
+        with patch.object(web, "_broadcast_sse") as broadcast:
+            controller.report(
+                "item_complete",
+                item_index=1,
+                item_name="image.png",
+                item_status="succeeded",
+                retryable=False,
+            )
+
+        self.assertEqual(
+            [event.args[0] for event in broadcast.call_args_list],
+            ["task_update", "images_changed"],
+        )
+
     def test_failed_controller_keeps_real_stage_and_progress_below_complete(self) -> None:
         task = web._new_task_record(
             "failed-progress",

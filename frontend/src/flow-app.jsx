@@ -438,13 +438,6 @@ function taskActivityLabel(task, t, formatNumber) {
       ? t(key)
       : t(key, { remaining: taskRemainingLabel(activity.remaining_seconds, t, formatNumber) });
   }
-  if (activity.kind === 'pixiv_cooldown') {
-    const key = activity.reason === 'baseline' ? 'task.pixivCooldown.baseline' : activity.reason === 'http_429' ? 'task.pixivCooldown.rateLimit' : 'task.pixivCooldown.risk';
-    return t(key, {
-      level: formatNumber(Math.max(0, Number(activity.risk_level || 0))),
-      remaining: taskRemainingLabel(activity.remaining_seconds, t, formatNumber),
-    });
-  }
   if (activity.kind !== 'llm_retry') return '';
   const values = {
     attempt: formatNumber(Math.max(0, Number(activity.attempt || 0))),
@@ -653,8 +646,6 @@ function GeneralSettings({ status, theme, setTheme, notify, reloadStatus }) {
   const pixivDetails = [];
   if (pixivSession.last_verified_at) pixivDetails.push(t('settings.pixivLastVerified', { time: formatDateTime(pixivSession.last_verified_at) }));
   if (pixivSession.last_error_code) pixivDetails.push(t('settings.pixivError', { reason: pixivSession.last_error || pixivSession.last_error_code }));
-  if (Number(pixivSession.risk_level || 0) > 0) pixivDetails.push(t('settings.pixivRiskLevel', { level: pixivSession.risk_level }));
-  if (pixivSession.cooldown_until) pixivDetails.push(t('settings.pixivCooldownUntil', { time: formatDateTime(pixivSession.cooldown_until) }));
   return <div className="settings-page">
     <section className="settings-section"><h3>{t('settings.appearance')}</h3><div className="settings-row"><div><strong>{t('settings.theme')}</strong><small>{t('settings.themeHint')}</small></div><div className="flow-segmented"><button aria-pressed={theme === 'dark'} className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')}>{t('settings.theme.dark')}</button><button aria-pressed={theme === 'light'} className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')}>{t('settings.theme.light')}</button></div></div><div className="settings-row"><div><strong>{t('settings.language')}</strong><small>{t('settings.languageHint')}</small></div><div className="flow-segmented locale-segmented">{locales.map(item => <button key={item.id} lang={item.id} aria-pressed={locale === item.id} className={locale === item.id ? 'active' : ''} onClick={() => setLocale(item.id)}>{item.label}</button>)}</div></div></section>
     <section className="settings-section"><h3>{t('settings.civitaiApi')}</h3><form className="settings-inline-field" onSubmit={event => { event.preventDefault(); saveKey(); }}><input className="credential-username" type="text" autoComplete="username" value="civitai-api" readOnly aria-hidden="true" tabIndex={-1}/><input type="password" autoComplete="new-password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={status.api_key_masked || t('settings.apiKeyPlaceholder')}/><Button type="submit" variant="primary" disabled={!apiKey.trim() || busy === 'key'}>{t('common.save')}</Button></form></section>
@@ -1115,6 +1106,7 @@ function FlowConsoleApp() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
   const toastTimers = useRef(new Map());
+  const imageReloadVersion = useRef(0);
   const pageHeading = useRef(null);
 
   function setTheme(value) {
@@ -1155,7 +1147,12 @@ function FlowConsoleApp() {
   }
 
   async function reloadStatus() { const next = await api('/api/status'); setStatus(next); if (next.scheduler) setScheduler(next.scheduler); return next; }
-  async function reloadImages() { const next = await api('/api/images'); setImages(next); return next; }
+  async function reloadImages() {
+    const version = ++imageReloadVersion.current;
+    const next = await api('/api/images');
+    if (version === imageReloadVersion.current) setImages(next);
+    return next;
+  }
   async function reloadTasks() { const next = await api('/api/tasks'); setTasks(next); return next; }
   useEffect(() => {
     Promise.all([reloadStatus(), reloadImages(), reloadTasks(), api('/api/llm-reverse-config'), api('/api/llm-reverse-platforms'), api('/api/upload-defaults')]).then(([, , , llm, platforms, defaults]) => { setLlmConfig(llm); setLlmPlatformSpecs(platforms); setUploadDefaults(defaults); }).catch(error => notify(localizedError(error, t), 'error'));

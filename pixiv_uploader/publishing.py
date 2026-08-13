@@ -114,7 +114,7 @@ from .pixiv.tagger_settings import (
     resolve_cl_model_dir,
     resolve_pixai_model_dir,
 )
-from .pixiv.session import PIXIV_SESSION, PixivFlowError, PixivProfileInUseError, PixivRateController
+from .pixiv.session import PIXIV_SESSION, PixivFlowError, PixivProfileInUseError
 from .pixiv.storage import (
     append_validation_case,
     create_manifest_path,
@@ -1076,9 +1076,7 @@ def _pixiv_retry_decision(
     )
     if submitted:
         return "stop_uncertain"
-    if result.error_code == "pixiv_rate_limited":
-        return "retry_after_cooldown" if attempt < max_retries else "stop_batch"
-    if result.risk_signal == "captcha":
+    if result.error_code == "pixiv_rate_limited" or "captcha" in result.error_code:
         return "stop_batch"
     if result.batch_fatal:
         return "stop_batch"
@@ -1413,7 +1411,7 @@ def cmd_upload(args):
     target_fail_counts = {target: 0 for target in all_processed_targets}
     target_canceled_counts = {target: 0 for target in all_processed_targets}
     pixiv_lease = None
-    pixiv_rate = None
+    pixiv_next_post_at = 0.0
     pixiv_batch_fatal = False
     pixiv_batch_error_code = ""
     batch_stop_reason = ""
@@ -1424,7 +1422,6 @@ def cmd_upload(args):
                 cancel_event=getattr(args, "cancel_event", None),
                 interaction_callback=interaction_callback,
             )
-            pixiv_rate = PixivRateController()
             if interaction_callback is not None:
                 interaction_callback(None)
         if not args.dry_run and targets:
@@ -1590,18 +1587,13 @@ def cmd_upload(args):
                     and pixiv_ready
                     and not cancel_requested
                 ):
+                    normal_interval_remaining = pixiv_next_post_at - time.monotonic()
+                    if normal_interval_remaining > 0:
+                        try:
+                            _sleep_with_cancel(normal_interval_remaining, _cancel_ev)
+                        except InterruptedError:
+                            cancel_requested = True
                     report_image("opening_pixiv", stage_progress=0.0)
-                    try:
-                        if pixiv_rate is not None:
-                            pixiv_rate.wait(
-                                cancel_event=_cancel_ev,
-                                activity_callback=lambda activity: report_image(
-                                    "opening_pixiv",
-                                    activity=activity or {},
-                                ),
-                            )
-                    except InterruptedError:
-                        cancel_requested = True
                     if pixiv_page is None and not cancel_requested:
                         log.info("    Pixiv 准备完成: 正在打开浏览器并填写投稿表单")
                         try:
@@ -1729,8 +1721,6 @@ def cmd_upload(args):
                                         error_code=exc.code,
                                         batch_fatal=True,
                                         maybe_posted=True,
-                                        risk_signal=pixiv_result.risk_signal,
-                                        retry_after=pixiv_result.retry_after,
                                     )
                                     pixiv_url = None
                         except InterruptedError as exc:
@@ -1770,68 +1760,11 @@ def cmd_upload(args):
                                 error_code=error_code,
                                 batch_fatal=bool(getattr(exc, "batch_fatal", True)),
                                 maybe_posted=bool(getattr(exc, "maybe_posted", False) or submitted_before_error),
-                                risk_signal=(
-                                    "http_429"
-                                    if error_code in {"pixiv_rate_limited", "pixiv_rate_limited_after_submit"}
-                                    else "captcha" if "captcha" in error_code else ""
-                                ),
-                                retry_after=float(getattr(exc, "retry_after", 0.0) or 0.0),
                             )
 
-                        if pixiv_result.risk_signal and pixiv_rate is not None:
-                            try:
-                                risk_snapshot = pixiv_rate.record_risk(
-                                    pixiv_result.risk_signal,
-                                    work_key=str(orig_path.resolve()),
-                                    retry_after=pixiv_result.retry_after,
-                                )
-                            except OSError as exc:
-                                confirmed_pixiv_url = pixiv_url
-                                pixiv_result = PixivPostResult(
-                                    confirmed_pixiv_url,
-                                    pixiv_steps,
-                                    error_code="pixiv_risk_state_unavailable",
-                                    batch_fatal=True,
-                                    maybe_posted=bool(pixiv_result.maybe_posted and not confirmed_pixiv_url),
-                                    risk_signal=pixiv_result.risk_signal,
-                                    retry_after=pixiv_result.retry_after,
-                                )
-                                pixiv_url = confirmed_pixiv_url
-                                pixiv_batch_fatal = True
-                                pixiv_batch_error_code = "pixiv_risk_state_unavailable"
-                                log.error(
-                                    "    无法持久化 Pixiv 风险冷却 [pixiv_risk_state_unavailable]："
-                                    f"{type(exc).__name__}: {exc}"
-                                )
-                            else:
-                                manifest["pixiv"]["risk"] = {
-                                    "signal": pixiv_result.risk_signal,
-                                    **risk_snapshot,
-                                }
-
                         if pixiv_url:
-                            if pixiv_rate is not None:
-                                try:
-                                    pixiv_rate.record_success(risk_signal=bool(pixiv_result.risk_signal))
-                                    pixiv_rate.schedule_baseline(args.delay)
-                                except OSError as exc:
-                                    log.error(
-                                        "    Pixiv 投稿已确认成功，但无法持久化后续冷却 "
-                                        "[pixiv_risk_state_unavailable]："
-                                        f"{type(exc).__name__}: {exc}"
-                                    )
-                                    pixiv_result = PixivPostResult(
-                                        pixiv_url,
-                                        pixiv_steps,
-                                        error_code="pixiv_risk_state_unavailable",
-                                        batch_fatal=True,
-                                        risk_signal=pixiv_result.risk_signal,
-                                        retry_after=pixiv_result.retry_after,
-                                    )
-                                    pixiv_batch_fatal = True
-                                    pixiv_batch_error_code = "pixiv_risk_state_unavailable"
-                            if pixiv_url:
-                                break
+                            pixiv_next_post_at = time.monotonic() + max(0.0, float(args.delay))
+                            break
 
                         retry_decision = _pixiv_retry_decision(
                             pixiv_result,
@@ -1845,33 +1778,11 @@ def cmd_upload(args):
                             log.warning("    Pixiv 投稿已经点击，结果未确认；禁止自动重试并终止剩余 Pixiv 队列")
                             break
 
-                        if retry_decision == "retry_after_cooldown":
-                            log.warning(
-                                "    Pixiv 点击前返回 429；完成风险冷却后进行安全重试 "
-                                f"({attempt + 2}/{max_retries + 1})"
-                            )
-                            try:
-                                if pixiv_rate is not None:
-                                    pixiv_rate.wait(
-                                        cancel_event=_cancel_ev,
-                                        activity_callback=lambda activity: report_image(
-                                            "opening_pixiv",
-                                            activity=activity or {},
-                                        ),
-                                    )
-                            except InterruptedError:
-                                cancel_requested = True
-                                break
-                            continue
-
                         if retry_decision == "stop_batch":
                             pixiv_batch_fatal = True
-                            pixiv_batch_error_code = (
-                                pixiv_result.error_code
-                                or ("pixiv_captcha_detected" if pixiv_result.risk_signal == "captcha" else "pixiv_batch_stopped")
-                            )
+                            pixiv_batch_error_code = pixiv_result.error_code or "pixiv_batch_stopped"
                             log.error(
-                                f"    Pixiv 风险性失败 [{pixiv_batch_error_code}]，终止剩余 Pixiv 队列"
+                                f"    Pixiv 发布失败 [{pixiv_batch_error_code}]，终止剩余 Pixiv 队列"
                             )
                             break
 
@@ -1901,12 +1812,6 @@ def cmd_upload(args):
                             pixiv_batch_fatal = True
                             pixiv_batch_error_code = pixiv_result.error_code or "pixiv_batch_stopped"
                         break
-
-                    if pixiv_url and pixiv_result.risk_signal in {"captcha", "http_429"}:
-                        log.warning(
-                            "    Pixiv 本图已确认成功并记录风险信号；"
-                            "下一张投稿会先完整执行自适应冷却"
-                        )
 
                     manifest["pixiv"]["upload_steps"] = [step.to_dict() for step in pixiv_steps]
                     manifest["pixiv"]["error_code"] = pixiv_result.error_code
