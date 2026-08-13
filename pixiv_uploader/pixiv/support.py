@@ -186,6 +186,20 @@ class PixivPostResult:
         yield self.steps
 
 
+@dataclass(frozen=True)
+class PixivSubmitPlan:
+    mode: str
+    captcha_provider: str = ""
+    deadline: float | None = None
+
+
+PIXIV_SUBMISSION_OWNERSHIP_STEPS = frozenset({"publish_click", "manual_submit_wait"})
+
+
+def pixiv_submission_may_have_started(steps: list[PixivStep]) -> bool:
+    return any(step.ok and step.name in PIXIV_SUBMISSION_OWNERSHIP_STEPS for step in steps)
+
+
 PIXIV_SELECTORS: dict[str, Any] = {
     "file_input": ['input[type="file"]'],
     "title": [
@@ -3622,18 +3636,16 @@ def _publish_enabled(locator) -> bool:
         return False
 
 
-def _wait_for_pre_submit_ready(
+def _wait_for_pre_submit_plan(
     page,
     publish_locator,
     *,
     cancel_event=None,
     interaction_callback=None,
     http_monitor: PixivHttp429Monitor | None = None,
-) -> tuple[bool, str]:
+) -> PixivSubmitPlan:
     normal_deadline = time.monotonic() + 120
-    captcha_deadline: float | None = None
-    captcha_provider = ""
-    notified = False
+    interaction_handed_off = False
     try:
         while True:
             _raise_if_canceled(cancel_event)
@@ -3641,41 +3653,28 @@ def _wait_for_pre_submit_ready(
             if rate_event:
                 raise PixivRateLimitedError(submitted=False)
             captcha = _detect_pixiv_captcha(page)
-            enabled = _publish_enabled(publish_locator)
-            unresolved_challenge = bool(captcha["active"] or (captcha["present"] and not captcha["token_present"]))
-            if unresolved_challenge:
-                if captcha_deadline is None:
-                    captcha_deadline = time.monotonic() + PIXIV_CAPTCHA_TIMEOUT_SECONDS
-                    captcha_provider = captcha["provider"] or "captcha"
-                    log.warning("    pixiv: 投稿点击前出现 %s，等待用户在 Pixiv 页面完成验证", captcha_provider)
-                if not notified:
-                    _notify_user_once(page)
-                    notified = True
-                if time.monotonic() >= captcha_deadline:
-                    exc = PixivFlowError(
-                        "pixiv_captcha_timeout_before_submit",
-                        "Pixiv 人机验证等待超过 10 分钟",
-                    )
-                    exc.batch_fatal = True
-                    raise exc
+            if captcha["present"] or captcha["active"]:
+                deadline = time.monotonic() + PIXIV_CAPTCHA_TIMEOUT_SECONDS
+                provider = captcha["provider"] or "captcha"
+                log.warning(
+                    "    pixiv: 投稿点击前出现 %s；自动点击已停用，请完成验证并手动点一次投稿",
+                    provider,
+                )
+                _notify_user_once(page)
                 _emit_interaction(
                     interaction_callback,
-                    _interaction_activity("pixiv_captcha_before_submit", deadline=captcha_deadline, phase="before_submit"),
+                    _interaction_activity("pixiv_captcha_before_submit", deadline=deadline, phase="before_submit"),
                 )
-            elif enabled:
-                return captcha_deadline is not None, captcha_provider
-            elif captcha_deadline is not None and time.monotonic() >= captcha_deadline:
-                exc = PixivFlowError(
-                    "pixiv_captcha_timeout_before_submit",
-                    "Pixiv 人机验证等待超过 10 分钟",
-                )
-                exc.batch_fatal = True
-                raise exc
-            elif captcha_deadline is None and time.monotonic() >= normal_deadline:
+                interaction_handed_off = True
+                return PixivSubmitPlan("manual", provider, deadline)
+            if _publish_enabled(publish_locator):
+                return PixivSubmitPlan("automatic")
+            if time.monotonic() >= normal_deadline:
                 raise PixivFlowError("pixiv_publish_button_timeout", "Pixiv 投稿按钮 120 秒内未启用")
             _sleep_with_cancel(1.0, cancel_event)
     finally:
-        _emit_interaction(interaction_callback, None)
+        if not interaction_handed_off:
+            _emit_interaction(interaction_callback, None)
 
 
 def _set_checkbox_by_attr(
@@ -3872,7 +3871,7 @@ def _create_pixiv_post(
             report("submitting_pixiv", 0.1)
         elif step.name == "publish_enable":
             report("submitting_pixiv", 0.55)
-        elif step.name == "publish_click":
+        elif step.name in {"publish_click", "manual_submit_wait"}:
             report("submitting_pixiv", 1.0 if step.ok else 0.8)
             if step.ok:
                 report("verifying_pixiv", 0.0)
@@ -4046,7 +4045,7 @@ def _create_pixiv_post(
     record(PixivStep("locate_publish", True))
 
     try:
-        pre_submit_captcha, captcha_provider = _wait_for_pre_submit_ready(
+        submit_plan = _wait_for_pre_submit_plan(
             page,
             publish_locator,
             cancel_event=cancel_event,
@@ -4073,34 +4072,39 @@ def _create_pixiv_post(
             batch_fatal=exc.batch_fatal,
             maybe_posted=exc.maybe_posted,
         )
-    record(PixivStep(
-        "publish_enable",
-        True,
-        detail=(f"enabled after {captcha_provider}" if pre_submit_captcha else "enabled"),
-    ))
 
-    try:
-        # 提交前“通读检查”停顿：表单填完后不立刻点击
-        session.before_submit()
-        _human_move_and_click(page, publish_locator, cancel_event=cancel_event, human=session)
-    except InterruptedError:
-        raise
-    except Exception as exc:
+    manual_submit = submit_plan.mode == "manual"
+    if manual_submit:
+        record(PixivStep(
+            "manual_submit_wait",
+            True,
+            detail=f"automatic click disabled after {submit_plan.captcha_provider}; waiting for user submission",
+        ))
+    else:
+        record(PixivStep("publish_enable", True, detail="enabled"))
         try:
-            _raise_if_browser_closed_exception(exc)
-        except PixivBrowserClosedError as closed_exc:
-            closed_exc.pixiv_steps = steps
+            # 提交前“通读检查”停顿：表单填完后不立刻点击
+            session.before_submit()
+            _human_move_and_click(page, publish_locator, cancel_event=cancel_event, human=session)
+        except InterruptedError:
             raise
-        record(PixivStep("publish_click", False, "exception", f"{type(exc).__name__}: {exc}"))
-        return None, steps
-    record(PixivStep("publish_click", True))
+        except Exception as exc:
+            try:
+                _raise_if_browser_closed_exception(exc)
+            except PixivBrowserClosedError as closed_exc:
+                closed_exc.pixiv_steps = steps
+                raise
+            record(PixivStep("publish_click", False, "exception", f"{type(exc).__name__}: {exc}"))
+            return None, steps
+        record(PixivStep("publish_click", True))
 
-    # The click above is the only automatic submit attempt. From this point on,
-    # success is observed but the button is never clicked again.
+    # Once CAPTCHA hands submission control to the user, this observer never
+    # reclaims it. Otherwise the automatic click above remains the only click.
     artwork_re = re.compile(r"/artworks/\d+")
-    captcha_detected = False
-    captcha_deadline: float | None = None
-    captcha_notified = False
+    captcha_detected = manual_submit
+    captcha_phase = "before_submit" if manual_submit else ""
+    captcha_deadline = submit_plan.deadline if manual_submit else None
+    captcha_notified = manual_submit
     normal_deadline = time.monotonic() + 60
     last_submit_destination = ""
     rate_event: dict[str, Any] | None = None
@@ -4149,9 +4153,13 @@ def _create_pixiv_post(
             # Detect it on every Pixiv-owned page; explicit artwork URLs have
             # already returned above, so this cannot turn a confirmed success
             # back into an interaction wait.
-            captcha = _detect_pixiv_captcha(page) if _is_pixiv_url(url) else {"active": False, "provider": ""}
-            challenge_active = bool(captcha["active"])
-            if not captcha_detected and not challenge_active:
+            captcha = (
+                _detect_pixiv_captcha(page)
+                if _is_pixiv_url(url)
+                else {"present": False, "active": False, "provider": ""}
+            )
+            challenge_present = bool(captcha["present"] or captcha["active"])
+            if not captcha_detected and not challenge_present:
                 # 先读取验证状态，再决定是否漂移；验证码出现的首个检测周期
                 # 也不会移动鼠标，避免抢占正在人工操作的指针。
                 try:
@@ -4160,9 +4168,10 @@ def _create_pixiv_post(
                     raise
                 except Exception as drift_exc:
                     _raise_if_browser_closed_exception(drift_exc)
-            if challenge_active:
+            if challenge_present:
                 if not captcha_detected:
                     captcha_detected = True
+                    captcha_phase = "after_submit"
                     captcha_deadline = time.monotonic() + PIXIV_CAPTCHA_TIMEOUT_SECONDS
                     log.warning(
                         "    pixiv: 投稿点击后出现 %s；等待用户完成验证，必要时请在 Pixiv 页面手动点一次投稿",
@@ -4172,30 +4181,32 @@ def _create_pixiv_post(
                     _notify_user_once(page)
                     captcha_notified = True
             if captcha_detected and captcha_deadline is not None:
-                # Once a post-click challenge has appeared, keep the task in
-                # waiting_input until publication is explicitly confirmed. The
-                # widget disappearing alone does not prove that Pixiv accepted
-                # the first click, and the user may still need to submit once in
-                # the Pixiv page.
+                # CAPTCHA 消失并不代表 Pixiv 已接收投稿；只接受明确成功回执。
+                interaction_type = (
+                    "pixiv_captcha_before_submit"
+                    if captcha_phase == "before_submit"
+                    else "pixiv_captcha_after_submit"
+                )
                 _emit_interaction(
                     interaction_callback,
                     _interaction_activity(
-                        "pixiv_captcha_after_submit",
+                        interaction_type,
                         deadline=captcha_deadline,
-                        phase="after_submit",
+                        phase=captcha_phase,
                     ),
                 )
                 if time.monotonic() >= captcha_deadline:
-                    record(PixivStep(
-                        "redirect",
-                        False,
-                        "pixiv_captcha_timeout_after_submit",
-                        "点击投稿后的人机验证等待超过 10 分钟；结果可能已发布",
-                    ))
+                    if captcha_phase == "before_submit":
+                        code = "pixiv_captcha_timeout_before_submit"
+                        detail = "人机验证出现后等待手动投稿超过 10 分钟；结果可能已发布"
+                    else:
+                        code = "pixiv_captcha_timeout_after_submit"
+                        detail = "点击投稿后的人机验证等待超过 10 分钟；结果可能已发布"
+                    record(PixivStep("redirect", False, code, detail))
                     return PixivPostResult(
                         None,
                         steps,
-                        error_code="pixiv_captcha_timeout_after_submit",
+                        error_code=code,
                         batch_fatal=True,
                         maybe_posted=True,
                     )
@@ -4261,14 +4272,14 @@ def create_pixiv_post(
                 returned_steps,
                 error_code=(last_failure.reason if last_failure else ""),
                 batch_fatal=False,
-                maybe_posted=any(step.name == "publish_click" and step.ok for step in returned_steps) and not url,
+                maybe_posted=pixiv_submission_may_have_started(returned_steps) and not url,
             )
         return result
     except InterruptedError as exc:
         exc.pixiv_steps = steps
         raise
     except PixivFlowError as exc:
-        submitted = any(step.name == "publish_click" and step.ok for step in steps)
+        submitted = pixiv_submission_may_have_started(steps)
         if isinstance(exc, PixivBrowserClosedError):
             try:
                 PIXIV_SESSION.update_verified(
@@ -4299,7 +4310,7 @@ def create_pixiv_post(
     except Exception as exc:
         if not _is_browser_closed_exception(exc):
             raise
-        submitted = any(step.name == "publish_click" and step.ok for step in steps)
+        submitted = pixiv_submission_may_have_started(steps)
         try:
             PIXIV_SESSION.update_verified(
                 "error",

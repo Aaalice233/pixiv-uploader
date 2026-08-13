@@ -364,27 +364,28 @@ class PixivFormControlTests(unittest.TestCase):
 
 
 class PixivCaptchaStateMachineTests(unittest.TestCase):
-    def test_pre_submit_captcha_waits_then_allows_one_submit(self) -> None:
+    def test_pre_submit_captcha_immediately_hands_submit_to_user(self) -> None:
         page = Mock()
         publish = Mock()
-        publish.is_enabled.side_effect = [False, True]
         activities: list[dict | None] = []
         captcha_active = {"present": True, "active": True, "provider": "recaptcha", "token_present": False}
-        captcha_done = {"present": False, "active": False, "provider": "", "token_present": True}
 
-        with patch.object(support, "_detect_pixiv_captcha", side_effect=[captcha_active, captcha_done]), patch.object(
+        with patch.object(support, "_detect_pixiv_captcha", return_value=captcha_active), patch.object(
             support, "_sleep_with_cancel"
         ), patch.object(support, "_notify_user_once") as notify:
-            result = support._wait_for_pre_submit_ready(
+            result = support._wait_for_pre_submit_plan(
                 page,
                 publish,
                 interaction_callback=activities.append,
             )
 
-        self.assertEqual(result, (True, "recaptcha"))
+        self.assertEqual(result.mode, "manual")
+        self.assertEqual(result.captcha_provider, "recaptcha")
+        self.assertIsNotNone(result.deadline)
+        publish.is_enabled.assert_not_called()
         notify.assert_called_once_with(page)
-        self.assertEqual(activities[-1], None)
-        self.assertTrue(any(activity and activity["interaction_type"] == "pixiv_captcha_before_submit" for activity in activities))
+        self.assertEqual(activities[-1]["interaction_type"], "pixiv_captcha_before_submit")
+        self.assertNotIn(None, activities)
 
     def _run_post(
         self,
@@ -433,8 +434,12 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
             support, "_set_checkbox_by_attr", side_effect=successful_step
         ), patch.object(support, "_accept_safety_check", return_value=support.PixivStep("safety_check", True)), patch.object(
             support,
-            "_wait_for_pre_submit_ready",
-            return_value=(pre_submit_captcha, "recaptcha" if pre_submit_captcha else ""),
+            "_wait_for_pre_submit_plan",
+            return_value=support.PixivSubmitPlan(
+                "manual" if pre_submit_captcha else "automatic",
+                "recaptcha" if pre_submit_captcha else "",
+                float("inf") if pre_submit_captcha else None,
+            ),
         ), patch.object(support, "_human_move_and_click") as click, patch.object(
             support, "_sleep_with_cancel"
         ), patch.object(support.time, "sleep"), patch(
@@ -464,11 +469,12 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
             )
         return result, click, activities, human
 
-    def test_captcha_before_submit_still_clicks_exactly_once(self) -> None:
+    def test_captcha_before_submit_never_automatically_clicks(self) -> None:
         result, click, _activities, _human = self._run_post(pre_submit_captcha=True, post_submit_captcha=False)
 
-        click.assert_called_once()
+        click.assert_not_called()
         self.assertEqual(result.url, "https://www.pixiv.net/artworks/123")
+        self.assertTrue(support.pixiv_submission_may_have_started(result.steps))
 
     def test_captcha_after_submit_never_triggers_a_second_automatic_click(self) -> None:
         result, click, activities, human = self._run_post(pre_submit_captcha=False, post_submit_captcha=True)
@@ -496,7 +502,7 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
         cancel_event = threading.Event()
         cancel_event.set()
         with self.assertRaises(InterruptedError):
-            support._wait_for_pre_submit_ready(
+            support._wait_for_pre_submit_plan(
                 Mock(),
                 Mock(),
                 cancel_event=cancel_event,
@@ -682,6 +688,7 @@ class PixivRetrySafetyTests(unittest.TestCase):
 
         before = support.PixivPostResult(None, [], error_code="pixiv_rate_limited", batch_fatal=True)
         clicked = [support.PixivStep("publish_click", True)]
+        manual = [support.PixivStep("manual_submit_wait", True)]
         after = support.PixivPostResult(None, clicked, error_code="pixiv_rate_limited_after_submit", maybe_posted=True)
 
         self.assertEqual(
@@ -694,6 +701,10 @@ class PixivRetrySafetyTests(unittest.TestCase):
         )
         self.assertEqual(
             publishing._pixiv_retry_decision(after, clicked, attempt=0, max_retries=5),
+            "stop_uncertain",
+        )
+        self.assertEqual(
+            publishing._pixiv_retry_decision(before, manual, attempt=0, max_retries=5),
             "stop_uncertain",
         )
 

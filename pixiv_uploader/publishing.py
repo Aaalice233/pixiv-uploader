@@ -145,6 +145,7 @@ from .pixiv.support import (
     open_pixiv_browser,
     PIXIV_RULE_FIT_PROFILE_DIR,
     pixiv_browse_transition,
+    pixiv_submission_may_have_started,
     summarize_rule_fit_report,
     sanitize_image_for_pixiv,
     warm_up_pixiv_session,
@@ -1113,10 +1114,7 @@ def _pixiv_retry_decision(
     attempt: int,
     max_retries: int,
 ) -> str:
-    submitted = result.maybe_posted or any(
-        getattr(step, "name", "") == "publish_click" and getattr(step, "ok", False)
-        for step in steps
-    )
+    submitted = result.maybe_posted or pixiv_submission_may_have_started(steps)
     if submitted:
         return "stop_uncertain"
     if result.error_code == "pixiv_rate_limited" or "captcha" in result.error_code:
@@ -1858,10 +1856,7 @@ def cmd_upload(args):
                             cancel_requested = True
                             pixiv_url = None
                             pixiv_steps = list(getattr(exc, "pixiv_steps", pixiv_steps))
-                            submitted_before_cancel = any(
-                                getattr(step, "name", "") == "publish_click" and getattr(step, "ok", False)
-                                for step in pixiv_steps
-                            )
+                            submitted_before_cancel = pixiv_submission_may_have_started(pixiv_steps)
                             pixiv_result = PixivPostResult(
                                 None,
                                 pixiv_steps,
@@ -1881,10 +1876,7 @@ def cmd_upload(args):
                             pixiv_url = None
                             error_steps = getattr(exc, "pixiv_steps", None)
                             pixiv_steps = list(error_steps) if error_steps is not None else list(pixiv_steps)
-                            submitted_before_error = any(
-                                getattr(step, "name", "") == "publish_click" and getattr(step, "ok", False)
-                                for step in pixiv_steps
-                            )
+                            submitted_before_error = pixiv_submission_may_have_started(pixiv_steps)
                             pixiv_result = PixivPostResult(
                                 None,
                                 pixiv_steps,
@@ -1912,7 +1904,7 @@ def cmd_upload(args):
                         if retry_decision == "stop_uncertain":
                             pixiv_batch_fatal = True
                             pixiv_batch_error_code = pixiv_result.error_code or "pixiv_submit_unconfirmed"
-                            log.warning("    Pixiv 投稿已经点击，结果未确认；禁止自动重试并终止剩余 Pixiv 队列")
+                            log.warning("    Pixiv 投稿操作可能已发生，结果未确认；禁止自动重试并终止剩余 Pixiv 队列")
                             break
 
                         if retry_decision == "stop_batch":
@@ -1954,7 +1946,7 @@ def cmd_upload(args):
                     manifest["pixiv"]["error_code"] = pixiv_result.error_code
                     if pixiv_result.maybe_posted:
                         log.warning(
-                            "    Pixiv 已点击投稿但结果未确认，记为 maybe_posted；"
+                            "    Pixiv 投稿操作可能已发生但结果未确认，记为 maybe_posted；"
                             "原图继续保留在 upload/，后续批次不会自动重投"
                         )
                         manifest["pixiv"]["post_url"] = ""

@@ -93,9 +93,9 @@ Do not close browser windows opened by the application while login or publishing
 - **First sign-in** — click Pixiv sign-in under **Settings → General → Publishing accounts**, then complete the flow only on Pixiv. The app verifies the real submission page and file input; once verified, the browser closes automatically. No terminal Enter key or Web “Continue” button is required. A Profile that exists but has never passed this check is shown as “Verification pending,” not signed in.
 - **Long-lived session** — sign-in and publishing both use system Chrome with one stable persistent Profile. Each Pixiv batch launches one browser Context and reuses it across images. Keep the device, Profile, and network egress stable, and do not open that Profile in an external Chrome instance at the same time.
 - **Expired session** — the task moves to “Action needed” and opens Pixiv sign-in. After you sign in on Pixiv, the app verifies the submission page again and automatically resumes the current image. The wait limit is 15 minutes and remains cancelable from the Publishing workspace.
-- **CAPTCHA** — for a challenge before submission, the app performs exactly one automatic submit after you solve it. If the challenge appears after Submit was already clicked, complete it on Pixiv and click Submit once only when Pixiv explicitly asks. The app never submits a second time automatically. The CAPTCHA limit is 10 minutes, and the whole Pixiv queue pauses while waiting.
+- **CAPTCHA** — whenever a challenge appears during submission, control of Submit is handed entirely to you: complete the challenge and click Submit once on Pixiv. From that point on, the app only waits for explicit success and never clicks Submit again, avoiding races with manual input and duplicate artworks. The CAPTCHA limit is 10 minutes, and the whole Pixiv queue pauses while waiting.
 - **Rate limits** — when Pixiv returns HTTP 429, the current Pixiv batch stops immediately without starting a risk level, adding an extra risk wait, or retrying automatically. Unconfirmed images remain in place to avoid duplicate submissions. The regular user-configured post interval still applies.
-- **Safe archival and termination** — an image counts as complete only after every selected target is confirmed and the source has moved into `done/`; confirmed uploads do not remain in `upload/`, and an archival failure is reported explicitly. Closing the browser, timing out, or canceling stops the Pixiv batch and keeps unconfirmed images. If Submit was clicked but success cannot be confirmed, the manifest records `maybe_posted` and automatic retry is forbidden until you check the Pixiv artworks page.
+- **Safe archival and termination** — an image counts as complete only after every selected target is confirmed and the source has moved into `done/`; confirmed uploads do not remain in `upload/`, and an archival failure is reported explicitly. Closing the browser, timing out, or canceling stops the Pixiv batch and keeps unconfirmed images. If either the app or the user may have clicked Submit but success cannot be confirmed, the manifest records `maybe_posted` and automatic retry is forbidden until you check the Pixiv artworks page.
 
 The account card reports “Not set up / Verification pending / Verifying / Signed in / Sign-in required / In use / Verification failed” and the last verification time. The Publishing workspace shows sign-in and CAPTCHA waits with their remaining time in real time.
 
@@ -147,7 +147,7 @@ upload/  →  preparation and platform processing  →  done/
 
 - The source moves to `done/` after all selected targets succeed
 - If one platform fails, the image remains available for retry and completed targets are skipped
-- If Pixiv accepted a Submit click but the outcome is uncertain, the image stays in place with `maybe_posted` and is never resubmitted automatically
+- If a Pixiv submission may have started but the outcome is uncertain, the image stays in place with `maybe_posted` and is never resubmitted automatically
 - The manifest records preparation results, publishing status, and actionable error codes for each platform
 
 ## 🏷️ Taggers
