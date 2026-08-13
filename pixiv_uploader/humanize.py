@@ -61,7 +61,8 @@ def sleep_with_cancel(seconds: float, cancel_event, poll: float = 0.2) -> None:
         time.sleep(min(poll, remaining))
 
 
-# QWERTY 相邻键，仅用于 ASCII 字母的错别字模拟；CJK 走 IME，无对应错误模式。
+# QWERTY 相邻键仅用于 ASCII 字母的错别字模拟；CJK 字符直接发送 Unicode
+# 文本输入，不伪造并不真实存在的 IME composition 过程。
 _QWERTY_NEIGHBORS: dict[str, str] = {
     "q": "wa", "w": "qeas", "e": "wrds", "r": "etdf", "t": "ryfg",
     "y": "tugh", "u": "yihj", "i": "uojk", "o": "ipkl", "p": "ol",
@@ -73,6 +74,55 @@ _QWERTY_NEIGHBORS: dict[str, str] = {
 
 # 输入这些字符后真人通常会停顿一下（换气/看结果）。
 _PUNCT_PAUSE_CHARS = set(" \t\n.,，。、!！?？:：;；)）]】」』")
+
+
+def _typing_script(char: str) -> str:
+    """按可见字符所属文字系统选择节奏，不尝试猜测输入法。"""
+    if char in _PUNCT_PAUSE_CHARS:
+        return "punctuation"
+    codepoint = ord(char)
+    if (
+        0x3040 <= codepoint <= 0x30FF
+        or 0x31F0 <= codepoint <= 0x31FF
+        or 0xFF66 <= codepoint <= 0xFF9D
+    ):
+        return "kana"
+    if (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+    ):
+        return "han"
+    if char.isascii():
+        return "ascii"
+    return "unicode"
+
+
+_INTERACTIVE_CHALLENGE_SELECTORS = (
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="hcaptcha"]',
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[title*="captcha" i]',
+    'iframe[title*="challenge" i]',
+    '.g-recaptcha',
+    '.h-captcha',
+    '.cf-turnstile',
+    '[data-sitekey]',
+)
+
+
+def has_visible_interactive_challenge(page) -> bool:
+    """等待期间检测可见验证控件，避免自动鼠标漂移干扰用户。"""
+    try:
+        for selector in _INTERACTIVE_CHALLENGE_SELECTORS:
+            matches = page.locator(selector)
+            for index in range(min(matches.count(), 4)):
+                if matches.nth(index).is_visible(timeout=250):
+                    return True
+    except Exception as exc:
+        if is_browser_closed_exception(exc):
+            raise
+    return False
 
 
 class HumanMouse:
@@ -160,7 +210,7 @@ class HumanMouse:
         self._remember_position(page, x, y)
 
     def click_locator(self, page, locator, *, cancel_event=None) -> None:
-        """拟人移动到元素中心附近并点击；取不到位置时回退 locator.click()。"""
+        """拟人移动后由 Locator 完成可操作性校验与点击。"""
         _raise_if_canceled(cancel_event)
         try:
             box = locator.bounding_box(timeout=3000)
@@ -169,14 +219,19 @@ class HumanMouse:
                 raise
             box = None
         if not box:
-            locator.click()
+            locator.click(timeout=3000)
             return
-        target_x = box["x"] + box["width"] / 2 + self._rng.uniform(-3, 3)
-        target_y = box["y"] + box["height"] / 2 + self._rng.uniform(-3, 3)
+        spread_x = min(3.0, max(0.0, box["width"] / 2 - 0.5))
+        spread_y = min(3.0, max(0.0, box["height"] / 2 - 0.5))
+        offset_x = box["width"] / 2 + self._rng.uniform(-spread_x, spread_x)
+        offset_y = box["height"] / 2 + self._rng.uniform(-spread_y, spread_y)
+        target_x = box["x"] + offset_x
+        target_y = box["y"] + offset_y
         self.move_to(page, target_x, target_y, cancel_event=cancel_event)
-        # 点击前 dwell 50~200ms（真人瞄准后的停顿）
+        # 坐标点击无法确认遮挡或命中错误；Locator 点击会在同一点执行完整
+        # actionability 检查，让调用方能在真实点击失败时启用可靠兜底。
         sleep_with_cancel(self._rng.uniform(0.05, 0.2), cancel_event)
-        page.mouse.click(target_x, target_y)
+        locator.click(position={"x": offset_x, "y": offset_y}, timeout=3000)
 
     def idle_drift(self, page, *, cancel_event=None, probability: float = 0.3) -> None:
         """长等待期间低概率小幅漂移鼠标，避免鼠标完全冻结。
@@ -186,6 +241,8 @@ class HumanMouse:
         if self._rng.random() >= probability:
             return
         try:
+            if has_visible_interactive_challenge(page):
+                return
             x, y = self._current_position(page)
             self.move_to(
                 page,
@@ -262,11 +319,13 @@ class HumanSession:
         self._action_count += 1
 
     def between_posts_delay(self, base: float) -> float:
-        """相邻成功投稿的间隔秒数（只计算不睡眠，由调用方调度）。
+        """计算相邻成功投稿的间隔；用户值始终作为最低等待时间。
 
-        base × uniform(0.8, 1.6)；约 8% 概率叠加 2~6 分钟长休息。
+        在 base 之上最多增加 60% 的自然抖动；约 8% 概率再叠加 2~6 分钟
+        长休息。只计算不睡眠，由调用方统一调度和上报倒计时。
         """
-        delay = max(0.0, float(base)) * self.rng.uniform(0.8, 1.6)
+        minimum = max(0.0, float(base))
+        delay = minimum + self.rng.uniform(0.0, minimum * 0.6)
         if self.rng.random() < 0.08:
             extra = self.rng.uniform(120.0, 360.0)
             log.info("    拟人节奏: 本次投稿后长休息 %.0f 秒", extra)
@@ -277,12 +336,18 @@ class HumanSession:
     # ── 打字 ───────────────────────────────────────────────────────
 
     def _char_delay(self, typed_char: str) -> float:
-        """打完一个字符后的停顿（秒）：词内爆发 / 标点后拉长 / 偶发思考停顿。"""
+        """按 ASCII、假名、汉字与标点分别生成字符间隔。"""
         scale = self.typing_base_ms / 75.0
-        if typed_char in _PUNCT_PAUSE_CHARS:
-            delay = self.rng.uniform(0.12, 0.35) * scale
-        else:
-            delay = self.rng.uniform(0.03, 0.09) * scale
+        script = _typing_script(typed_char)
+        bounds = {
+            "ascii": (0.03, 0.09),
+            "kana": (0.05, 0.14),
+            "han": (0.08, 0.20),
+            "unicode": (0.05, 0.14),
+            "punctuation": (0.12, 0.35),
+        }
+        minimum, maximum = bounds[script]
+        delay = self.rng.uniform(minimum, maximum) * scale
         if self._chars_since_think >= self._next_think_at and self.rng.random() < 0.35:
             delay += self.rng.uniform(0.5, 1.5) * self.pause_tendency
             self._chars_since_think = 0
@@ -290,7 +355,7 @@ class HumanSession:
         return delay
 
     def _should_typo(self, char: str) -> bool:
-        # 仅 ASCII 字母模拟错别字；CJK 经 IME 输入，没有对应的打错模式
+        # 仅 ASCII 字母模拟相邻键错误；CJK 直接输入，不虚构 IME 候选行为。
         return char.isascii() and char.isalpha() and self.rng.random() < self.typo_rate
 
     def _type_typo_sequence(self, keyboard, char: str) -> None:
@@ -304,19 +369,23 @@ class HumanSession:
         self._sleep(self.rng.uniform(0.08, 0.22))
 
     def _type_char(self, keyboard, char: str) -> None:
-        # textarea 的换行必须走 Enter 键，keyboard.type("\n") 不会产出换行
+        # textarea 的换行必须走 Enter；非 ASCII 字符用 insert_text 保证中日文
+        # 原样进入受控输入框，不伪造本机并未发生的 IME composition。
         if char == "\n":
             keyboard.press("Enter")
-        else:
+        elif char.isascii():
             keyboard.type(char)
+        else:
+            keyboard.insert_text(char)
 
-    def _type_once(self, locator, text: str, *, allow_typos: bool) -> None:
+    def _type_once(self, locator, text: str, *, allow_typos: bool, clear: bool) -> None:
         keyboard = self.page.keyboard
-        try:
-            locator.fill("")
-        except Exception as exc:
-            if is_browser_closed_exception(exc):
-                raise
+        if clear:
+            try:
+                locator.fill("")
+            except Exception as exc:
+                if is_browser_closed_exception(exc):
+                    raise
         self._chars_since_think = 0
         self._next_think_at = self.rng.randint(8, 20)
         for char in text:
@@ -343,10 +412,31 @@ class HumanSession:
         *,
         allow_typos: bool = True,
         verify: bool = True,
+        clear: bool = True,
     ) -> None:
-        """逐字符拟人输入；校验不符自动清空重打一次，仍不符抛 HumanTypingError。"""
+        """逐字符输入并校验；替换型字段可清空重试，增量字段绝不自动清空。"""
+        if not clear:
+            try:
+                initial = locator.input_value()
+            except Exception as exc:
+                if is_browser_closed_exception(exc):
+                    raise
+                initial = ""
+            expected = f"{initial}{text}"
+            self._type_once(locator, text, allow_typos=allow_typos, clear=False)
+            if not verify or self._verify_typed(locator, expected):
+                return
+            raise HumanTypingError(
+                f"appended value mismatch (expected {len(expected)} chars); input was preserved"
+            )
+
         for attempt in (1, 2):
-            self._type_once(locator, text, allow_typos=allow_typos and attempt == 1)
+            self._type_once(
+                locator,
+                text,
+                allow_typos=allow_typos and attempt == 1,
+                clear=True,
+            )
             if not verify or self._verify_typed(locator, text):
                 return
             if attempt == 1:

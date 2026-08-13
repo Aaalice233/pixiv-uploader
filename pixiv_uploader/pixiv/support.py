@@ -21,9 +21,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from PIL import Image
 
-from ..humanize import HumanSession, HumanTypingError, is_browser_closed_exception
-from ..paths import PROJECT_ROOT
-from ..runtime import ensure_runtime_layout
+from ..humanize import HumanSession, is_browser_closed_exception
 from .session import (
     PIXIV_PROFILE_DIR,
     PIXIV_CAPTCHA_TIMEOUT_SECONDS,
@@ -1933,15 +1931,20 @@ def warm_up_pixiv_session(
     human: HumanSession | None = None,
     *,
     cancel_event=None,
+    interaction_callback=None,
 ) -> None:
-    """批次首次投稿前的拟人热身：先像真人一样浏览首页，再进入投稿流程。
-
-    避免“打开浏览器 → 直奔投稿页 → 秒填表单”的机械行为序列。
-    热身失败不阻断投稿；浏览器关闭与取消原样透传。
-    """
+    """验证登录后浏览首页，并最终回到已验证的投稿页。"""
     session = _session_for(page, human, cancel_event)
+
+    # 登录状态必须以真实投稿表单为准。若 Profile 已过期，先等待用户登录，
+    # 再执行热身，避免把登录前的匿名浏览误当作本批次热身。
+    ensure_on_pixiv_upload_page(
+        page,
+        cancel_event=cancel_event,
+        interaction_callback=interaction_callback,
+    )
     try:
-        log.info("    pixiv: 会话热身，先浏览首页再进入投稿页")
+        log.info("    pixiv: 登录状态已验证，先浏览首页再进入投稿页")
         safe_goto(
             page,
             f"{PIXIV_BASE}/",
@@ -1960,6 +1963,13 @@ def warm_up_pixiv_session(
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
         log.warning("    pixiv: 会话热身浏览失败（继续投稿）: %s: %s", type(exc).__name__, exc)
+
+    # 无论装饰性的首页浏览是否完整完成，都必须重新拿到投稿表单后才能继续。
+    ensure_on_pixiv_upload_page(
+        page,
+        cancel_event=cancel_event,
+        interaction_callback=interaction_callback,
+    )
 
 
 def pixiv_browse_transition(
@@ -3024,6 +3034,8 @@ def _click_first(page, selectors: list[str], cancel_event=None, human: HumanSess
     try:
         _human_move_and_click(page, locator, cancel_event=cancel_event, human=human)
         return True
+    except InterruptedError:
+        raise
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
         return False
@@ -3079,11 +3091,13 @@ def _fill_if_found(page, name: str, selectors: list[str], value: str, cancel_eve
     except InterruptedError:
         raise
     except Exception as exc1:
+        _raise_if_browser_closed_exception(exc1)
         # 拟人输入失败绝不阻断投稿：先回退直接填充，再退 JS 赋值
         try:
             locator.fill(value)
             return PixivStep(name, True, detail="fill_fallback")
         except Exception as exc_fill:
+            _raise_if_browser_closed_exception(exc_fill)
             try:
                 locator.evaluate(
                     "(el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
@@ -3100,7 +3114,15 @@ def _fill_if_found(page, name: str, selectors: list[str], value: str, cancel_eve
                 )
 
 
-def _click_radio(page, name: str, selectors_per_choice: dict[str, list[str]], choice: str) -> PixivStep:
+def _click_radio(
+    page,
+    name: str,
+    selectors_per_choice: dict[str, list[str]],
+    choice: str,
+    *,
+    cancel_event=None,
+    human: HumanSession | None = None,
+) -> PixivStep:
     text_options = selectors_per_choice.get(choice)
     if not text_options:
         return PixivStep(name, False, "selector_miss", f"unknown choice: {choice}")
@@ -3113,6 +3135,8 @@ def _click_radio(page, name: str, selectors_per_choice: dict[str, list[str]], ch
                 f'[role="radio"]:has-text("{text}")',
                 f'text="{text}"',
             ],
+            cancel_event=cancel_event,
+            human=human,
         ):
             return PixivStep(name, True, detail=f"choice={choice}, matched={text}")
     return PixivStep(
@@ -3156,8 +3180,16 @@ def _set_checkbox_by_text(page, name: str, texts: list[str], desired: bool, canc
         if current == desired:
             return PixivStep(name, True, detail=f"already={current}, text='{text}'")
         try:
-            _human_move_and_click(page, locator, cancel_event=cancel_event)
+            _human_move_and_click(
+                page,
+                locator,
+                cancel_event=cancel_event,
+                human=human,
+            )
+        except InterruptedError:
+            raise
         except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
             last_detail = f"click failed for '{text}': {type(exc).__name__}: {exc}"
             continue
         _jsleep(0.4, cancel_event=cancel_event)
@@ -3168,162 +3200,289 @@ def _set_checkbox_by_text(page, name: str, texts: list[str], desired: bool, canc
     return PixivStep(name, False, "verify_failed", last_detail or f"no candidate matched: {texts}")
 
 
-def _read_tag_count(page) -> int:
-    """Read current tag count from Pixiv's 'N/10' counter near the tag input."""
+def _read_tag_count(page) -> int | None:
+    """读取标签输入框附近的 N/10 计数；无法确认时返回 None。"""
     try:
-        for sel in ('input[placeholder="标签"]', 'input[placeholder="タグ"]', 'input[placeholder="Tags"]'):
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                container = loc.locator("xpath=ancestor::label")
-                text = container.inner_text()
-                m = re.search(r"(\d+)\s*/\s*10", text)
-                if m:
-                    return int(m.group(1))
-    except Exception:
-        pass
-    return 0
+        locator = _first_visible_locator(page, PIXIV_SELECTORS["tag_input"])
+        if locator is None:
+            return None
+        value = locator.evaluate(
+            """el => {
+                let node = el;
+                for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+                    const match = String(node.textContent || '').match(/(?:^|\\D)(10|[0-9])\\s*\\/\\s*10(?:\\D|$)/);
+                    if (match) return Number(match[1]);
+                }
+                return null;
+            }"""
+        )
+        if isinstance(value, (int, float)) and 0 <= int(value) <= 10:
+            return int(value)
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+    return None
 
 
-def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], cancel_event=None, human: HumanSession | None = None) -> PixivStep:
+def _tag_commit_state(
+    page,
+    selectors: list[str],
+    before_count: int | None,
+) -> tuple[bool, int | None, str | None]:
+    locator = _first_visible_locator(page, selectors)
+    value_after: str | None = None
+    if locator is not None:
+        try:
+            value_after = str(locator.input_value() or "")
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
+    after_count = _read_tag_count(page)
+    if before_count is not None:
+        return (
+            after_count is not None and after_count > before_count,
+            after_count,
+            value_after,
+        )
+    if after_count is not None:
+        return after_count > 0 and value_after == "", after_count, value_after
+    return value_after == "", after_count, value_after
+
+
+def _fill_tag_input(
+    page,
+    name: str,
+    selectors: list[str],
+    tags: list[str],
+    cancel_event=None,
+    human: HumanSession | None = None,
+) -> PixivStep:
     tags = tags[:10]
     session = _session_for(page, human, cancel_event)
     failed: list[str] = []
     not_committed: list[str] = []
     autocomplete_used = 0
     raw_used = 0
-    last_exc: str = ""
-    listbox_selectors = PIXIV_SELECTORS.get("tag_autocomplete_listbox", [])
-    autocomplete_debug_dumps = 0  # cap per call
-    for tag_index, tag in enumerate(tags):
-        current_count = _read_tag_count(page)
-        if current_count >= 10:
-            log.info(f"    tag count already {current_count}/10, stopping")
+    committed_count = 0
+    last_exc = ""
+    option_selector = '[data-tag][data-type="front_matching"]'
+
+    for tag in tags:
+        before_count = _read_tag_count(page)
+        if before_count is not None and before_count >= 10:
+            log.info("    tag count already %s/10, stopping", before_count)
             break
-        # Re-locate each iteration: pixiv tag input may briefly hide/swap during chip insert
+
+        # Pixiv inserts a chip and may replace the input node after every tag.
+        # Never clear this field here: clearing a controlled tag input can remove
+        # chips that were already accepted by the page.
         locator = _first_visible_locator(page, selectors)
         if locator is None:
             failed.append(f"{tag}(selector_miss)")
             last_exc = f"none of: {selectors}"
-            continue
+            break
         try:
+            existing = str(locator.input_value() or "")
+            if existing:
+                not_committed.append(f"{tag}(input_not_empty:{existing!r})")
+                break
+
             session.mouse.click_locator(page, locator, cancel_event=cancel_event)
             session.paced_sleep(0.3)
             try:
-                # 真实逐键输入会在打字过程中自然驱动自动补全列表
-                session.type_text(locator, tag)
+                session.type_text(locator, tag, clear=False)
             except InterruptedError:
                 raise
             except Exception as type_exc:
                 _raise_if_browser_closed_exception(type_exc)
-                log.info(
-                    f"    拟人打字输入标签失败，回退直接填充 tag={tag!r}: "
-                    f"{type(type_exc).__name__}: {type_exc}"
-                )
-                locator.fill(tag)
-                locator.dispatch_event("input")
-            session.paced_sleep(1.2)
-            listbox = _first_visible_locator(page, listbox_selectors) if listbox_selectors else None
-            if listbox is None and autocomplete_debug_dumps < 3:
-                # No listbox detected — dump page HTML so we can see what real
-                # autocomplete DOM looks like. Cap at 3 dumps per fill_tags call
-                # to avoid runaway disk usage.
-                try:
-                    log_dir = ensure_runtime_layout(PROJECT_ROOT).logs
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", tag)[:24]
-                    html_path = log_dir / f"pixiv_autocomplete_probe_{ts}_{tag_index}_{safe_tag}.html"
-                    html_path.write_text(page.content(), encoding="utf-8")
-                    log.info(f"    autocomplete listbox not found at tag[{tag_index}]={tag!r}; DOM dumped: {html_path.name}")
-                except Exception as exc:
-                    log.warning(f"    autocomplete DOM dump 失败: {exc}")
-                autocomplete_debug_dumps += 1
-            if listbox is not None:
-                clicked = False
-                exact_option = None
-                try:
-                    options = page.locator('[data-tag][data-type="front_matching"]')
-                    count = options.count()
-                    for option_index in range(min(count, 20)):
-                        option = options.nth(option_index)
-                        try:
-                            data_tag = (option.get_attribute("data-tag", timeout=2000) or "").strip()
-                        except Exception:
-                            break
-                        if data_tag == tag:
-                            exact_option = option
-                            break
-                except Exception as exc:
-                    log.warning(f"    autocomplete exact-match lookup 失败 tag={tag!r}: {type(exc).__name__}: {exc}")
-                if exact_option is not None:
-                    try:
-                        session.mouse.click_locator(page, exact_option, cancel_event=cancel_event)
-                        clicked = True
-                    except Exception as exc:
-                        log.warning(f"    autocomplete exact-option click 失败 tag={tag!r}: {type(exc).__name__}: {exc}")
-                if clicked:
-                    autocomplete_used += 1
-                else:
-                    page.keyboard.press(" ")
-                    raw_used += 1
-            else:
-                page.keyboard.press(" ")
-                raw_used += 1
-            session.paced_sleep(0.6)
-            try:
-                value_after = locator.input_value()
-            except Exception:
-                value_after = None
-            if value_after:
-                for commit_key in (" ", "Enter", "Tab"):
-                    try:
-                        locator.press(commit_key)
-                        session.paced_sleep(0.4)
-                        value_after = locator.input_value()
-                    except Exception:
-                        pass
-                    if not value_after:
+                current_value = str(locator.input_value() or "")
+                if current_value != tag:
+                    if current_value:
+                        not_committed.append(
+                            f"{tag}(typing_preserved:{current_value!r})"
+                        )
+                        last_exc = str(type_exc)
                         break
-            if value_after:
-                not_committed.append(f"{tag}(remained:{value_after!r})")
+                    # Direct text insertion preserves the controlled input and
+                    # does not issue the destructive fill("") used by normal fields.
+                    page.keyboard.insert_text(tag)
+                    inserted_value = str(locator.input_value() or "")
+                    if inserted_value != tag:
+                        not_committed.append(
+                            f"{tag}(fallback_typing_failed:{inserted_value!r})"
+                        )
+                        last_exc = str(type_exc)
+                        break
+            session.paced_sleep(1.2)
+
+            exact_option = None
+            try:
+                options = page.locator(option_selector)
+                for option_index in range(min(options.count(), 20)):
+                    option = options.nth(option_index)
+                    data_tag = (option.get_attribute("data-tag", timeout=2000) or "").strip()
+                    if data_tag == tag:
+                        exact_option = option
+                        break
+            except Exception as exc:
+                _raise_if_browser_closed_exception(exc)
+                log.warning(
+                    "    autocomplete exact-match lookup 失败 tag=%r: %s: %s",
+                    tag,
+                    type(exc).__name__,
+                    exc,
+                )
+
+            committed = False
+            value_after: str | None = None
+            after_count = before_count
+            if exact_option is not None:
+                try:
+                    session.mouse.click_locator(
+                        page,
+                        exact_option,
+                        cancel_event=cancel_event,
+                    )
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    _raise_if_browser_closed_exception(exc)
+                    log.warning(
+                        "    autocomplete exact-option click 失败 tag=%r: %s: %s",
+                        tag,
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    session.paced_sleep(0.6)
+                    committed, after_count, value_after = _tag_commit_state(
+                        page,
+                        selectors,
+                        before_count,
+                    )
+                    if committed:
+                        autocomplete_used += 1
+
+            # If no exact suggestion exists (or it remained uncommitted), use
+            # keyboard separators one at a time and verify before trying another.
+            if not committed and value_after != "":
+                for commit_key in ("Enter", " ", "Tab"):
+                    current_locator = _first_visible_locator(page, selectors)
+                    if current_locator is None:
+                        break
+                    current_locator.press(commit_key)
+                    session.paced_sleep(0.4)
+                    committed, after_count, value_after = _tag_commit_state(
+                        page,
+                        selectors,
+                        before_count,
+                    )
+                    if committed or value_after == "":
+                        break
+                if committed:
+                    raw_used += 1
+
+            if not committed:
+                not_committed.append(
+                    f"{tag}(count:{before_count}->{after_count}, remained:{value_after!r})"
+                )
+                break
+            committed_count += 1
         except InterruptedError:
             raise
         except Exception as exc:
             _raise_if_browser_closed_exception(exc)
             failed.append(f"{tag}({type(exc).__name__})")
             last_exc = f"{type(exc).__name__}: {exc}"
-    detail = f"{len(tags)} tags (autocomplete={autocomplete_used}, raw={raw_used})"
-    if failed or not_committed:
+            break
+
+    detail = (
+        f"{committed_count}/{len(tags)} tags committed "
+        f"(autocomplete={autocomplete_used}, raw={raw_used})"
+    )
+    if failed or not_committed or committed_count != len(tags):
         return PixivStep(
-            name, False, "fill_failed",
+            name,
+            False,
+            "fill_failed",
             f"{detail} | failed: {failed} | not_committed: {not_committed} | last: {last_exc}",
         )
     return PixivStep(name, True, detail=detail)
 
 
-def _set_radio_by_attr(page, name: str, attr_name: str, attr_value: str, cancel_event=None) -> PixivStep:
+def _control_click_target(page, locator):
+    """返回单选/复选框可见的 label；无 label 时才尝试控件本身。"""
+    try:
+        label = locator.locator("xpath=ancestor::label[1]")
+        if label.count() > 0 and label.first.is_visible(timeout=250):
+            return label.first
+        control_id = str(locator.get_attribute("id") or "")
+        if control_id:
+            escaped = control_id.replace("\\", "\\\\").replace('"', '\\"')
+            labels = page.locator(f'label[for="{escaped}"]')
+            if labels.count() > 0 and labels.first.is_visible(timeout=250):
+                return labels.first
+        if locator.is_visible(timeout=250):
+            return locator
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+    return None
+
+
+def _set_radio_by_attr(
+    page,
+    name: str,
+    attr_name: str,
+    attr_value: str,
+    cancel_event=None,
+    human: HumanSession | None = None,
+) -> PixivStep:
     selector = f'input[name="{attr_name}"][value="{attr_value}"]'
-    locator = _first_visible_locator(page, [selector])
+    locator = _first_attached_locator(page, [selector])
     if locator is None:
         return PixivStep(name, False, "selector_miss", selector)
+    if _read_checked_state(locator) is True:
+        return PixivStep(name, True, detail=f"already selected name={attr_name}, value={attr_value}")
+
+    target = _control_click_target(page, locator)
+    if target is not None:
+        try:
+            _human_move_and_click(
+                page,
+                target,
+                cancel_event=cancel_event,
+                human=human,
+            )
+            _jsleep(0.3, cancel_event=cancel_event)
+            if _read_checked_state(locator) is True:
+                return PixivStep(name, True, detail=f"name={attr_name}, value={attr_value} via human click")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
+
     try:
-        # charcoal radio: hidden input inside <label>. Click the label, not the input.
+        locator.check(timeout=3000)
+        _jsleep(0.3, cancel_event=cancel_event)
+        if _read_checked_state(locator) is True:
+            return PixivStep(name, True, detail=f"name={attr_name}, value={attr_value} via check fallback")
+    except InterruptedError:
+        raise
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+
+    try:
         locator.evaluate("""el => {
-            const label = el.closest('label') || el.parentElement;
-            if (label && label.tagName === 'LABEL') { label.click(); return; }
             el.checked = true;
             el.dispatchEvent(new Event('change', {bubbles: true}));
             el.dispatchEvent(new Event('input', {bubbles: true}));
         }""")
         _jsleep(0.3, cancel_event=cancel_event)
-        checked = locator.evaluate("el => el.checked")
-        if not checked:
-            return PixivStep(name, False, "verify_failed", f"{selector} not checked after click")
-        return PixivStep(name, True, detail=f"name={attr_name}, value={attr_value}")
+        if _read_checked_state(locator) is True:
+            return PixivStep(name, True, detail=f"name={attr_name}, value={attr_value} via js fallback")
     except InterruptedError:
         raise
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
-        return PixivStep(name, False, "exception", f"{type(exc).__name__}: {exc}")
+    return PixivStep(name, False, "verify_failed", f"{selector} not checked after all strategies")
 
 
 PIXIV_CAPTCHA_SELECTORS = (
@@ -3519,11 +3678,18 @@ def _wait_for_pre_submit_ready(
         _emit_interaction(interaction_callback, None)
 
 
-def _set_checkbox_by_attr(page, name: str, attr_name: str, desired: bool, cancel_event=None) -> PixivStep:
+def _set_checkbox_by_attr(
+    page,
+    name: str,
+    attr_name: str,
+    desired: bool,
+    cancel_event=None,
+    human: HumanSession | None = None,
+) -> PixivStep:
     selector = f'input[name="{attr_name}"][type="checkbox"]'
-    locator = _first_visible_locator(page, [selector])
+    locator = _first_attached_locator(page, [selector])
     if locator is None:
-        locator = _first_visible_locator(page, [f'input[name="{attr_name}"]'])
+        locator = _first_attached_locator(page, [f'input[name="{attr_name}"]'])
         if locator is None:
             return PixivStep(name, False, "selector_miss", selector)
     current = _read_checked_state(locator)
@@ -3532,41 +3698,47 @@ def _set_checkbox_by_attr(page, name: str, attr_name: str, desired: bool, cancel
     if current == desired:
         return PixivStep(name, True, detail=f"already={current}")
 
-    # Charcoal checkbox: hidden input inside <label>. Click the label, not the input.
-    try:
-        clicked_label = locator.evaluate("""el => {
-            const label = el.closest('label') || el.parentElement;
-            if (label && label.tagName === 'LABEL') { label.click(); return true; }
-            return false;
-        }""")
-    except Exception as exc:
-        _raise_if_browser_closed_exception(exc)
-        clicked_label = False
-    if clicked_label:
-        _jsleep(0.4, cancel_event=cancel_event)
-        final = _read_checked_state(locator)
-        if final == desired:
-            return PixivStep(name, True, detail=f"toggled to {desired} via label")
+    target = _control_click_target(page, locator)
+    if target is not None:
+        try:
+            _human_move_and_click(
+                page,
+                target,
+                cancel_event=cancel_event,
+                human=human,
+            )
+            _jsleep(0.4, cancel_event=cancel_event)
+            if _read_checked_state(locator) == desired:
+                return PixivStep(name, True, detail=f"toggled to {desired} via human click")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            _raise_if_browser_closed_exception(exc)
 
     try:
-        locator.click(timeout=3000)
+        locator.set_checked(desired, timeout=3000)
         _jsleep(0.4, cancel_event=cancel_event)
-        final = _read_checked_state(locator)
-        if final == desired:
-            return PixivStep(name, True, detail=f"toggled to {desired} via locator.click")
+        if _read_checked_state(locator) == desired:
+            return PixivStep(name, True, detail=f"toggled to {desired} via set_checked fallback")
+    except InterruptedError:
+        raise
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
 
     try:
-        locator.evaluate("""el => {
-            el.checked = !el.checked;
-            el.dispatchEvent(new Event('change', {bubbles: true}));
-            el.dispatchEvent(new Event('input', {bubbles: true}));
-        }""")
+        locator.evaluate(
+            """(el, desired) => {
+                el.checked = desired;
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+            }""",
+            desired,
+        )
         _jsleep(0.4, cancel_event=cancel_event)
-        final = _read_checked_state(locator)
-        if final == desired:
-            return PixivStep(name, True, detail=f"toggled to {desired} via js")
+        if _read_checked_state(locator) == desired:
+            return PixivStep(name, True, detail=f"toggled to {desired} via js fallback")
+    except InterruptedError:
+        raise
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
 
@@ -3766,16 +3938,37 @@ def _create_pixiv_post(
     age_attr = PIXIV_SELECTORS["age_radio_attr"]
     age_value = age_attr["values"].get(age)
     if age_value is not None:
-        step_age = _set_radio_by_attr(page, "age_restriction", age_attr["name"], age_value, cancel_event=cancel_event)
+        step_age = _set_radio_by_attr(
+            page,
+            "age_restriction",
+            age_attr["name"],
+            age_value,
+            cancel_event=cancel_event,
+            human=session,
+        )
     else:
         step_age = PixivStep("age_restriction", False, "selector_miss", f"unknown age={age}")
     if not step_age.ok:
-        step_age = _click_radio(page, "age_restriction", PIXIV_SELECTORS["age_radio_text"], age)
+        step_age = _click_radio(
+            page,
+            "age_restriction",
+            PIXIV_SELECTORS["age_radio_text"],
+            age,
+            cancel_event=cancel_event,
+            human=session,
+        )
     record(step_age)
 
     # AI flag: radio name=ai_type (NOT a checkbox)
     ai_attr = PIXIV_SELECTORS["ai_radio_attr"]
-    record(_set_radio_by_attr(page, "ai_flag", ai_attr["name"], ai_attr["values"][True], cancel_event=cancel_event))
+    record(_set_radio_by_attr(
+        page,
+        "ai_flag",
+        ai_attr["name"],
+        ai_attr["values"][True],
+        cancel_event=cancel_event,
+        human=session,
+    ))
 
     # Sexual content radio. Pixiv only shows this in all_ages mode (R-18
     # implies sexual=true and the field is removed). Probe for presence first.
@@ -3783,7 +3976,14 @@ def _create_pixiv_post(
     sexual_present = _first_visible_locator(page, [f'input[name="{sex_attr["name"]}"]']) is not None
     if sexual_present:
         has_sexual = age in {"r18", "r18g"}
-        record(_set_radio_by_attr(page, "sexual_flag", sex_attr["name"], sex_attr["values"][has_sexual], cancel_event=cancel_event))
+        record(_set_radio_by_attr(
+            page,
+            "sexual_flag",
+            sex_attr["name"],
+            sex_attr["values"][has_sexual],
+            cancel_event=cancel_event,
+            human=session,
+        ))
     else:
         record(PixivStep("sexual_flag", True, detail="field absent (R-18 implicit)"))
 
@@ -3793,6 +3993,7 @@ def _create_pixiv_post(
         page, "original_flag", PIXIV_SELECTORS["original_checkbox_attr"],
         domain == "original",
         cancel_event=cancel_event,
+        human=session,
     ))
     _raise_if_canceled(cancel_event)
 
@@ -3801,11 +4002,25 @@ def _create_pixiv_post(
     priv_attr = PIXIV_SELECTORS["privacy_radio_attr"]
     priv_value = priv_attr["values"].get(privacy)
     if priv_value is not None:
-        step_priv = _set_radio_by_attr(page, "privacy", priv_attr["name"], priv_value, cancel_event=cancel_event)
+        step_priv = _set_radio_by_attr(
+            page,
+            "privacy",
+            priv_attr["name"],
+            priv_value,
+            cancel_event=cancel_event,
+            human=session,
+        )
     else:
         step_priv = PixivStep("privacy", False, "selector_miss", f"unknown privacy={privacy}")
     if not step_priv.ok:
-        step_priv = _click_radio(page, "privacy", PIXIV_SELECTORS["privacy_radio_text"], privacy)
+        step_priv = _click_radio(
+            page,
+            "privacy",
+            PIXIV_SELECTORS["privacy_radio_text"],
+            privacy,
+            cancel_event=cancel_event,
+            human=session,
+        )
     record(step_priv)
 
     # Allow tag edits checkbox
@@ -3813,6 +4028,7 @@ def _create_pixiv_post(
         page, "allow_tag_edits", PIXIV_SELECTORS["allow_tag_edit_checkbox_attr"],
         bool(payload.get("allow_tag_edits", False)),
         cancel_event=cancel_event,
+        human=session,
     ))
 
     # Pixiv may render CAPTCHA in this section. Submission readiness is handled
@@ -3891,15 +4107,6 @@ def _create_pixiv_post(
     try:
         while True:
             _sleep_with_cancel(1.0, cancel_event)
-            if not captcha_detected:
-                # 等待跳转期间低概率漂移鼠标，避免指针完全冻结；
-                # 一旦出现人机验证则停止漂移，不干扰人工操作
-                try:
-                    session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.15)
-                except InterruptedError:
-                    raise
-                except Exception as drift_exc:
-                    _raise_if_browser_closed_exception(drift_exc)
             try:
                 url = str(page.url or "")
             except Exception as exc:
@@ -3944,6 +4151,15 @@ def _create_pixiv_post(
             # back into an interaction wait.
             captcha = _detect_pixiv_captcha(page) if _is_pixiv_url(url) else {"active": False, "provider": ""}
             challenge_active = bool(captcha["active"])
+            if not captcha_detected and not challenge_active:
+                # 先读取验证状态，再决定是否漂移；验证码出现的首个检测周期
+                # 也不会移动鼠标，避免抢占正在人工操作的指针。
+                try:
+                    session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.15)
+                except InterruptedError:
+                    raise
+                except Exception as drift_exc:
+                    _raise_if_browser_closed_exception(drift_exc)
             if challenge_active:
                 if not captcha_detected:
                     captcha_detected = True

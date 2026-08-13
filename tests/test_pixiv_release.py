@@ -271,6 +271,33 @@ class PixivUploadFailureTests(unittest.TestCase):
         self.assertEqual(steps[0].reason, "pixiv_browser_closed")
 
 
+class PostIntervalTests(unittest.TestCase):
+    def test_wait_reports_countdown_and_clears_activity(self) -> None:
+        import pixiv_uploader.publishing as publishing
+
+        events: list[tuple[str, dict]] = []
+        with patch.object(
+            publishing.time,
+            "monotonic",
+            side_effect=[100.0, 100.0, 101.0, 102.0, 102.2],
+        ), patch.object(publishing, "_sleep_with_cancel"):
+            publishing._wait_for_post_interval(
+                2.2,
+                None,
+                platform="pixiv",
+                stage="opening_pixiv",
+                progress_callback=lambda stage, **details: events.append((stage, details)),
+            )
+
+        countdowns = [
+            details["activity"]["remaining_seconds"]
+            for _stage, details in events
+            if details.get("activity")
+        ]
+        self.assertEqual(countdowns, [3, 2, 1])
+        self.assertEqual(events[-1], ("opening_pixiv", {"activity": {}}))
+
+
 class PixivUploadStartupTests(unittest.TestCase):
     def test_pixiv_browser_opens_after_manifest_preparation(self) -> None:
         import pixiv_uploader.publishing as splitter
@@ -359,6 +386,11 @@ class PixivUploadStartupTests(unittest.TestCase):
                 stack.enter_context(patch.object(splitter, "sync_playwright", return_value=manager))
                 stack.enter_context(patch.object(splitter, "create_upload_manifest", side_effect=prepare))
                 stack.enter_context(patch.object(splitter, "open_pixiv_browser", side_effect=open_browser))
+                stack.enter_context(patch.object(
+                    splitter,
+                    "warm_up_pixiv_session",
+                    side_effect=lambda *_args, **_kwargs: events.append("warmup"),
+                ))
                 stack.enter_context(patch.object(splitter, "create_pixiv_post", side_effect=publish))
                 stack.enter_context(patch.object(splitter, "_acquire_pixiv_profile_for_task", return_value=object()))
                 stack.enter_context(patch.object(splitter, "find_target_successes", return_value={}))
@@ -367,7 +399,7 @@ class PixivUploadStartupTests(unittest.TestCase):
                 stack.enter_context(patch.object(splitter, "move_to_done", return_value=root / "done" / source.name))
                 summary = splitter.cmd_upload(args)
 
-            self.assertEqual(events, ["prepare", "open", "publish"])
+            self.assertEqual(events, ["prepare", "open", "warmup", "publish"])
             progress_stages = [stage for stage, _details in progress_events]
             self.assertLess(progress_stages.index("opening_pixiv"), progress_stages.index("filling_pixiv"))
             self.assertLess(progress_stages.index("filling_pixiv"), progress_stages.index("submitting_pixiv"))

@@ -4,7 +4,7 @@ import math
 import random
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pixiv_uploader import humanize
 from pixiv_uploader.humanize import HumanSession, HumanTypingError, sleep_with_cancel
@@ -38,6 +38,11 @@ class FakeKeyboard:
         if self.target is not None:
             self.target.value += text
 
+    def insert_text(self, text):
+        self.events.append(("insert_text", text))
+        if self.target is not None:
+            self.target.value += text
+
     def press(self, key):
         self.events.append(("press", key))
         if self.target is None:
@@ -54,6 +59,7 @@ class FakeLocator:
         self._box = box if box is not None else {"x": 100.0, "y": 100.0, "width": 40.0, "height": 20.0}
         self.fills: list[str] = []
         self.click_count = 0
+        self.click_positions: list[dict | None] = []
 
     def bounding_box(self, timeout=None):
         return self._box
@@ -62,8 +68,9 @@ class FakeLocator:
         self.fills.append(value)
         self.value = value
 
-    def click(self, timeout=None):
+    def click(self, timeout=None, position=None):
         self.click_count += 1
+        self.click_positions.append(position)
 
     def input_value(self):
         return self.value
@@ -132,6 +139,25 @@ class BrowserClosedDetectionTests(unittest.TestCase):
         self.assertFalse(humanize.is_browser_closed_exception(ValueError("unrelated")))
 
 
+class InteractiveChallengeTests(unittest.TestCase):
+    def test_visible_challenge_is_detected(self):
+        page = Mock()
+        matches = Mock()
+        matches.count.return_value = 1
+        matches.nth.return_value.is_visible.return_value = True
+        page.locator.return_value = matches
+
+        self.assertTrue(humanize.has_visible_interactive_challenge(page))
+
+    def test_absent_challenge_does_not_block_waiting_motion(self):
+        page = Mock()
+        matches = Mock()
+        matches.count.return_value = 0
+        page.locator.return_value = matches
+
+        self.assertFalse(humanize.has_visible_interactive_challenge(page))
+
+
 class TypingTests(unittest.TestCase):
     def _type(self, session, locator, text, recorder, **kwargs):
         session.page.keyboard.target = locator
@@ -153,6 +179,23 @@ class TypingTests(unittest.TestCase):
                 self.assertTrue(0.12 <= delay <= 0.35, f"空格后停顿越界: {delay}")
             else:
                 self.assertTrue(0.03 <= delay <= 0.09, f"词内停顿越界: {delay}")
+
+    def test_mixed_language_delay_uses_script_specific_bounds(self):
+        session = make_session(typing_base_ms=75.0, pause_tendency=1.0)
+        session._chars_since_think = 0
+        session._next_think_at = 10**9
+
+        samples = {
+            "ascii": session._char_delay("a"),
+            "kana": session._char_delay("あ"),
+            "han": session._char_delay("画"),
+            "punctuation": session._char_delay("。"),
+        }
+
+        self.assertTrue(0.03 <= samples["ascii"] <= 0.09)
+        self.assertTrue(0.05 <= samples["kana"] <= 0.14)
+        self.assertTrue(0.08 <= samples["han"] <= 0.20)
+        self.assertTrue(0.12 <= samples["punctuation"] <= 0.35)
 
     def test_think_pause_stays_within_bounds(self):
         recorder = RecordingSleep()
@@ -189,7 +232,9 @@ class TypingTests(unittest.TestCase):
 
         self.assertEqual(locator.value, text)
         backspaces = [e for e in session.page.keyboard.events if e == ("press", "Backspace")]
+        inserted = [e for e in session.page.keyboard.events if e[0] == "insert_text"]
         self.assertEqual(backspaces, [])
+        self.assertEqual("".join(value for _kind, value in inserted), text)
 
     def test_newline_uses_enter_key(self):
         recorder = RecordingSleep()
@@ -209,6 +254,15 @@ class TypingTests(unittest.TestCase):
                 session.type_text(locator, "abc")
         # 两次尝试各清空一次
         self.assertEqual(locator.fills, ["", ""])
+
+    def test_incremental_typing_never_clears_existing_value(self):
+        recorder = RecordingSleep()
+        session = make_session(typo_rate=0.0)
+        locator = FakeLocator(value="既存")
+        self._type(session, locator, "tag", recorder, clear=False)
+
+        self.assertEqual(locator.value, "既存tag")
+        self.assertEqual(locator.fills, [])
 
     def test_typing_cancel_raises(self):
         event = threading.Event()
@@ -259,13 +313,13 @@ class PacerTests(unittest.TestCase):
         session = make_session()
         for _ in range(200):
             delay = session.between_posts_delay(10.0)
-            self.assertTrue(8.0 <= delay <= 16.0 + 360.0)
+            self.assertTrue(10.0 <= delay <= 16.0 + 360.0)
             self.assertEqual(session._action_count, 0)
 
         # 强制触发长休息：random()<0.08 恒真
         with patch.object(session.rng, "random", return_value=0.0):
             rested = session.between_posts_delay(10.0)
-        self.assertGreaterEqual(rested, 8.0 + 120.0)
+        self.assertGreaterEqual(rested, 10.0 + 120.0)
 
         # base 为 0 时仍只可能由长休息产生等待
         with patch.object(session.rng, "random", return_value=1.0):
@@ -304,15 +358,29 @@ class MouseClickTests(unittest.TestCase):
         with patch.object(humanize, "sleep_with_cancel", recorder):
             session.mouse.click_locator(page, locator)
 
-        self.assertEqual(len(page.mouse.clicks), 1)
-        click_x, click_y = page.mouse.clicks[0]
+        self.assertEqual(locator.click_count, 1)
+        self.assertEqual(page.mouse.clicks, [])
+        click_position = locator.click_positions[0]
+        self.assertIsNotNone(click_position)
+        click_x = 100.0 + click_position["x"]
+        click_y = 100.0 + click_position["y"]
         # 目标是元素中心 ±3px
         self.assertTrue(abs(click_x - 120.0) <= 3.0)
         self.assertTrue(abs(click_y - 110.0) <= 3.0)
         self.assertGreater(len(page.mouse.moves), 5)
-        # 移动终点 == 点击点，且点击前有 dwell
+        # 移动终点 == Locator 的点击位置，且点击前有 dwell
         self.assertEqual(page.mouse.moves[-1], (click_x, click_y))
         self.assertTrue(any(script.startswith("() => { window._lastMouseX") for script in page.evaluated))
+
+    def test_click_locator_exposes_actionability_failure_to_caller(self):
+        page = FakePage()
+        session = make_session(page)
+        locator = FakeLocator()
+        locator.click = Mock(side_effect=RuntimeError("element is covered"))
+
+        with patch.object(humanize, "sleep_with_cancel", RecordingSleep()):
+            with self.assertRaisesRegex(RuntimeError, "covered"):
+                session.mouse.click_locator(page, locator)
 
     def test_click_locator_falls_back_to_locator_click_without_box(self):
         page = FakePage()
@@ -379,6 +447,18 @@ class IdleDriftTests(unittest.TestCase):
         page = FakePage()
         session = make_session(page)
         session.mouse.idle_drift(page, probability=0.0)
+        self.assertEqual(page.mouse.moves, [])
+
+    def test_visible_challenge_blocks_drift_inside_mouse_helper(self):
+        page = FakePage()
+        session = make_session(page)
+        with patch.object(
+            humanize,
+            "has_visible_interactive_challenge",
+            return_value=True,
+        ):
+            session.mouse.idle_drift(page, probability=1.0)
+
         self.assertEqual(page.mouse.moves, [])
 
     def test_full_probability_moves_within_drift_range(self):

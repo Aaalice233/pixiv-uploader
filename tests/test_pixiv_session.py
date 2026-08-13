@@ -171,6 +171,197 @@ class PixivAuthenticationRecoveryTests(unittest.TestCase):
         self.assertIs(support._first_attached_locator(page, ['input[type="file"]']), file_input)
         file_input.is_visible.assert_not_called()
 
+    def test_warmup_verifies_login_before_browsing_and_restores_upload_page(self) -> None:
+        page = Mock()
+        session = Mock()
+        session.rng.uniform.return_value = 2.0
+        session.rng.random.return_value = 1.0
+        events: list[str] = []
+
+        with patch.object(
+            support,
+            "ensure_on_pixiv_upload_page",
+            side_effect=lambda *_args, **_kwargs: events.append("verify"),
+        ), patch.object(
+            support,
+            "safe_goto",
+            side_effect=lambda *_args, **_kwargs: events.append("browse"),
+        ):
+            support.warm_up_pixiv_session(page, session)
+
+        self.assertEqual(events, ["verify", "browse", "verify"])
+
+
+class PixivTagInputTests(unittest.TestCase):
+    class TagLocator:
+        def __init__(self, value: str = "") -> None:
+            self.value = value
+            self.pressed: list[str] = []
+
+        def input_value(self):
+            return self.value
+
+        def press(self, key):
+            self.pressed.append(key)
+            self.value = ""
+
+    def test_each_tag_is_committed_without_clearing_the_controlled_input(self) -> None:
+        page = Mock()
+        options = Mock()
+        options.count.return_value = 0
+        page.locator.return_value = options
+        locator = self.TagLocator()
+        session = Mock()
+        session.mouse = Mock()
+
+        def type_incrementally(received_locator, text, **kwargs):
+            self.assertFalse(kwargs["clear"])
+            self.assertEqual(received_locator.value, "")
+            received_locator.value += text
+
+        session.type_text.side_effect = type_incrementally
+        with patch.object(
+            support,
+            "_first_visible_locator",
+            return_value=locator,
+        ), patch.object(
+            support,
+            "_read_tag_count",
+            side_effect=[0, 1, 1, 2],
+        ):
+            result = support._fill_tag_input(
+                page,
+                "fill_tags",
+                support.PIXIV_SELECTORS["tag_input"],
+                ["女の子", "blue_hair"],
+                human=session,
+            )
+
+        self.assertTrue(result.ok, result.detail)
+        self.assertEqual(session.type_text.call_count, 2)
+        self.assertEqual(locator.pressed, ["Enter", "Enter"])
+
+    def test_empty_input_without_tag_count_increment_is_not_accepted(self) -> None:
+        page = Mock()
+        options = Mock()
+        options.count.return_value = 0
+        page.locator.return_value = options
+        locator = self.TagLocator()
+        session = Mock()
+        session.mouse = Mock()
+        session.type_text.side_effect = lambda received_locator, text, **_kwargs: setattr(
+            received_locator,
+            "value",
+            text,
+        )
+
+        with patch.object(
+            support,
+            "_first_visible_locator",
+            return_value=locator,
+        ), patch.object(
+            support,
+            "_read_tag_count",
+            side_effect=[0, 0],
+        ):
+            result = support._fill_tag_input(
+                page,
+                "fill_tags",
+                support.PIXIV_SELECTORS["tag_input"],
+                ["first", "second"],
+                human=session,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(session.type_text.call_count, 1)
+        self.assertIn("count:0->0", result.detail)
+
+    def test_uncommitted_value_is_preserved_and_stops_before_next_tag(self) -> None:
+        page = Mock()
+        locator = self.TagLocator("previous")
+        session = Mock()
+        session.mouse = Mock()
+        with patch.object(
+            support,
+            "_first_visible_locator",
+            return_value=locator,
+        ), patch.object(support, "_read_tag_count", return_value=0):
+            result = support._fill_tag_input(
+                page,
+                "fill_tags",
+                support.PIXIV_SELECTORS["tag_input"],
+                ["next", "last"],
+                human=session,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(locator.value, "previous")
+        session.type_text.assert_not_called()
+
+
+class PixivFormControlTests(unittest.TestCase):
+    def test_radio_prefers_human_click_and_verifies_state(self) -> None:
+        page = Mock()
+        locator = Mock()
+        target = Mock()
+        locator.is_checked.side_effect = [False, True]
+
+        with patch.object(
+            support,
+            "_first_attached_locator",
+            return_value=locator,
+        ), patch.object(
+            support,
+            "_control_click_target",
+            return_value=target,
+        ), patch.object(
+            support,
+            "_human_move_and_click",
+        ) as click, patch.object(support, "_jsleep"):
+            result = support._set_radio_by_attr(
+                page,
+                "privacy",
+                "privacy",
+                "public",
+                human=Mock(),
+            )
+
+        self.assertTrue(result.ok)
+        click.assert_called_once()
+        locator.check.assert_not_called()
+        locator.evaluate.assert_not_called()
+
+    def test_checkbox_prefers_human_click_and_verifies_state(self) -> None:
+        page = Mock()
+        locator = Mock()
+        target = Mock()
+        locator.is_checked.side_effect = [False, True]
+
+        with patch.object(
+            support,
+            "_first_attached_locator",
+            return_value=locator,
+        ), patch.object(
+            support,
+            "_control_click_target",
+            return_value=target,
+        ), patch.object(
+            support,
+            "_human_move_and_click",
+        ) as click, patch.object(support, "_jsleep"):
+            result = support._set_checkbox_by_attr(
+                page,
+                "allow_tag_edits",
+                "allow_tag_edit",
+                True,
+                human=Mock(),
+            )
+
+        self.assertTrue(result.ok)
+        click.assert_called_once()
+        locator.set_checked.assert_not_called()
+        locator.evaluate.assert_not_called()
+
 
 class PixivCaptchaStateMachineTests(unittest.TestCase):
     def test_pre_submit_captcha_waits_then_allows_one_submit(self) -> None:
@@ -214,6 +405,8 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
         activities: list[dict | None] = []
         monitor = Mock()
         monitor.consume.return_value = None
+        human = Mock()
+        human.mouse = Mock()
         successful_step = lambda name, *_args, **_kwargs: support.PixivStep(name, True)
         visible_locator_results = [None, publish]
         captcha_active = {"present": True, "active": True, "provider": "hcaptcha", "token_present": False}
@@ -267,24 +460,26 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
                 steps,
                 interaction_callback=activities.append,
                 http_monitor=monitor,
+                human=human,
             )
-        return result, click, activities
+        return result, click, activities, human
 
     def test_captcha_before_submit_still_clicks_exactly_once(self) -> None:
-        result, click, _activities = self._run_post(pre_submit_captcha=True, post_submit_captcha=False)
+        result, click, _activities, _human = self._run_post(pre_submit_captcha=True, post_submit_captcha=False)
 
         click.assert_called_once()
         self.assertEqual(result.url, "https://www.pixiv.net/artworks/123")
 
     def test_captcha_after_submit_never_triggers_a_second_automatic_click(self) -> None:
-        result, click, activities = self._run_post(pre_submit_captcha=False, post_submit_captcha=True)
+        result, click, activities, human = self._run_post(pre_submit_captcha=False, post_submit_captcha=True)
 
         click.assert_called_once()
+        human.mouse.idle_drift.assert_not_called()
         self.assertEqual(result.url, "https://www.pixiv.net/artworks/123")
         self.assertTrue(any(activity and activity["interaction_type"] == "pixiv_captcha_after_submit" for activity in activities))
 
     def test_post_submit_captcha_is_detected_on_pixiv_management_landing(self) -> None:
-        result, click, activities = self._run_post(
+        result, click, activities, _human = self._run_post(
             pre_submit_captcha=False,
             post_submit_captcha=True,
             post_submit_url="https://www.pixiv.net/manage/illusts",

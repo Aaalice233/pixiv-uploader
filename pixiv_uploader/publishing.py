@@ -22,7 +22,7 @@ from .watermark import (
     WatermarkError,
     WatermarkService,
 )
-from .humanize import HumanSession
+from .humanize import HumanSession, has_visible_interactive_challenge
 from .pixiv.censor import CENSOR_CLASS_BY_NAME, CensorEngine, DEFAULT_CENSOR_CLASSES, DeepghsDetector, parse_class_set
 from .pixiv.llm_platforms import field_specs_for_consumer
 from .pixiv.llm_reverse import (
@@ -244,6 +244,36 @@ def _sleep_with_cancel(seconds: float, cancel_event, poll: float = 0.2) -> None:
         if remaining <= 0:
             return
         time.sleep(min(poll, remaining))
+
+
+def _wait_for_post_interval(
+    seconds: float,
+    cancel_event,
+    *,
+    platform: str,
+    stage: str,
+    progress_callback=None,
+) -> None:
+    """可取消地等待相邻投稿间隔，并持续上报真实倒计时。"""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    try:
+        while True:
+            _raise_if_canceled(cancel_event)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            _emit_progress(
+                progress_callback,
+                stage,
+                activity={
+                    "kind": "post_interval",
+                    "platform": platform,
+                    "remaining_seconds": max(1, int(remaining + 0.999)),
+                },
+            )
+            _sleep_with_cancel(min(1.0, remaining), cancel_event)
+    finally:
+        _emit_progress(progress_callback, stage, activity={})
 
 
 def check_civitai_safety(
@@ -552,7 +582,7 @@ def ensure_on_create_page(page):
             pass
 
 
-def create_civitai_post(page, image_path: Path, delay: float, cancel_event=None, human: HumanSession | None = None) -> str | None:
+def create_civitai_post(page, image_path: Path, cancel_event=None, human: HumanSession | None = None) -> str | None:
     _raise_if_canceled(cancel_event)
     session = human if human is not None else HumanSession(page, cancel_event=cancel_event)
     ensure_on_create_page(page)
@@ -582,7 +612,9 @@ def create_civitai_post(page, image_path: Path, delay: float, cancel_event=None,
     enabled = False
     for _ in range(60):
         _sleep_with_cancel(2, cancel_event)
-        session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.2)
+        challenge_visible = has_visible_interactive_challenge(page)
+        if not challenge_visible:
+            session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.2)
         if publish_btn.count() > 0 and publish_btn.first.is_enabled():
             enabled = True
             break
@@ -597,20 +629,18 @@ def create_civitai_post(page, image_path: Path, delay: float, cancel_event=None,
     except InterruptedError:
         raise
     except Exception as click_exc:
-        # sticky 通知栏可能遮挡按钮导致轨迹点击落空，force 跳过遮挡检查兑底
+        # sticky 通知栏可能遮挡按钮导致轨迹点击失败，force 跳过遮挡检查兜底
         log.debug(f"    拟人点击 Publish 失败，回退 force 点击: {type(click_exc).__name__}: {click_exc}")
         publish_btn.first.click(force=True)
     log.info("    已点击 Publish，等待跳转...")
 
     for _ in range(30):
         _sleep_with_cancel(2, cancel_event)
-        session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.2)
+        if not has_visible_interactive_challenge(page):
+            session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.2)
         current_url = page.url
         if "/posts/create" not in current_url and "/posts/" in current_url:
-            post_url = re.sub(r"/edit$", "", current_url)
-            wait = delay + random.uniform(1, 3)
-            _sleep_with_cancel(wait, cancel_event)
-            return post_url
+            return re.sub(r"/edit$", "", current_url)
     log.error("    发布超时（60 秒内未跳转），跳过")
     return None
 
@@ -1424,6 +1454,7 @@ def cmd_upload(args):
     target_fail_counts = {target: 0 for target in all_processed_targets}
     target_canceled_counts = {target: 0 for target in all_processed_targets}
     pixiv_lease = None
+    civitai_next_post_at = 0.0
     pixiv_next_post_at = 0.0
     pixiv_batch_fatal = False
     pixiv_batch_error_code = ""
@@ -1564,7 +1595,21 @@ def cmd_upload(args):
                 else:
                     civitai_copy = Path(manifest["civitai"]["clean_copy_path"])
                     try:
-                        civitai_url = create_civitai_post(civitai_page, civitai_copy, args.delay, cancel_event=_cancel_ev, human=civitai_human)
+                        interval_remaining = civitai_next_post_at - time.monotonic()
+                        if interval_remaining > 0:
+                            _wait_for_post_interval(
+                                interval_remaining,
+                                _cancel_ev,
+                                platform="civitai",
+                                stage="publishing_civitai",
+                                progress_callback=report_image,
+                            )
+                        civitai_url = create_civitai_post(
+                            civitai_page,
+                            civitai_copy,
+                            cancel_event=_cancel_ev,
+                            human=civitai_human,
+                        )
                     except InterruptedError:
                         cancel_requested = True
                         manifest["civitai"]["error_code"] = "task_canceled"
@@ -1579,6 +1624,12 @@ def cmd_upload(args):
                     if civitai_url:
                         manifest["civitai"]["post_url"] = civitai_url
                         manifest["status_by_target"]["civitai"] = "success"
+                        interval = (
+                            civitai_human.between_posts_delay(args.delay)
+                            if civitai_human is not None
+                            else max(0.0, float(args.delay))
+                        )
+                        civitai_next_post_at = time.monotonic() + interval
                         report_image("publishing_civitai", stage_progress=1.0)
                         log.info(f"    Civitai 发布成功: {civitai_url}")
                     elif cancel_requested and manifest["status_by_target"].get("civitai") == "pending":
@@ -1609,7 +1660,13 @@ def cmd_upload(args):
                     normal_interval_remaining = pixiv_next_post_at - time.monotonic()
                     if normal_interval_remaining > 0:
                         try:
-                            _sleep_with_cancel(normal_interval_remaining, _cancel_ev)
+                            _wait_for_post_interval(
+                                normal_interval_remaining,
+                                _cancel_ev,
+                                platform="pixiv",
+                                stage="opening_pixiv",
+                                progress_callback=report_image,
+                            )
                         except InterruptedError:
                             cancel_requested = True
                     report_image("opening_pixiv", stage_progress=0.0)
@@ -1646,13 +1703,23 @@ def cmd_upload(args):
                         if pixiv_human is None:
                             pixiv_human = HumanSession(pixiv_page, cancel_event=_cancel_ev)
                             try:
-                                warm_up_pixiv_session(pixiv_page, pixiv_human, cancel_event=_cancel_ev)
+                                warm_up_pixiv_session(
+                                    pixiv_page,
+                                    pixiv_human,
+                                    cancel_event=_cancel_ev,
+                                    interaction_callback=lambda activity: report_image(
+                                        "opening_pixiv",
+                                        stage_progress=0.0,
+                                        activity=activity or {},
+                                    ),
+                                )
                             except InterruptedError:
                                 cancel_requested = True
                             except PixivFlowError as warm_exc:
-                                # 热身期间浏览器被关闭，按浏览器不可用处理
                                 pixiv_browser_error = str(warm_exc)
                                 pixiv_browser_error_code = str(getattr(warm_exc, "code", "pixiv_browser_closed"))
+                                pixiv_batch_fatal = True
+                                pixiv_batch_error_code = pixiv_browser_error_code
                                 log.error(f"    Pixiv 会话热身中断: {pixiv_browser_error}")
 
                 if "pixiv" in skip_targets:
@@ -1714,9 +1781,26 @@ def cmd_upload(args):
                         except PixivFlowError as transition_exc:
                             pixiv_browser_error = str(transition_exc)
                             pixiv_browser_error_code = str(getattr(transition_exc, "code", "pixiv_browser_closed"))
+                            pixiv_batch_fatal = True
+                            pixiv_batch_error_code = pixiv_browser_error_code
+                            pixiv_result = PixivPostResult(
+                                None,
+                                pixiv_steps,
+                                error_code=pixiv_browser_error_code,
+                                batch_fatal=True,
+                            )
                             log.error(f"    Pixiv 浏览过渡中断: {pixiv_browser_error}")
-                    pixiv_posts_attempted += 1
-                    for attempt in range(max_retries + 1):
+                    can_attempt_pixiv = not cancel_requested and not pixiv_browser_error
+                    if can_attempt_pixiv:
+                        pixiv_posts_attempted += 1
+                    elif cancel_requested:
+                        pixiv_result = PixivPostResult(
+                            None,
+                            pixiv_steps,
+                            error_code="pixiv_task_canceled",
+                            batch_fatal=True,
+                        )
+                    for attempt in (range(max_retries + 1) if can_attempt_pixiv else ()):
                         pixiv_steps = []
                         try:
                             report_image("filling_pixiv", stage_progress=0.0, activity={})

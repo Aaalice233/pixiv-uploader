@@ -438,6 +438,13 @@ function taskActivityLabel(task, t, formatNumber) {
       ? t(key)
       : t(key, { remaining: taskRemainingLabel(activity.remaining_seconds, t, formatNumber) });
   }
+  if (activity.kind === 'post_interval') {
+    const platform = PLATFORM_META[activity.platform]?.label || activity.platform || '—';
+    return t('task.postInterval', {
+      platform,
+      remaining: taskRemainingLabel(activity.remaining_seconds, t, formatNumber),
+    });
+  }
   if (activity.kind !== 'llm_retry') return '';
   const values = {
     attempt: formatNumber(Math.max(0, Number(activity.attempt || 0))),
