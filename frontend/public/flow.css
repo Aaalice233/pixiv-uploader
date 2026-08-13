@@ -134,6 +134,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .flow-log-actions .flow-text-button { display: inline-flex; align-items: center; gap: 6px; }
 .flow-task-list { min-height: calc(100vh - 365px); }
 .flow-task-row { min-height: 108px; padding: 16px 20px 16px 25px; display: grid; grid-template-columns: 92px minmax(170px, .72fr) minmax(300px, 1.45fr) minmax(76px, auto); align-items: center; gap: 20px; transition: background .14s; }
+.flow-task-row.expandable { cursor: pointer; }
+.flow-task-row.expandable .flow-task-controls, .flow-task-row.expandable .flow-task-details { cursor: default; }
 .flow-task-row + .flow-task-row { box-shadow: 0 1px 0 var(--flow-line) inset; }
 .flow-task-row:hover, .flow-task-row.expanded { background: var(--flow-surface-raised); }
 .flow-task-state { display: flex; align-items: center; gap: 8px; color: var(--flow-faint); font-family: var(--flow-mono); font-size: 10px; }

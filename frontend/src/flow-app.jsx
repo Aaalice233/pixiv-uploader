@@ -553,7 +553,11 @@ function TaskRow({ task, expanded, onToggle, onCancel, onRemove, onRetry }) {
   const target = targetIds.length ? targetIds.map(id => PLATFORM_META[id].label).join(' + ') : t('task.target.local');
   const retryable = viewModel.hasStructuredItems ? viewModel.retryableFiles.length > 0 : task.status === 'failed';
   const activityLabel = taskActivityLabel(task, t, formatNumber);
-  return <article className={`flow-task-row ${statusTone} ${expanded ? 'expanded' : ''}`}>
+  const handleRowClick = event => {
+    if (!viewModel.canExpand || event.target.closest('.flow-task-controls, .flow-task-details')) return;
+    onToggle();
+  };
+  return <article className={`flow-task-row ${statusTone} ${viewModel.canExpand ? 'expandable' : ''} ${expanded ? 'expanded' : ''}`} onClick={handleRowClick}>
     <div className={`flow-task-state ${statusTone}`}><i/>{t(`task.status.${task.status}`)}</div>
     <div className="flow-task-copy"><strong>{title}</strong><span>{target} · {task.created_at || t('common.justNow')}</span></div>
     <TaskBatchSummary task={task} viewModel={viewModel}/>
