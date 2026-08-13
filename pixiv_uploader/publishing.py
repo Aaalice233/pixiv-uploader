@@ -1445,6 +1445,83 @@ def _validate_confirmed_pixiv_url(url: str) -> str:
     return f"https://www.pixiv.net/artworks/{artwork_id}"
 
 
+_ITEM_SUCCESS_TARGET_STATUSES = {"success", "skipped_already_done", "skipped_civitai_safety", "dry_run"}
+
+
+def _task_target_results(manifest: dict, targets: list[str]) -> dict[str, dict[str, str]]:
+    results: dict[str, dict[str, str]] = {}
+    statuses = manifest.get("status_by_target") if isinstance(manifest.get("status_by_target"), dict) else {}
+    for target in targets:
+        payload = manifest.get(target) if isinstance(manifest.get(target), dict) else {}
+        status = str(statuses.get(target) or "failed")
+        error_code = str(payload.get("error_code") or "")
+        if not error_code:
+            if status == "failed":
+                error_code = f"{target}_upload_failed"
+            elif status == "canceled":
+                error_code = "task_canceled"
+            elif status == "maybe_posted":
+                error_code = "pixiv_submit_unconfirmed"
+        results[target] = {
+            "status": status,
+            "post_url": str(payload.get("post_url") or "") if status in {"success", "skipped_already_done"} else "",
+            "error_code": error_code,
+        }
+    return results
+
+
+def _task_item_outcome(
+    manifest: dict,
+    targets: list[str],
+    *,
+    source_available: bool,
+    canceled: bool = False,
+) -> dict:
+    target_results = _task_target_results(manifest, targets)
+    status_values = [detail["status"] for detail in target_results.values()]
+    statuses = set(status_values)
+    finalization = manifest.get("finalization") if isinstance(manifest.get("finalization"), dict) else {}
+    if finalization.get("error_code") == "source_archive_failed":
+        status = "failed"
+        reason_code = "source_archive_failed"
+    elif "maybe_posted" in statuses:
+        status = "uncertain"
+        reason_code = next(
+            (detail["error_code"] for detail in target_results.values() if detail["status"] == "maybe_posted"),
+            "pixiv_submit_unconfirmed",
+        )
+    elif canceled or "canceled" in statuses:
+        status = "canceled"
+        reason_code = "task_canceled"
+    else:
+        successful = sum(value in _ITEM_SUCCESS_TARGET_STATUSES for value in status_values)
+        if status_values and successful == len(status_values):
+            if bool(manifest.get("dry_run")) or finalization.get("status") == "archived":
+                status = "succeeded"
+                reason_code = ""
+            else:
+                status = "failed"
+                reason_code = "source_archive_failed"
+        elif successful:
+            status = "partial"
+            reason_code = next(
+                (detail["error_code"] for detail in target_results.values() if detail["error_code"]),
+                "partial_target_failure",
+            )
+        else:
+            status = "failed"
+            reason_code = next(
+                (detail["error_code"] for detail in target_results.values() if detail["error_code"]),
+                "publishing_failed",
+            )
+    return {
+        "item_status": status,
+        "retryable": bool(source_available and status in {"partial", "failed", "canceled"}),
+        "reason_code": reason_code,
+        "targets": target_results,
+    }
+
+
 def cmd_upload(args):
     progress_callback = getattr(args, "progress_callback", None)
     interaction_callback = getattr(args, "interaction_callback", None)
@@ -1498,14 +1575,72 @@ def cmd_upload(args):
         file for file in UPLOAD_DIR.iterdir()
         if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS
     )
-    if not all_images:
+    selected_names = [str(name) for name in (getattr(args, "files", None) or [])]
+    preselected_images: list[Path] | None = None
+    if selected_names:
+        upload_by_name = {file.name.lower(): file for file in all_images}
+        _emit_progress(
+            progress_callback,
+            "items_registered",
+            items=[
+                {"name": name, "retryable": name.lower() in upload_by_name}
+                for name in selected_names
+            ],
+            targets=targets,
+        )
+        missing_names = [name for name in selected_names if name.lower() not in upload_by_name]
+        if missing_names:
+            missing_lookup = {name.lower() for name in missing_names}
+            failed_so_far = 0
+            for item_index, name in enumerate(selected_names, 1):
+                if name.lower() not in missing_lookup:
+                    continue
+                failed_so_far += 1
+                _emit_progress(
+                    progress_callback,
+                    "item_complete",
+                    item_index=item_index,
+                    item_name=name,
+                    item_status="failed",
+                    retryable=False,
+                    reason_code="source_file_missing",
+                    targets={
+                        target: {
+                            "status": "failed",
+                            "post_url": "",
+                            "error_code": "source_file_missing",
+                        }
+                        for target in targets
+                    },
+                    total=len(selected_names),
+                    current=failed_so_far,
+                    succeeded=0,
+                    failed=failed_so_far,
+                    canceled=0,
+                )
+            log.error(f"指定文件已不在 upload/，任务未开始: {missing_names}")
+            return {
+                "status": "missing_files",
+                "reason_code": "source_file_missing",
+                "total": len(selected_names),
+                "processed": len(missing_names),
+                "succeeded": 0,
+                "failed": len(missing_names),
+                "canceled": 0,
+                "unprocessed": len(selected_names) - len(missing_names),
+                "missing_files": missing_names,
+            }
+        preselected_images = [upload_by_name[name.lower()] for name in selected_names]
+    elif not all_images:
         log.info(f"upload/ 目录没有图片。\n  {UPLOAD_DIR}")
         return {
             "status": "no_work",
+            "reason_code": "no_images_available",
             "total": 0,
             "processed": 0,
             "succeeded": 0,
             "failed": 0,
+            "canceled": 0,
             "unprocessed": 0,
         }
 
@@ -1566,34 +1701,18 @@ def cmd_upload(args):
             log.info("自动打码: 未启用（如需放模型到 models/auto_censor.pt + pip install ultralytics opencv-python）")
     _emit_progress(progress_callback, "initializing", stage_progress=0.8)
     sort_mode = getattr(args, "sort", "random")
-    selected_names = [str(name) for name in (getattr(args, "files", None) or [])]
-    if selected_names:
-        upload_by_name = {file.name.lower(): file for file in all_images}
-        missing_names = [name for name in selected_names if name.lower() not in upload_by_name]
-        if missing_names:
-            log.error(f"指定文件已不在 upload/，任务未开始: {missing_names}")
-            _emit_progress(
-                progress_callback,
-                "initializing",
-                stage_progress=1.0,
-                total=len(selected_names),
-                current=len(missing_names),
-                failed=len(missing_names),
-            )
-            return {
-                "status": "missing_files",
-                "total": len(selected_names),
-                "processed": len(missing_names),
-                "succeeded": 0,
-                "failed": len(missing_names),
-                "unprocessed": len(selected_names) - len(missing_names),
-                "missing_files": missing_names,
-            }
-        image_files = [upload_by_name[name.lower()] for name in selected_names]
+    if preselected_images is not None:
+        image_files = preselected_images
     else:
         requested = max(0, int(getattr(args, "count", 0) or 0))
         count = min(requested, len(all_images)) if requested else min(random.randint(1, 5), len(all_images))
         image_files = _select_by_sort(all_images, sort_mode, count)
+        _emit_progress(
+            progress_callback,
+            "items_registered",
+            items=[{"name": image.name, "retryable": True} for image in image_files],
+            targets=targets,
+        )
 
     image_queue = [(image, targets) for image in image_files]
     _emit_progress(
@@ -1626,6 +1745,7 @@ def cmd_upload(args):
     pixiv_rate = None
     pixiv_batch_fatal = False
     pixiv_batch_error_code = ""
+    batch_stop_reason = ""
 
     try:
         if not args.dry_run and "pixiv" in targets:
@@ -1644,6 +1764,7 @@ def cmd_upload(args):
         _cancel_ev = getattr(args, "cancel_event", None)
         for index, (orig_path, effective_targets) in enumerate(image_queue, 1):
             if _cancel_ev and _cancel_ev.is_set():
+                batch_stop_reason = "task_canceled"
                 log.info("收到取消信号，停止上传")
                 break
             def report_image(stage: str, **details) -> None:
@@ -1729,6 +1850,12 @@ def cmd_upload(args):
                     current=index,
                     succeeded=success_count,
                     failed=fail_count,
+                    canceled=canceled_count,
+                    **_task_item_outcome(
+                        manifest,
+                        effective_targets,
+                        source_available=orig_path.exists(),
+                    ),
                 )
                 continue
 
@@ -1753,8 +1880,12 @@ def cmd_upload(args):
                         civitai_url = create_civitai_post(civitai_page, civitai_copy, args.delay, cancel_event=_cancel_ev)
                     except InterruptedError:
                         cancel_requested = True
+                        manifest["civitai"]["error_code"] = "task_canceled"
                         civitai_url = None
                     except Exception as exc:
+                        manifest["civitai"]["error_code"] = str(
+                            getattr(exc, "code", "civitai_upload_failed")
+                        )
                         log.error(f"    Civitai 发布异常: {exc}")
                         log.debug(traceback.format_exc())
                         civitai_url = None
@@ -1765,12 +1896,20 @@ def cmd_upload(args):
                         log.info(f"    Civitai 发布成功: {civitai_url}")
                     elif cancel_requested and manifest["status_by_target"].get("civitai") == "pending":
                         manifest["status_by_target"]["civitai"] = "canceled"
+                        manifest["civitai"]["error_code"] = "task_canceled"
                         manifest["errors"].append("Civitai upload canceled")
                         all_succeeded = False
                     else:
                         manifest["status_by_target"]["civitai"] = "failed"
+                        manifest["civitai"]["error_code"] = str(
+                            manifest["civitai"].get("error_code") or "civitai_upload_failed"
+                        )
                         manifest["errors"].append("Civitai upload failed")
                         all_succeeded = False
+                report_image(
+                    "item_target",
+                    targets=_task_target_results(manifest, ["civitai"]),
+                )
 
             if "pixiv" in effective_targets:
                 pixiv_browser_error = ""
@@ -2132,6 +2271,11 @@ def cmd_upload(args):
                             manifest["errors"].append(error_msg)
                         all_succeeded = False
 
+                report_image(
+                    "item_target",
+                    targets=_task_target_results(manifest, ["pixiv"]),
+                )
+
             write_manifest(manifest_path, manifest)
 
             for target in effective_targets:
@@ -2207,17 +2351,26 @@ def cmd_upload(args):
                 succeeded=success_count,
                 failed=fail_count,
                 canceled=canceled_count,
+                **_task_item_outcome(
+                    manifest,
+                    effective_targets,
+                    source_available=orig_path.exists(),
+                    canceled=cancel_requested,
+                ),
             )
             if pixiv_batch_fatal:
+                batch_stop_reason = pixiv_batch_error_code or "pixiv_batch_stopped"
                 log.error(
-                    f"\nPixiv 队列已安全停止 [{pixiv_batch_error_code or 'pixiv_batch_stopped'}]，"
+                    f"\nPixiv 队列已安全停止 [{batch_stop_reason}]，"
                     "剩余图片与 manifest 保留"
                 )
                 break
             if cancel_requested:
+                batch_stop_reason = "task_canceled"
                 log.info("\n任务已取消，剩余图片与 manifest 保留")
                 break
             if consecutive_failures >= abort_threshold:
+                batch_stop_reason = "consecutive_failures"
                 log.error(f"\n连续 {consecutive_failures} 张失败，中断本次批次（避免触发风控）")
                 break
 
@@ -2256,14 +2409,21 @@ def cmd_upload(args):
 
     processed_count = success_count + fail_count + canceled_count
     unprocessed_count = max(0, len(image_queue) - processed_count)
-    if canceled_count or (getattr(args, "cancel_event", None) and args.cancel_event.is_set()):
+    all_items_succeeded = success_count == len(image_queue) and not fail_count and not canceled_count
+    if all_items_succeeded:
+        status = "success"
+        batch_stop_reason = ""
+    elif canceled_count or (getattr(args, "cancel_event", None) and args.cancel_event.is_set()):
         status = "canceled"
+        batch_stop_reason = batch_stop_reason or "task_canceled"
     elif fail_count or unprocessed_count:
         status = "failed"
+        batch_stop_reason = batch_stop_reason or "publishing_failed"
     else:
         status = "success"
     return {
         "status": status,
+        "reason_code": batch_stop_reason,
         "total": len(image_queue),
         "processed": processed_count,
         "succeeded": success_count,

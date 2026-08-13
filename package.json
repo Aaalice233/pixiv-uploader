@@ -12,8 +12,9 @@
     "build:frontend": "esbuild frontend/src/flow-app.jsx --bundle --outdir=frontend/dist --format=iife --target=chrome100 --tree-shaking=true --minify",
     "watch:frontend": "esbuild frontend/src/flow-app.jsx --bundle --outdir=frontend/dist --format=iife --target=chrome100 --tree-shaking=true --watch",
     "test:i18n": "node --test scripts/test-i18n.mjs",
+    "test:task-view-model": "node --test scripts/test-task-view-model.mjs",
     "check:i18n": "node scripts/check-i18n.mjs && npm run test:i18n",
-    "check:frontend": "npm run check:i18n && npm run build:frontend"
+    "check:frontend": "npm run check:i18n && npm run test:task-view-model && npm run build:frontend"
   },
   "dependencies": {
     "react": "18.3.1",

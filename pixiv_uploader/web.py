@@ -315,12 +315,38 @@ def _task_snapshot(task: dict) -> dict:
     return {key: value for key, value in task.items() if key not in _TASK_PRIVATE_FIELDS}
 
 
+def _plain_file_name(value) -> str:
+    return str(value or "").replace("\x00", "").replace("\\", "/").rsplit("/", 1)[-1][:255]
+
+
+def _progress_item_plan(command: int, params: dict) -> tuple[list[dict], list[str]]:
+    if command not in (2, 3):
+        return [], []
+    names = params.get("files") or []
+    if not isinstance(names, list):
+        return [], []
+    default_targets = "pixiv" if command == 3 else "civitai,pixiv"
+    targets = [
+        part.strip().lower()
+        for part in str(params.get("targets", default_targets)).split(",")
+        if part.strip()
+    ]
+    return [{"name": _plain_file_name(name), "retryable": True} for name in names], targets
+
+
 class _TaskProgressController:
     def __init__(self, task_id: str, command: int, params: dict) -> None:
         with TASKS_LOCK:
             total = int(TASKS.get(task_id, {}).get("total") or 0)
+        planned_items, targets = _progress_item_plan(command, params)
         self._task_id = task_id
-        self._state = TaskProgressState(build_progress_profile(command, params), total=total)
+        self._command = command
+        self._state = TaskProgressState(
+            build_progress_profile(command, params),
+            total=total,
+            items=planned_items if planned_items else None,
+            targets=targets,
+        )
 
     def report(self, stage: str, **details) -> None:
         with TASKS_LOCK:
@@ -332,6 +358,10 @@ class _TaskProgressController:
             activity = task.get("activity") or {}
             if activity.get("kind") == "pixiv_interaction":
                 task["status"] = "waiting_input"
+            elif task.get("status") == "waiting_input":
+                cancel_event = task.get("cancel_event")
+                if not (cancel_event and cancel_event.is_set()):
+                    task["status"] = "running"
             task["count"] = f"{task['current']} / {task['total']}" if task["total"] else "—"
             snap = _task_snapshot(task)
         _broadcast_sse("task_update", snap)
@@ -341,11 +371,10 @@ class _TaskProgressController:
             task = TASKS.get(self._task_id)
             if task is None or task.get("status") in {"done", "failed", "canceled"}:
                 return
+            task.update(self._state.advance(self._state.stage, activity=dict(activity or {})))
             if activity:
-                task["activity"] = dict(activity)
                 task["status"] = "waiting_input"
             else:
-                task["activity"] = {}
                 cancel_event = task.get("cancel_event")
                 if task.get("status") == "waiting_input" and not (cancel_event and cancel_event.is_set()):
                     task["status"] = "running"
@@ -370,20 +399,37 @@ class _TaskProgressController:
                     )
                 )
 
-    def finish(self, status: str) -> None:
+    def finish(self, status: str, *, reason_code: str = "") -> None:
         with TASKS_LOCK:
             task = TASKS.get(self._task_id)
             if task is None:
                 return
-            task.update(self._state.finish(status))
-            task["status"] = status
+            if self._command in (2, 3):
+                upload_dir = SCRIPT_DIR / "upload"
+                try:
+                    available_names = (
+                        [path.name for path in upload_dir.iterdir() if path.is_file()]
+                        if upload_dir.exists()
+                        else []
+                    )
+                except OSError:
+                    available_names = []
+                self._state.reconcile_source_availability(available_names)
+            task.update(self._state.finish(status, reason_code=reason_code))
+            task["status"] = self._state.finished_status or status
             task["count"] = f"{task['current']} / {task['total']}" if task["total"] else "—"
             snap = _task_snapshot(task)
         _broadcast_sse("task_update", snap)
 
 
 def _initial_progress(command: int, params: dict, total: int) -> dict:
-    return TaskProgressState(build_progress_profile(command, params), total=total).snapshot()
+    planned_items, targets = _progress_item_plan(command, params)
+    return TaskProgressState(
+        build_progress_profile(command, params),
+        total=total,
+        items=planned_items if planned_items else None,
+        targets=targets,
+    ).snapshot()
 
 
 def _new_task_record(
@@ -603,12 +649,13 @@ def _run_task_locked(
             result = cmd_upload(args)
             progress.store_result(result)
             _broadcast_sse("images_changed", {})
-            if _is_task_canceled(task_id):
+            result_reason = str(result.get("reason_code") or "") if isinstance(result, dict) else ""
+            if _is_task_canceled(task_id) or (isinstance(result, dict) and result.get("status") == "canceled"):
                 _push_log_line(task_id, "INFO", "worker", "任务已取消")
-                progress.finish("canceled")
+                progress.finish("canceled", reason_code=result_reason or "task_canceled")
                 return
             if isinstance(result, dict) and result.get("status") != "success":
-                progress.finish("failed")
+                progress.finish("failed", reason_code=result_reason or "batch_stopped")
                 return
 
         elif cmd == 4:
@@ -708,13 +755,13 @@ def _run_task_locked(
 
     except InterruptedError:
         _push_log_line(task_id, "INFO", "worker", "任务已取消")
-        progress.finish("canceled")
+        progress.finish("canceled", reason_code="task_canceled")
     except SystemExit as exc:
         _push_log_line(task_id, "ERR", "worker", f"Task exited: {exc}")
-        progress.finish("failed")
+        progress.finish("failed", reason_code="task_exited")
     except Exception as exc:
         _push_log_line(task_id, "ERR", "worker", f"Task error: {exc}")
-        progress.finish("failed")
+        progress.finish("failed", reason_code="unexpected_task_failure")
 
     finally:
         app_logger.removeHandler(sse_handler)
@@ -760,7 +807,7 @@ def api_run(cmd):
         files = params.get("files") or []
         if not isinstance(files, list):
             return _api_error("files_must_be_array", detail="files 必须是数组")
-        normalized_files = [Path(str(name)).name for name in files]
+        normalized_files = [_plain_file_name(name) for name in files]
         if any(Path(name).suffix.lower() not in UPLOAD_IMAGE_SUFFIXES for name in normalized_files):
             return _api_error("unsupported_file_in_list", detail="files 中包含不支持的图片格式")
         params["targets"] = targets
@@ -807,16 +854,10 @@ def api_run(cmd):
     try:
         t.start()
     except Exception as exc:
-        with TASKS_LOCK:
-            failed_task = TASKS.get(task_id)
-            if failed_task is task:
-                failed_task["status"] = "failed"
-                failed_task["activity"] = {}
-                failed_snapshot = _task_snapshot(failed_task)
-            else:
-                failed_snapshot = None
-        if failed_snapshot is not None:
-            _broadcast_sse("task_update", failed_snapshot)
+        _TaskProgressController(task_id, cmd, params).finish(
+            "failed",
+            reason_code="task_start_failed",
+        )
         return _api_error("task_start_failed", 500, detail=str(exc), reason=str(exc))
     return jsonify({"task_id": task_id})
 

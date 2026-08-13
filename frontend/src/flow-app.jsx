@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { I18nProvider, localizedError, requestLocale, useI18n } from './i18n.jsx';
+import { ITEM_STATUS_META, TARGET_STATUS_META, taskViewModel } from './task-view-model.js';
 
 const THEME_KEY = 'flow-theme-v2';
 const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'];
@@ -501,65 +502,130 @@ function taskActivityLabel(task, t, formatNumber) {
   return key ? t(key, values) : '';
 }
 
-function TaskRow({ task, onCancel, onRemove, onRetry }) {
+function taskReasonLabel(reasonCode, t) {
+  if (!reasonCode) return '';
+  const key = `task.reason.${reasonCode}`;
+  const localized = t(key);
+  return localized === key ? t('task.reason.withCode', { code: reasonCode }) : `${localized} · ${reasonCode}`;
+}
+
+function TaskTargetBadge({ platform, detail, expanded }) {
+  const { t } = useI18n();
+  const meta = TARGET_STATUS_META[detail.status] || TARGET_STATUS_META.failed;
+  const platformLabel = PLATFORM_META[platform]?.label || platform;
+  const content = <><b>{platformLabel}</b><span>{t(meta.labelKey)}</span>{detail.postUrl && <Icon name="link" size={12}/>}</>;
+  return detail.postUrl
+    ? <a className={`flow-task-target ${meta.tone}`} href={detail.postUrl} target="_blank" rel="noopener noreferrer" tabIndex={expanded ? 0 : -1} aria-label={t('task.openPost', { platform: platformLabel })}>{content}</a>
+    : <span className={`flow-task-target ${meta.tone}`}>{content}</span>;
+}
+
+function TaskItemDetails({ task, viewModel, expanded, activityLabel }) {
   const { formatNumber, t } = useI18n();
-  const statusTone = { queued: 'idle', running: 'running', done: 'done', failed: 'failed', canceled: 'canceled', waiting_input: 'waiting' }[task.status] || 'idle';
-  const rawProgress = Math.max(0, Math.min(1, Number(task.progress || 0)));
+  const regionId = `task-items-${task.id}`;
+  return <div id={regionId} className={`flow-task-details ${expanded ? 'expanded' : ''}`} aria-hidden={!expanded}>
+    <div className="flow-task-details-inner">
+      <div className="flow-task-item-list">
+        {viewModel.items.map(item => {
+          const meta = ITEM_STATUS_META[item.status];
+          const runningText = item.status === 'running'
+            ? activityLabel || `${taskStageLabel({ stage: item.stage }, t)} · ${formatNumber(Math.round(item.stageProgress * 100))}%`
+            : t(`task.itemStatus.${item.status}`);
+          const reason = ['failed', 'partial', 'uncertain', 'canceled', 'unprocessed'].includes(item.status)
+            ? taskReasonLabel(item.reasonCode, t)
+            : '';
+          return <div key={`${item.index}-${item.name}`} className={`flow-task-item ${meta.tone} ${item.status === 'running' ? 'current' : ''}`}>
+            <span className="flow-task-item-index"><i aria-hidden="true">{meta.icon}</i>{formatNumber(item.index)}</span>
+            <div className="flow-task-item-copy"><strong title={item.name}>{item.name}</strong><span>{runningText}{reason && ` · ${reason}`}</span></div>
+            <div className="flow-task-targets">{Object.entries(item.targets).map(([platform, detail]) => <TaskTargetBadge key={platform} platform={platform} detail={detail} expanded={expanded}/>)}</div>
+          </div>;
+        })}
+      </div>
+    </div>
+  </div>;
+}
+
+function TaskBatchSummary({ task, viewModel }) {
+  const { formatNumber, t } = useI18n();
+  const progressNumber = Number(task.progress || 0);
+  const rawProgress = Number.isFinite(progressNumber) ? Math.max(0, Math.min(1, progressNumber)) : 0;
   const visualProgress = task.status === 'done' ? 100 : Math.min(99, rawProgress * 100);
   const displayProgress = task.status === 'done' ? 100 : Math.min(99, Math.floor(rawProgress * 100));
-  const total = Math.max(0, Number(task.total || task.params?.files?.length || 0));
-  const current = Math.max(0, Math.min(total || Number.MAX_SAFE_INTEGER, Number(task.current || 0)));
-  const itemIndex = Math.max(0, Math.min(total || Number.MAX_SAFE_INTEGER, Number(task.item_index || 0)));
-  const stageIndex = Math.max(0, Number(task.stage_index || 0));
-  const stageCount = Math.max(0, Number(task.stage_count || 0));
   const stageLabel = taskStageLabel(task, t);
+  const activityLabel = taskActivityLabel(task, t, formatNumber);
+  const { total, processed, succeeded, failed, canceled } = viewModel.summary;
+  const itemIndexNumber = Number(task.item_index || viewModel.activeItem?.index || 0);
+  const itemIndex = Number.isFinite(itemIndexNumber) ? Math.max(0, Math.min(total || Number.MAX_SAFE_INTEGER, itemIndexNumber)) : 0;
+  const itemName = task.item_name || viewModel.activeItem?.name || '';
+  const active = ACTIVE_TASK_STATUSES.has(task.status) && itemIndex > 0 && total > 0;
+  const stageProgress = Number(task.stage_progress || 0);
+  const stagePercent = Math.round((Number.isFinite(stageProgress) ? Math.max(0, Math.min(1, stageProgress)) : 0) * 100);
+  const currentLabel = active
+    ? t('task.progress.current', { current: formatNumber(itemIndex), total: formatNumber(total), name: itemName, stage: stageLabel, percent: formatNumber(stagePercent) })
+    : stageLabel;
+  const summaryLabel = [
+    total ? t('task.progress.completed', { current: formatNumber(processed), total: formatNumber(total) }) : t('task.progress.preparing'),
+    t('task.progress.succeeded', { count: formatNumber(succeeded) }),
+    t('task.progress.failed', { count: formatNumber(failed) }),
+    t('task.progress.canceled', { count: formatNumber(canceled) }),
+  ].join(' · ');
+  const overallLabel = t('task.progress.overall', { percent: formatNumber(displayProgress) });
+  return <div className="flow-task-progress">
+    <div className="flow-task-stage"><strong title={currentLabel}>{currentLabel}</strong><span>{overallLabel}</span></div>
+    <div className={`flow-task-meter ${task.status === 'running' ? 'active' : ''}`} role="progressbar" aria-label={t('task.progress.batchAria')} aria-valuemin="0" aria-valuemax="100" aria-valuenow={displayProgress} aria-valuetext={`${overallLabel} · ${summaryLabel}`}><i style={{ width: `${visualProgress}%` }}/></div>
+    {activityLabel && <div className="flow-task-activity" role="status">{activityLabel}</div>}
+    <div className="flow-task-outcomes">{summaryLabel}</div>
+  </div>;
+}
+
+function TaskRow({ task, expanded, onToggle, onCancel, onRemove, onRetry }) {
+  const { formatNumber, t } = useI18n();
+  const viewModel = useMemo(() => taskViewModel(task), [task]);
+  const statusTone = { queued: 'idle', running: 'running', done: 'done', failed: 'failed', canceled: 'canceled', waiting_input: 'waiting' }[task.status] || 'idle';
   const commandKey = `task.command.${task.cmd}`;
-  const title = [2, 3].includes(Number(task.cmd)) && total
-    ? t(`${commandKey}.count`, { count: total })
+  const title = [2, 3].includes(Number(task.cmd)) && viewModel.summary.total
+    ? t(`${commandKey}.count`, { count: viewModel.summary.total })
     : t(commandKey);
   const targetIds = String(task.params?.targets || (task.cmd === 3 ? 'pixiv' : '')).split(',').filter(id => PLATFORM_META[id]);
   const target = targetIds.length ? targetIds.map(id => PLATFORM_META[id].label).join(' + ') : t('task.target.local');
-  const imagePosition = itemIndex && total
-    ? t('task.progress.imagePosition', { current: formatNumber(itemIndex), total: formatNumber(total) })
-    : total
-      ? t('task.progress.totalImages', { total: formatNumber(total) })
-      : '';
-  const itemDetail = task.item_name || (total
-    ? t('task.progress.completed', { current: formatNumber(current), total: formatNumber(total) })
-    : t('task.progress.preparing'));
+  const retryable = viewModel.hasStructuredItems ? viewModel.retryableFiles.length > 0 : task.status === 'failed';
   const activityLabel = taskActivityLabel(task, t, formatNumber);
-  const overallLabel = t('task.progress.overall', { percent: formatNumber(displayProgress) });
-  const progressAriaLabel = [stageLabel, imagePosition, overallLabel].filter(Boolean).join(' · ');
-  const outcomeParts = [];
-  if (total) outcomeParts.push(t('task.progress.completed', { current: formatNumber(current), total: formatNumber(total) }));
-  if (Number(task.succeeded || 0)) outcomeParts.push(t('task.progress.succeeded', { count: formatNumber(task.succeeded) }));
-  if (Number(task.failed || 0)) outcomeParts.push(t('task.progress.failed', { count: formatNumber(task.failed) }));
-  if (Number(task.canceled || 0)) outcomeParts.push(t('task.progress.canceled', { count: formatNumber(task.canceled) }));
-  return <article className={`flow-task-row ${statusTone}`}>
+  return <article className={`flow-task-row ${statusTone} ${expanded ? 'expanded' : ''}`}>
     <div className={`flow-task-state ${statusTone}`}><i/>{t(`task.status.${task.status}`)}</div>
     <div className="flow-task-copy"><strong>{title}</strong><span>{target} · {task.created_at || t('common.justNow')}</span></div>
-    <div className="flow-task-progress">
-      <div className="flow-task-stage"><div className="flow-task-stage-heading"><strong>{stageLabel}</strong>{imagePosition && <span className="flow-task-image-position">{imagePosition}</span>}</div><span>{overallLabel}</span></div>
-      <div className={`flow-task-meter ${task.status === 'running' ? 'active' : ''}`} role="progressbar" aria-label={stageLabel} aria-valuemin="0" aria-valuemax="100" aria-valuenow={displayProgress} aria-valuetext={progressAriaLabel}><i style={{ width: `${visualProgress}%` }}/></div>
-      <div className="flow-task-progress-meta"><span>{stageIndex && stageCount ? `${t('task.progress.stage', { current: formatNumber(stageIndex), total: formatNumber(stageCount) })} · ` : ''}{itemDetail}</span>{activityLabel && <span className="flow-task-activity">{activityLabel}</span>}{outcomeParts.length > 0 && <span>{outcomeParts.join(' · ')}</span>}</div>
+    <TaskBatchSummary task={task} viewModel={viewModel}/>
+    <div className="flow-task-controls">
+      {viewModel.canExpand && <IconButton icon="chevron" className={`flow-task-expand ${expanded ? 'expanded' : ''}`} label={t(expanded ? 'task.collapseItems' : 'task.expandItems')} aria-expanded={expanded} aria-controls={`task-items-${task.id}`} onClick={onToggle}/>}
+      {!ACTIVE_TASK_STATUSES.has(task.status) && retryable && <IconButton icon="refresh" label={viewModel.hasStructuredItems ? t('task.retryUnsuccessful') : t('task.retry')} onClick={() => onRetry(task)}/>}
+      {ACTIVE_TASK_STATUSES.has(task.status) ? <IconButton icon="pause" label={t('task.cancel')} onClick={() => onCancel(task.id)}/> : <IconButton icon="x" label={t('task.remove')} onClick={() => onRemove(task.id)}/>}
     </div>
-    <div className="flow-task-controls">{task.status === 'failed' && <IconButton icon="refresh" label={t('task.retry')} onClick={() => onRetry(task)}/>} {(task.status === 'running' || task.status === 'queued' || task.status === 'waiting_input') ? <IconButton icon="pause" label={t('task.cancel')} onClick={() => onCancel(task.id)}/> : <IconButton icon="x" label={t('task.remove')} onClick={() => onRemove(task.id)}/>}</div>
+    {viewModel.canExpand && <TaskItemDetails task={task} viewModel={viewModel} expanded={expanded} activityLabel={activityLabel}/>}
   </article>;
 }
 
 function TaskCenter({ tasks, onCancel, onRemove, onRetry }) {
   const { formatNumber, t } = useI18n();
   const [filter, setFilter] = useState('all');
+  const [expandedTasks, setExpandedTasks] = useState(() => new Set());
   const workflowTasks = useMemo(() => tasks.filter(task => !isMaintenanceTask(task)), [tasks]);
-  const sortedTasks = useMemo(() => [...workflowTasks].sort((a, b) => {
-    const rank = { running: 0, waiting_input: 1, queued: 2, failed: 3, done: 4, canceled: 5 };
-    return (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || String(b.created_at || '').localeCompare(String(a.created_at || ''));
-  }), [workflowTasks]);
+  useEffect(() => {
+    const ids = new Set(workflowTasks.map(task => task.id));
+    setExpandedTasks(previous => {
+      const next = new Set([...previous].filter(id => ids.has(id)));
+      const changed = next.size !== previous.size || [...next].some(id => !previous.has(id));
+      return changed ? next : previous;
+    });
+  }, [workflowTasks]);
+  const sortedTasks = useMemo(() => [...workflowTasks].reverse(), [workflowTasks]);
   const visibleTasks = sortedTasks.filter(task => filter === 'all' || (filter === 'active' ? ACTIVE_TASK_STATUSES.has(task.status) : task.status === filter));
   const activeCount = workflowTasks.filter(task => ACTIVE_TASK_STATUSES.has(task.status)).length;
+  const toggleTask = id => setExpandedTasks(previous => {
+    const next = new Set(previous);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
   return <section className="flow-workbench flow-page-panel">
     <header className="flow-page-toolbar"><div className="flow-page-summary"><Icon name="queue" size={17}/><span>{t('task.centerSummary', { total: formatNumber(workflowTasks.length), active: formatNumber(activeCount) })}</span></div><div className="flow-segmented task-filters" role="group" aria-label={t('task.filterLabel')}>{['all','active','failed'].map(id => <button key={id} aria-pressed={filter === id} className={filter === id ? 'active' : ''} onClick={() => setFilter(id)}>{t(`task.filter.${id}`)}</button>)}</div></header>
-    <div className="flow-task-list">{visibleTasks.length ? visibleTasks.map(task => <TaskRow key={task.id} task={task} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{workflowTasks.length ? t('task.filterEmpty') : t('task.emptyTitle')}</strong><span>{workflowTasks.length ? t('task.filterEmptyHint') : t('task.emptyHint')}</span></div>}</div>
+    <div className="flow-task-list">{visibleTasks.length ? visibleTasks.map(task => <TaskRow key={task.id} task={task} expanded={expandedTasks.has(task.id)} onToggle={() => toggleTask(task.id)} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{workflowTasks.length ? t('task.filterEmpty') : t('task.emptyTitle')}</strong><span>{workflowTasks.length ? t('task.filterEmptyHint') : t('task.emptyHint')}</span></div>}</div>
   </section>;
 }
 
@@ -1141,7 +1207,20 @@ function FlowConsoleApp() {
   }
   async function cancelTask(id) { try { await api(`/api/tasks/${id}/cancel`, { method: 'POST' }); notify(t('task.cancelNotice')); } catch (error) { notify(localizedError(error, t), 'error'); } }
   async function removeTask(id) { try { await api(`/api/tasks/${id}/remove`, { method: 'POST' }); } catch (error) { notify(localizedError(error, t), 'error'); } }
-  async function retryTask(task) { try { await runTask(task.cmd, task.params || {}); } catch (error) { notify(localizedError(error, t), 'error'); } }
+  async function retryTask(task) {
+    try {
+      const viewModel = taskViewModel(task);
+      if (viewModel.hasStructuredItems) {
+        if (!viewModel.retryableFiles.length) {
+          notify(t('task.noRetryableItems'), 'error');
+          return;
+        }
+        await runTask(task.cmd, { ...(task.params || {}), files: viewModel.retryableFiles });
+        return;
+      }
+      await runTask(task.cmd, task.params || {});
+    } catch (error) { notify(localizedError(error, t), 'error'); }
+  }
   async function openFolder() { try { await api('/api/open-folder'); } catch (error) { notify(localizedError(error, t), 'error'); } }
   async function submitInput(answer) { try { await api(`/api/tasks/${inputRequest.task_id}/resume`, jsonOptions('POST', { answer })); setInputRequest(null); } catch (error) { notify(localizedError(error, t), 'error'); } }
   async function startSplit(posts) {

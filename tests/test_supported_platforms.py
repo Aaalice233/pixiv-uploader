@@ -101,7 +101,10 @@ class PlatformApiTests(unittest.TestCase):
 
     def test_task_payload_exposes_structured_image_progress(self) -> None:
         with patch.object(self.web_server.threading.Thread, "start"):
-            response = self.client.post("/api/run/2", json={"targets": "pixiv", "files": ["example.png"]})
+            response = self.client.post(
+                "/api/run/2",
+                json={"targets": "pixiv", "files": [r"C:\private\example.png"]},
+            )
 
         self.assertEqual(response.status_code, 200)
         task_id = response.get_json()["task_id"]
@@ -110,7 +113,7 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(task["total"], 1)
         self.assertEqual(task["cmd"], 2)
         self.assertEqual(task["category"], "workflow")
-        self.assertEqual(task["progress_version"], 3)
+        self.assertEqual(task["progress_version"], 4)
         self.assertEqual(task["progress"], 0.0)
         self.assertEqual(task["stage"], "queued")
         self.assertEqual(task["stage_label"], "等待执行")
@@ -120,6 +123,12 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(task["succeeded"], 0)
         self.assertEqual(task["failed"], 0)
         self.assertEqual(task["canceled"], 0)
+        self.assertEqual(len(task["items"]), 1)
+        self.assertEqual(task["params"]["files"], ["example.png"])
+        self.assertEqual(task["items"][0]["name"], "example.png")
+        self.assertEqual(task["items"][0]["status"], "queued")
+        self.assertNotIn("source_path", task["items"][0])
+        self.assertNotIn("private", str(task["items"][0]))
 
     def test_maintenance_commands_are_classified_outside_workflow_tasks(self) -> None:
         with patch.object(self.web_server.threading.Thread, "start"):
