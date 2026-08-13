@@ -566,7 +566,7 @@ function TaskRow({ task, expanded, onToggle, onCancel, onRemove, onRetry }) {
   </article>;
 }
 
-function WorkspaceTaskSection({ tasks, onCancel, onRemove, onRetry, onCreate }) {
+function WorkspaceTaskSection({ tasks, onCancel, onRemove, onRetry }) {
   const { formatNumber, t } = useI18n();
   const [filter, setFilter] = useState('all');
   const [expandedTasks, setExpandedTasks] = useState(() => new Set());
@@ -589,7 +589,7 @@ function WorkspaceTaskSection({ tasks, onCancel, onRemove, onRetry, onCreate }) 
   });
   return <section className="flow-workbench workspace-task-section">
     <header className="flow-page-toolbar"><div className="flow-page-summary"><Icon name="queue" size={17}/><span>{t('task.centerSummary', { total: formatNumber(workflowTasks.length), active: formatNumber(activeCount) })}</span></div><div className="flow-segmented task-filters" role="group" aria-label={t('task.filterLabel')}>{['all','active','failed'].map(id => <button key={id} aria-pressed={filter === id} className={filter === id ? 'active' : ''} onClick={() => setFilter(id)}>{t(`task.filter.${id}`)}</button>)}</div></header>
-    <div className="flow-task-list">{visibleTasks.length ? visibleTasks.map(task => <TaskRow key={task.id} task={task} expanded={expandedTasks.has(task.id)} onToggle={() => toggleTask(task.id)} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{workflowTasks.length ? t('task.filterEmpty') : t('task.emptyTitle')}</strong><span>{workflowTasks.length ? t('task.filterEmptyHint') : t('task.emptyHint')}</span>{!workflowTasks.length && <Button variant="primary" icon="upload" onClick={onCreate}>{t('nav.createPublish')}</Button>}</div>}</div>
+    <div className="flow-task-list">{visibleTasks.length ? visibleTasks.map(task => <TaskRow key={task.id} task={task} expanded={expandedTasks.has(task.id)} onToggle={() => toggleTask(task.id)} onCancel={onCancel} onRemove={onRemove} onRetry={onRetry}/>) : <div className="flow-workbench-empty"><Icon name="queue" size={25}/><strong>{workflowTasks.length ? t('task.filterEmpty') : t('task.emptyTitle')}</strong><span>{workflowTasks.length ? t('task.filterEmptyHint') : t('task.emptyHint')}</span></div>}</div>
   </section>;
 }
 
@@ -1046,7 +1046,22 @@ function SystemSettings({ status, tasks, connected, onStart, onCancel, onNavigat
 
 function SettingsPage({ tab, onTabChange, status, scheduler, llmConfig, llmPlatformSpecs, theme, setTheme, reloadStatus, setScheduler, setLlmConfig, notify, tasks, connected, onMaintenance, onCancel, onNavigate }) {
   const { t } = useI18n();
-  return <section className="settings-shell"><div className="settings-layout"><nav aria-label={t('settings.sections')}><div>{SETTINGS_NAV.map(([id,icon]) => <button aria-current={tab === id ? 'page' : undefined} aria-pressed={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => onTabChange(id)}><Icon name={icon}/><span>{t(`settings.tab.${id}`)}</span></button>)}</div></nav><div className="settings-main"><div key={tab} className="settings-page-transition">{tab === 'general' && <GeneralSettings status={status} theme={theme} setTheme={setTheme} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'pixiv' && <PixivSettings status={status} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'llm' && <LlmSettings initialConfig={llmConfig} platformSpecs={llmPlatformSpecs} onSaved={setLlmConfig} notify={notify}/>} {tab === 'scheduler' && <SchedulerSettings scheduler={scheduler} onChanged={setScheduler} llmConfig={llmConfig} notify={notify}/>} {tab === 'system' && <SystemSettings status={status} tasks={tasks} connected={connected} onStart={onMaintenance} onCancel={onCancel} onNavigate={onNavigate} reloadStatus={reloadStatus}/>}</div></div></div></section>;
+  const shellRef = useRef(null);
+  const navRef = useRef(null);
+  const mainRef = useRef(null);
+  useEffect(() => {
+    mainRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    const activeTab = navRef.current?.querySelector('[aria-current="page"]');
+    if (activeTab && navRef.current.scrollWidth > navRef.current.clientWidth) {
+      const left = activeTab.offsetLeft - (navRef.current.clientWidth - activeTab.offsetWidth) / 2;
+      navRef.current.scrollTo({ left: Math.max(0, left), behavior: 'auto' });
+    }
+    if (window.matchMedia('(max-width: 700px)').matches && shellRef.current) {
+      const shellTop = shellRef.current.getBoundingClientRect().top + window.scrollY;
+      window.scrollTo({ top: Math.max(0, shellTop - 68), behavior: 'auto' });
+    }
+  }, [tab]);
+  return <section ref={shellRef} className="settings-shell"><div className="settings-layout"><nav ref={navRef} aria-label={t('settings.sections')}><div>{SETTINGS_NAV.map(([id,icon]) => <button aria-current={tab === id ? 'page' : undefined} aria-pressed={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => onTabChange(id)}><Icon name={icon}/><span>{t(`settings.tab.${id}`)}</span></button>)}</div></nav><div ref={mainRef} className="settings-main"><div key={tab} className="settings-page-transition">{tab === 'general' && <GeneralSettings status={status} theme={theme} setTheme={setTheme} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'pixiv' && <PixivSettings status={status} notify={notify} reloadStatus={reloadStatus}/>} {tab === 'llm' && <LlmSettings initialConfig={llmConfig} platformSpecs={llmPlatformSpecs} onSaved={setLlmConfig} notify={notify}/>} {tab === 'scheduler' && <SchedulerSettings scheduler={scheduler} onChanged={setScheduler} llmConfig={llmConfig} notify={notify}/>} {tab === 'system' && <SystemSettings status={status} tasks={tasks} connected={connected} onStart={onMaintenance} onCancel={onCancel} onNavigate={onNavigate} reloadStatus={reloadStatus}/>}</div></div></div></section>;
 }
 
 function Sidebar({ status, page, activeTaskCount, onNavigate, mobileOpen, setMobileOpen }) {
@@ -1124,6 +1139,8 @@ function FlowConsoleApp() {
   useEffect(() => {
     const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
     window.scrollTo({ top: 0, behavior });
+  }, [route.page]);
+  useEffect(() => {
     pageHeading.current?.focus({ preventScroll: true });
   }, [route.page, route.settingsTab]);
   function dismissToast(id) { setToasts(previous => previous.filter(toast => toast.id !== id)); clearTimeout(toastTimers.current.get(id)); toastTimers.current.delete(id); }
@@ -1193,8 +1210,8 @@ function FlowConsoleApp() {
     {mobileOpen && <button className="mobile-menu-scrim" aria-label={t('nav.closeMenu')} onClick={() => setMobileOpen(false)}/>}
     <main className="app-main">
       <header className="app-topbar"><div><h1 ref={pageHeading} tabIndex={-1}>{t(`page.${route.page}`)}</h1><span className={connected ? 'connected' : ''}><i/>{connected ? t('app.connected') : t('app.reconnecting')}</span></div><span className="app-version">v{status.version || t('common.notAvailable')}</span></header>
-      <div className="app-content"><div key={route.page} className="app-page">
-        {route.page === 'workspace' && <><QuickPublish images={images} scheduler={scheduler} onPublish={() => setDialog('publish')} onOpenFolder={openFolder} onOpenScheduler={() => navigate('settings', 'scheduler')}/><WorkspaceTaskSection tasks={tasks} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask} onCreate={() => setDialog('publish')}/></>}
+      <div className={`app-content ${route.page === 'settings' ? 'settings-content' : ''}`}><div key={route.page} className="app-page">
+        {route.page === 'workspace' && <><QuickPublish images={images} scheduler={scheduler} onPublish={() => setDialog('publish')} onOpenFolder={openFolder} onOpenScheduler={() => navigate('settings', 'scheduler')}/><WorkspaceTaskSection tasks={tasks} onCancel={cancelTask} onRemove={removeTask} onRetry={retryTask}/></>}
         {route.page === 'logs' && <ActivityLog logs={logs} clearLogs={() => setLogs([])} notify={notify}/>}
         {route.page === 'settings' && <SettingsPage tab={route.settingsTab} onTabChange={tab => navigate('settings', tab)} status={status} scheduler={scheduler} llmConfig={llmConfig} llmPlatformSpecs={llmPlatformSpecs} theme={theme} setTheme={setTheme} reloadStatus={reloadStatus} setScheduler={setScheduler} setLlmConfig={setLlmConfig} notify={notify} tasks={tasks} connected={connected} onMaintenance={startMaintenance} onCancel={cancelTask} onNavigate={navigate}/>}
       </div></div>
