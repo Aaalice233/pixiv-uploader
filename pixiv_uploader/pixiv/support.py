@@ -21,6 +21,7 @@ from urllib.parse import quote, urlparse
 import httpx
 from PIL import Image
 
+from ..humanize import HumanSession, HumanTypingError, is_browser_closed_exception
 from ..paths import PROJECT_ROOT
 from ..runtime import ensure_runtime_layout
 from .session import (
@@ -1927,6 +1928,74 @@ def ensure_pixiv_logged_in(
         )
 
 
+def warm_up_pixiv_session(
+    page,
+    human: HumanSession | None = None,
+    *,
+    cancel_event=None,
+) -> None:
+    """批次首次投稿前的拟人热身：先像真人一样浏览首页，再进入投稿流程。
+
+    避免“打开浏览器 → 直奔投稿页 → 秒填表单”的机械行为序列。
+    热身失败不阻断投稿；浏览器关闭与取消原样透传。
+    """
+    session = _session_for(page, human, cancel_event)
+    try:
+        log.info("    pixiv: 会话热身，先浏览首页再进入投稿页")
+        safe_goto(
+            page,
+            f"{PIXIV_BASE}/",
+            wait=session.rng.uniform(2.0, 4.0),
+            cancel_event=cancel_event,
+        )
+        session.mouse.scroll(page, session.rng.uniform(600, 2400), cancel_event=cancel_event)
+        session.paced_sleep(session.rng.uniform(2.0, 6.0))
+        if session.rng.random() < 0.5:
+            session.mouse.scroll(page, -session.rng.uniform(300, 900), cancel_event=cancel_event)
+            session.paced_sleep(session.rng.uniform(1.0, 4.0))
+        session.paced_sleep(session.rng.uniform(2.0, 8.0))
+        session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.6)
+    except InterruptedError:
+        raise
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        log.warning("    pixiv: 会话热身浏览失败（继续投稿）: %s: %s", type(exc).__name__, exc)
+
+
+def pixiv_browse_transition(
+    page,
+    human: HumanSession | None = None,
+    *,
+    cancel_event=None,
+    artwork_url: str | None = None,
+) -> bool:
+    """相邻投稿之间的低概率浏览过渡（首页或刚发布的作品页），返回是否执行。
+
+    避免“上一篇投稿完成 → 立即打开投稿页”的机械节奏。过渡失败不阻断投稿。
+    """
+    session = _session_for(page, human, cancel_event)
+    if session.rng.random() >= 0.15:
+        return False
+    target = artwork_url or f"{PIXIV_BASE}/"
+    try:
+        log.info("    pixiv: 投稿间浏览过渡: %s", target)
+        safe_goto(
+            page,
+            target,
+            wait=session.rng.uniform(2.0, 5.0),
+            cancel_event=cancel_event,
+        )
+        if session.rng.random() < 0.5:
+            session.mouse.scroll(page, session.rng.uniform(400, 1600), cancel_event=cancel_event)
+        session.paced_sleep(session.rng.uniform(3.0, 10.0))
+    except InterruptedError:
+        raise
+    except Exception as exc:
+        _raise_if_browser_closed_exception(exc)
+        log.warning("    pixiv: 浏览过渡失败（继续投稿）: %s: %s", type(exc).__name__, exc)
+    return True
+
+
 def _collect_artwork_urls_from_page(page, max_items: int) -> list[str]:
     urls = []
     seen = set()
@@ -1948,7 +2017,7 @@ def _collect_artwork_urls_from_page(page, max_items: int) -> list[str]:
             if len(urls) >= max_items:
                 return urls
         try:
-            page.mouse.wheel(0, 2400)
+            HumanSession(page).mouse.scroll(page, 2400)
         except Exception:
             pass
         time.sleep(1.2)
@@ -2894,64 +2963,24 @@ def _jsleep(base: float, jitter: float = 0.4, cancel_event=None) -> None:
     _sleep_with_cancel(max(0.05, base + delta), cancel_event)
 
 
-def _typing_delay() -> int:
-    """Per-character typing delay in ms, randomized 25-75."""
-    return random.randint(25, 75)
+def _session_for(page, human: HumanSession | None, cancel_event=None) -> HumanSession:
+    """返回调用方传入的拟人化会话；未传时按页面临时创建一个（行为指纹不再跨调用一致）。"""
+    if human is not None:
+        return human
+    return HumanSession(page, cancel_event=cancel_event)
 
 
-def _human_move_and_click(page, locator, *, cancel_event=None) -> None:
-    """Move mouse along a bezier curve to the element, then click."""
-    if cancel_event is not None and cancel_event.is_set():
-        raise InterruptedError("task canceled")
-    try:
-        box = locator.bounding_box(timeout=3000)
-    except Exception as exc:
-        _raise_if_browser_closed_exception(exc)
-        box = None
-    if not box:
-        locator.click()
-        return
-    target_x = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
-    target_y = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
-    try:
-        current = page.evaluate(
-            "() => ({x: window._lastMouseX || 640, y: window._lastMouseY || 360})"
-        )
-        cx, cy = current["x"], current["y"]
-    except Exception as exc:
-        _raise_if_browser_closed_exception(exc)
-        cx, cy = 640.0, 360.0
-    steps = random.randint(15, 30)
-    cp1x = cx + (target_x - cx) * 0.3 + random.uniform(-50, 50)
-    cp1y = cy + (target_y - cy) * 0.3 + random.uniform(-30, 30)
-    cp2x = cx + (target_x - cx) * 0.7 + random.uniform(-30, 30)
-    cp2y = cy + (target_y - cy) * 0.7 + random.uniform(-20, 20)
-    for i in range(steps + 1):
-        t = i / steps
-        x = (1 - t) ** 3 * cx + 3 * (1 - t) ** 2 * t * cp1x + 3 * (1 - t) * t ** 2 * cp2x + t ** 3 * target_x
-        y = (1 - t) ** 3 * cy + 3 * (1 - t) ** 2 * t * cp1y + 3 * (1 - t) * t ** 2 * cp2y + t ** 3 * target_y
-        page.mouse.move(x, y)
-        time.sleep(random.uniform(0.005, 0.02))
-    page.evaluate(
-        f"() => {{ window._lastMouseX = {target_x}; window._lastMouseY = {target_y}; }}"
+def _human_move_and_click(page, locator, *, cancel_event=None, human: HumanSession | None = None) -> None:
+    """沿拟人轨迹移动鼠标到元素并点击；取不到位置时回退直接点击。"""
+    _session_for(page, human, cancel_event).mouse.click_locator(
+        page, locator, cancel_event=cancel_event
     )
-    time.sleep(random.uniform(0.05, 0.15))
-    page.mouse.click(target_x, target_y)
 
 
 def _is_browser_closed_exception(exc: BaseException) -> bool:
     if isinstance(exc, PixivBrowserClosedError):
         return True
-    message = str(exc).lower()
-    return type(exc).__name__ == "TargetClosedError" or any(
-        marker in message
-        for marker in (
-            "target page, context or browser has been closed",
-            "page has been closed",
-            "browser has been closed",
-            "context has been closed",
-        )
-    )
+    return is_browser_closed_exception(exc)
 
 
 def _raise_if_browser_closed_exception(exc: BaseException) -> None:
@@ -2988,12 +3017,12 @@ def _first_visible_locator(page, selectors: list[str]):
     return None
 
 
-def _click_first(page, selectors: list[str], cancel_event=None) -> bool:
+def _click_first(page, selectors: list[str], cancel_event=None, human: HumanSession | None = None) -> bool:
     locator = _first_visible_locator(page, selectors)
     if locator is None:
         return False
     try:
-        _human_move_and_click(page, locator, cancel_event=cancel_event)
+        _human_move_and_click(page, locator, cancel_event=cancel_event, human=human)
         return True
     except Exception as exc:
         _raise_if_browser_closed_exception(exc)
@@ -3038,28 +3067,37 @@ def _capture_failure(page, log_dir: Path | None, step_name: str) -> str:
         return ""
 
 
-def _fill_if_found(page, name: str, selectors: list[str], value: str, cancel_event=None) -> PixivStep:
+def _fill_if_found(page, name: str, selectors: list[str], value: str, cancel_event=None, human: HumanSession | None = None) -> PixivStep:
     locator = _first_visible_locator(page, selectors)
     if locator is None:
         return PixivStep(name, False, "selector_miss", f"none of: {selectors}")
+    session = _session_for(page, human, cancel_event)
     try:
-        _human_move_and_click(page, locator, cancel_event=cancel_event)
-        locator.fill(value)
+        session.mouse.click_locator(page, locator, cancel_event=cancel_event)
+        session.type_text(locator, value)
         return PixivStep(name, True)
+    except InterruptedError:
+        raise
     except Exception as exc1:
+        # 拟人输入失败绝不阻断投稿：先回退直接填充，再退 JS 赋值
         try:
-            locator.evaluate(
-                "(el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
-                value,
-            )
-            return PixivStep(name, True, detail="js_fallback")
-        except Exception as exc2:
-            _raise_if_browser_closed_exception(exc1)
-            _raise_if_browser_closed_exception(exc2)
-            return PixivStep(
-                name, False, "fill_failed",
-                f"click_fill: {type(exc1).__name__}: {exc1} | js: {type(exc2).__name__}: {exc2}",
-            )
+            locator.fill(value)
+            return PixivStep(name, True, detail="fill_fallback")
+        except Exception as exc_fill:
+            try:
+                locator.evaluate(
+                    "(el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
+                    value,
+                )
+                return PixivStep(name, True, detail="js_fallback")
+            except Exception as exc2:
+                _raise_if_browser_closed_exception(exc1)
+                _raise_if_browser_closed_exception(exc_fill)
+                _raise_if_browser_closed_exception(exc2)
+                return PixivStep(
+                    name, False, "fill_failed",
+                    f"type: {type(exc1).__name__}: {exc1} | fill: {type(exc_fill).__name__}: {exc_fill} | js: {type(exc2).__name__}: {exc2}",
+                )
 
 
 def _click_radio(page, name: str, selectors_per_choice: dict[str, list[str]], choice: str) -> PixivStep:
@@ -3098,7 +3136,7 @@ def _read_checked_state(locator) -> bool | None:
         return None
 
 
-def _set_checkbox_by_text(page, name: str, texts: list[str], desired: bool, cancel_event=None) -> PixivStep:
+def _set_checkbox_by_text(page, name: str, texts: list[str], desired: bool, cancel_event=None, human: HumanSession | None = None) -> PixivStep:
     last_detail = ""
     for text in texts:
         locator = _first_visible_locator(
@@ -3146,8 +3184,9 @@ def _read_tag_count(page) -> int:
     return 0
 
 
-def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], cancel_event=None) -> PixivStep:
+def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], cancel_event=None, human: HumanSession | None = None) -> PixivStep:
     tags = tags[:10]
+    session = _session_for(page, human, cancel_event)
     failed: list[str] = []
     not_committed: list[str] = []
     autocomplete_used = 0
@@ -3167,11 +3206,22 @@ def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], canc
             last_exc = f"none of: {selectors}"
             continue
         try:
-            _human_move_and_click(page, locator, cancel_event=cancel_event)
-            _jsleep(0.3, cancel_event=cancel_event)
-            locator.fill(tag)
-            locator.dispatch_event("input")
-            _jsleep(1.2, cancel_event=cancel_event)
+            session.mouse.click_locator(page, locator, cancel_event=cancel_event)
+            session.paced_sleep(0.3)
+            try:
+                # 真实逐键输入会在打字过程中自然驱动自动补全列表
+                session.type_text(locator, tag)
+            except InterruptedError:
+                raise
+            except Exception as type_exc:
+                _raise_if_browser_closed_exception(type_exc)
+                log.info(
+                    f"    拟人打字输入标签失败，回退直接填充 tag={tag!r}: "
+                    f"{type(type_exc).__name__}: {type_exc}"
+                )
+                locator.fill(tag)
+                locator.dispatch_event("input")
+            session.paced_sleep(1.2)
             listbox = _first_visible_locator(page, listbox_selectors) if listbox_selectors else None
             if listbox is None and autocomplete_debug_dumps < 3:
                 # No listbox detected — dump page HTML so we can see what real
@@ -3206,7 +3256,7 @@ def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], canc
                     log.warning(f"    autocomplete exact-match lookup 失败 tag={tag!r}: {type(exc).__name__}: {exc}")
                 if exact_option is not None:
                     try:
-                        _human_move_and_click(page, exact_option, cancel_event=cancel_event)
+                        session.mouse.click_locator(page, exact_option, cancel_event=cancel_event)
                         clicked = True
                     except Exception as exc:
                         log.warning(f"    autocomplete exact-option click 失败 tag={tag!r}: {type(exc).__name__}: {exc}")
@@ -3218,7 +3268,7 @@ def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], canc
             else:
                 page.keyboard.press(" ")
                 raw_used += 1
-            _jsleep(0.6, cancel_event=cancel_event)
+            session.paced_sleep(0.6)
             try:
                 value_after = locator.input_value()
             except Exception:
@@ -3227,7 +3277,7 @@ def _fill_tag_input(page, name: str, selectors: list[str], tags: list[str], canc
                 for commit_key in (" ", "Enter", "Tab"):
                     try:
                         locator.press(commit_key)
-                        _jsleep(0.4, cancel_event=cancel_event)
+                        session.paced_sleep(0.4)
                         value_after = locator.input_value()
                     except Exception:
                         pass
@@ -3620,7 +3670,9 @@ def _create_pixiv_post(
     progress_callback=None,
     interaction_callback=None,
     http_monitor: PixivHttp429Monitor | None = None,
+    human: HumanSession | None = None,
 ) -> PixivPostResult | tuple[str | None, list[PixivStep]]:
+    session = _session_for(page, human, cancel_event)
     form_progress = {
         "ensure_upload_page": 0.05,
         "select_file": 0.15,
@@ -3690,24 +3742,24 @@ def _create_pixiv_post(
         record(PixivStep("select_file", False, "exception", f"{type(exc).__name__}: {exc}"))
         return None, steps
 
-    _jsleep(4.0, cancel_event=cancel_event)
+    session.paced_sleep(4.0)
 
     record(_fill_if_found(
         page, "fill_title", PIXIV_SELECTORS["title"],
-        payload["title_ja"], cancel_event=cancel_event,
+        payload["title_ja"], cancel_event=cancel_event, human=session,
     ))
-    _jsleep(0.5, cancel_event=cancel_event)
+    session.paced_sleep(0.5)
     caption_text = "\n".join(s for s in (payload.get("caption_ja", ""), payload.get("caption_zh", "")) if s).strip()
     if caption_text:
         record(_fill_if_found(
             page, "fill_caption", PIXIV_SELECTORS["caption"], caption_text,
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, human=session,
         ))
     else:
         record(PixivStep("fill_caption", True, detail="empty (skipped)"))
-    _jsleep(0.4, cancel_event=cancel_event)
-    record(_fill_tag_input(page, "fill_tags", PIXIV_SELECTORS["tag_input"], payload["final_tags"], cancel_event=cancel_event))
-    _jsleep(0.6, cancel_event=cancel_event)
+    session.paced_sleep(0.4)
+    record(_fill_tag_input(page, "fill_tags", PIXIV_SELECTORS["tag_input"], payload["final_tags"], cancel_event=cancel_event, human=session))
+    session.paced_sleep(0.6)
 
     # Age restriction: prefer name=value attr, fallback to text
     age = payload["age_restriction"]
@@ -3812,7 +3864,9 @@ def _create_pixiv_post(
     ))
 
     try:
-        _human_move_and_click(page, publish_locator, cancel_event=cancel_event)
+        # 提交前“通读检查”停顿：表单填完后不立刻点击
+        session.before_submit()
+        _human_move_and_click(page, publish_locator, cancel_event=cancel_event, human=session)
     except InterruptedError:
         raise
     except Exception as exc:
@@ -3837,6 +3891,15 @@ def _create_pixiv_post(
     try:
         while True:
             _sleep_with_cancel(1.0, cancel_event)
+            if not captcha_detected:
+                # 等待跳转期间低概率漂移鼠标，避免指针完全冻结；
+                # 一旦出现人机验证则停止漂移，不干扰人工操作
+                try:
+                    session.mouse.idle_drift(page, cancel_event=cancel_event, probability=0.15)
+                except InterruptedError:
+                    raise
+                except Exception as drift_exc:
+                    _raise_if_browser_closed_exception(drift_exc)
             try:
                 url = str(page.url or "")
             except Exception as exc:
@@ -3954,6 +4017,7 @@ def create_pixiv_post(
     cancel_event=None,
     progress_callback=None,
     interaction_callback=None,
+    human: HumanSession | None = None,
 ) -> PixivPostResult:
     steps: list[PixivStep] = []
     http_monitor: PixivHttp429Monitor | None = None
@@ -3969,6 +4033,7 @@ def create_pixiv_post(
             progress_callback,
             interaction_callback,
             http_monitor,
+            human,
         )
         if isinstance(raw_result, PixivPostResult):
             result = raw_result

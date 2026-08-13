@@ -244,7 +244,9 @@ class PixivCaptchaStateMachineTests(unittest.TestCase):
             return_value=(pre_submit_captcha, "recaptcha" if pre_submit_captcha else ""),
         ), patch.object(support, "_human_move_and_click") as click, patch.object(
             support, "_sleep_with_cancel"
-        ), patch.object(support.time, "sleep"), patch.object(
+        ), patch.object(support.time, "sleep"), patch(
+            "pixiv_uploader.humanize.sleep_with_cancel"
+        ), patch.object(
             support, "_resolve_posted_artwork_url", return_value=None
         ), patch.object(
             support,
