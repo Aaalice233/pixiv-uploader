@@ -80,11 +80,12 @@ def default_llm_reverse_config() -> dict[str, Any]:
         "model": "",
         "timeout_seconds": 45,
         "retry_policy": {
-            "request_attempts": 3,
+            # Six total requests = the initial request plus at most five retries.
+            "request_attempts": 6,
             "repair_attempts": 1,
-            "base_delay_seconds": 0.8,
-            "max_delay_seconds": 10.0,
-            "total_timeout_seconds": 180,
+            "base_delay_seconds": 5.0,
+            "max_delay_seconds": 60.0,
+            "total_timeout_seconds": 600,
             "adaptive_image": True,
             "fallback_models": [],
         },
@@ -880,13 +881,14 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 
 def _retry_delay_seconds(policy: dict[str, Any], request_index: int, retry_after: float | None) -> float:
-    if retry_after is not None:
-        return max(0.0, retry_after)
     ceiling = min(
         float(policy["max_delay_seconds"]),
         float(policy["base_delay_seconds"]) * (2 ** max(0, request_index - 1)),
     )
-    return random.uniform(ceiling / 2, ceiling)
+    progressive_delay = random.uniform(ceiling / 2, ceiling)
+    # Retry-After is a lower bound, not a reason to bypass local backoff when an
+    # upstream returns zero or an unrealistically short cooldown.
+    return max(progressive_delay, max(0.0, retry_after)) if retry_after is not None else progressive_delay
 
 
 def _remaining_request_timeout(configured_timeout: float, deadline: float) -> float:

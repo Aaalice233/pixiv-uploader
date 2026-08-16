@@ -92,6 +92,21 @@ class LlmImagePreviewTests(unittest.TestCase):
 
 
 class LlmRetryPolicyTests(unittest.TestCase):
+    def test_default_policy_allows_five_progressive_retries(self) -> None:
+        policy = llm_reverse.default_llm_reverse_config()["retry_policy"]
+
+        self.assertEqual(policy["request_attempts"], 6)
+        self.assertEqual(policy["base_delay_seconds"], 5.0)
+        self.assertEqual(policy["max_delay_seconds"], 60.0)
+        self.assertEqual(policy["total_timeout_seconds"], 600)
+
+    def test_retry_after_cannot_shorten_progressive_backoff(self) -> None:
+        policy = llm_reverse.default_llm_reverse_config()["retry_policy"]
+
+        with patch.object(llm_reverse.random, "uniform", return_value=20.0):
+            self.assertEqual(llm_reverse._retry_delay_seconds(policy, 3, 1.0), 20.0)
+            self.assertEqual(llm_reverse._retry_delay_seconds(policy, 3, 30.0), 30.0)
+
     def test_partial_few_shot_sample_is_not_sent_to_the_model(self) -> None:
         spec = llm_reverse.get_merged_spec(["pixiv"])
         persona = {

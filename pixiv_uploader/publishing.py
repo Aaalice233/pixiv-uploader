@@ -968,6 +968,18 @@ def create_upload_manifest(
                     )
             _raise_if_canceled(cancel_event)
 
+    llm_copy_failed = bool(
+        llm_reverse_result.get("enabled")
+        and llm_reverse_result.get("status") == "failed"
+        and _targets_need_copy(targets)
+    )
+    llm_copy_error = str(llm_reverse_result.get("error") or "LLM copy generation failed")
+    if llm_copy_failed:
+        log.error(
+            "    LLM 文案生成失败，已阻止需要文案的平台投稿: %s",
+            llm_copy_error,
+        )
+
     if needs_pixiv_payload:
         _emit_progress(progress_callback, "watermarking", stage_progress=0.0)
     watermark_failed = False
@@ -1009,6 +1021,12 @@ def create_upload_manifest(
             stage_progress=0.0 if watermark_failed else 1.0,
         )
 
+    manifest_errors: list[str] = []
+    if watermark_failed:
+        manifest_errors.append(f"Watermark failed: {watermark_error}")
+    if llm_copy_failed:
+        manifest_errors.append(f"LLM copy generation failed: {llm_copy_error}")
+
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_path": str(image_path),
@@ -1017,12 +1035,16 @@ def create_upload_manifest(
         "status_by_target": {
             target: (
                 "failed"
-                if watermark_failed and PLATFORM_RULES.get(target, {}).get("needs_sanitize")
+                if (
+                    watermark_failed and PLATFORM_RULES.get(target, {}).get("needs_sanitize")
+                ) or (
+                    llm_copy_failed and PLATFORM_RULES.get(target, {}).get("needs_copy")
+                )
                 else "pending"
             )
             for target in targets
         },
-        "errors": [f"Watermark failed: {watermark_error}"] if watermark_failed else [],
+        "errors": manifest_errors,
         "watermark": watermark_result,
         "civitai": {
             "clean_copy_path": str(civitai_copy) if civitai_copy else "",
@@ -1052,6 +1074,7 @@ def create_upload_manifest(
             "privacy": pixiv_privacy,
             "allow_tag_edits": pixiv_allow_tag_edits,
             "post_url": "",
+            "error_code": "llm_copy_generation_failed" if llm_copy_failed else "",
             "llm_reverse": llm_reverse_result,
             "tagger": {
                 "status": tagger_result.get("status", "disabled"),
@@ -1069,7 +1092,7 @@ def create_upload_manifest(
         },
     }
 
-    pixiv_ready = not watermark_failed
+    pixiv_ready = not watermark_failed and not llm_copy_failed
     if "pixiv" in targets:
         status = pixiv_metadata_check.get("status")
         if watermark_failed:

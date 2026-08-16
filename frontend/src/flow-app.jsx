@@ -920,11 +920,11 @@ function LlmSettings({ initialConfig, platformSpecs, onSaved, notify }) {
   const persona = (config.personas || []).find(item => item.id === selectedId) || config.personas?.[0];
   const sampleFieldSpecs = llmSampleFieldSpecs(persona, platformSpecs);
   const retryPolicy = {
-    request_attempts: 3,
+    request_attempts: 6,
     repair_attempts: 1,
-    base_delay_seconds: 0.8,
-    max_delay_seconds: 10,
-    total_timeout_seconds: 180,
+    base_delay_seconds: 5,
+    max_delay_seconds: 60,
+    total_timeout_seconds: 600,
     adaptive_image: true,
     fallback_models: [],
     ...(config.retry_policy || {}),

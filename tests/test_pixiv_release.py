@@ -173,6 +173,70 @@ class PixivLlmTagPipelineTests(unittest.TestCase):
         self.assertEqual(tagging["candidate_count"], 3)
         self.assertEqual(tagging["added_tags"], ["女の子", "白髪", "小鳥"])
 
+    def test_llm_copy_failure_blocks_pixiv_posting(self) -> None:
+        import pixiv_uploader.publishing as publishing
+
+        payload = {
+            "raw_candidates": [],
+            "metadata_entity_hits": [],
+            "popularity_decisions": [],
+            "rejected_tags": [],
+            "final_tags": ["オリジナル", "AIイラスト"],
+            "entity_tags": [],
+            "domain": "original",
+            "title_ja": "無題",
+            "title_zh": "无题",
+            "caption_ja": "",
+            "caption_zh": "",
+            "age_restriction": "all_ages",
+            "ai_generated": True,
+        }
+        llm_result = {
+            "enabled": True,
+            "status": "failed",
+            "error": "HTTP 429: busy",
+            "error_code": "rate_limited",
+            "fields": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.png"
+            clean = root / "source_clean.png"
+            source.write_bytes(b"source")
+            metadata = {"available": False, "status": "unavailable", "detected_types": [], "details": []}
+            with patch.object(
+                publishing, "sanitize_image_for_pixiv", return_value=SimpleNamespace(output_path=clean)
+            ), patch.object(
+                publishing, "build_pixiv_payload", return_value=payload
+            ), patch.object(
+                publishing, "infer_image_copy", return_value=llm_result
+            ), patch.object(
+                publishing, "resolve_persona", return_value=({}, "sfw")
+            ), patch.object(
+                publishing, "append_validation_case"
+            ):
+                manifest, pixiv_ready = publishing.create_upload_manifest(
+                    image_path=source,
+                    targets=["pixiv"],
+                    files={"validation": root / "validation.json"},
+                    hain_bridge=SimpleNamespace(read_metadata=lambda _: metadata),
+                    alias_data={},
+                    popularity_data={},
+                    age_rules={},
+                    civitai_dir=root,
+                    pixiv_dir=root,
+                    pixiv_privacy="public",
+                    pixiv_allow_tag_edits=False,
+                    llm_reverse_config={"enabled": True},
+                    ai_tags_by_platform={"pixiv": True},
+                )
+
+        self.assertFalse(pixiv_ready)
+        self.assertEqual(manifest["status_by_target"]["pixiv"], "failed")
+        self.assertEqual(manifest["pixiv"]["error_code"], "llm_copy_generation_failed")
+        self.assertIn("HTTP 429: busy", manifest["errors"][0])
+
     def test_original_tag_reserves_one_of_pixivs_ten_slots(self) -> None:
         alias_data = {
             "mappings": {},
